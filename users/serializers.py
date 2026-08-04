@@ -3,10 +3,25 @@ from rest_framework import serializers
 
 
 class UserSerializer(serializers.ModelSerializer):
+    organization_memberships = serializers.SerializerMethodField()
+
     class Meta:
         model = get_user_model()
-        fields = ("id", "email", "first_name", "last_name")
+        fields = ("id", "email", "first_name", "last_name", "last_login", "is_active", "is_staff", "is_superuser", "date_joined", "organization_memberships")
 
+
+    def get_organization_memberships(self, user):
+        memberships = user.organization_memberships.filter(is_active=True).select_related("organization")
+        return [
+            {
+                "id": membership.id,
+                "organization": membership.organization.slug,
+                "organization_name": membership.organization.name,
+                "role": membership.role,
+                "tab_permissions": membership.tab_permissions,
+            }
+            for membership in memberships
+        ]
 
 class RegisterSerializer(serializers.Serializer):
     email = serializers.EmailField()

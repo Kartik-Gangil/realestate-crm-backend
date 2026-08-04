@@ -1,12 +1,19 @@
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
+TAB_PERMISSIONS = ("dashboard", "leads", "assigned_leads", "follow_ups", "members")
+
+
+def default_tab_permissions():
+    return list(TAB_PERMISSIONS)
 
 
 class Organization(models.Model):
     name = models.CharField(max_length=150)
     slug = models.SlugField(max_length=150, unique=True)
     is_active = models.BooleanField(default=True)
+    # Last telecaller used by the organization round-robin allocator.
+    round_robin_cursor = models.PositiveBigIntegerField(null=True, blank=True)
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="created_organizations")
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -27,6 +34,8 @@ class OrganizationMembership(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="organization_memberships")
     role = models.CharField(max_length=20, choices=Role.choices)
     is_active = models.BooleanField(default=True)
+
+    tab_permissions = models.JSONField(default=default_tab_permissions, blank=True)
     joined_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

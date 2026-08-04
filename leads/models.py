@@ -64,9 +64,9 @@ class FollowUpCall(models.Model):
     organization = models.ForeignKey("organizations.Organization", on_delete=models.CASCADE, related_name="follow_up_calls")
     lead = models.ForeignKey(Lead, on_delete=models.CASCADE, related_name="follow_up_calls")
     telecaller_membership = models.ForeignKey("organizations.OrganizationMembership", null=True, on_delete=models.SET_NULL, related_name="follow_up_calls")
-    note = models.TextField()
-    outcome = models.CharField(max_length=20, choices=Outcome.choices, default=Outcome.CONNECTED)
-    called_at = models.DateTimeField(default=timezone.now)
+    note = models.TextField(blank=True, default="")
+    outcome = models.CharField(max_length=20, choices=Outcome.choices, blank=True, default="")
+    called_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
