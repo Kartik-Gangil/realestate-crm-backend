@@ -3,9 +3,9 @@ import io
 
 from django.core.exceptions import ValidationError
 from django.db import transaction
-from django.db.models import Count, Q
+from django.db.models import Count, Q, OuterRef , Subquery
 from django.shortcuts import get_object_or_404
-from django.utils.dateparse import parse_datetime
+from django.utils.dateparse import parse_date, parse_datetime
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import PermissionDenied
@@ -26,8 +26,8 @@ CSV_HEADER_ALIASES = {
     "email": "email", "email_address": "email",
     "phone": "phone", "phone_number": "phone", "mobile": "phone",
     "mobile_number": "phone", "contact_number": "phone",
-    "source": "source", "status": "status",
-    "next_follow_up": "next_follow_up", "next_followup": "next_follow_up", "follow_up": "next_follow_up",
+    "source": "source",
+    "platform": "source",
     "assigned_membership": "assigned_membership", "assigned_membership_id": "assigned_membership",
     "assignee_id": "assigned_membership",
 }
@@ -64,6 +64,14 @@ def _parse_datetime(value, field_name):
     return parsed
 
 
+def _parse_date(value, field_name):
+    if value is None:
+        return None
+    parsed = parse_date(value)
+    if parsed is None:
+        raise ValidationError({field_name: "Use an ISO 8601 date (YYYY-MM-DD)."})
+    return parsed
+
 def _leads_for_access(access):
     leads = Lead.objects.filter(organization=access.organization).select_related("organization", "assigned_membership__user")
     return leads if access.can_view_all_leads else leads.filter(assigned_membership=access.membership)
@@ -75,15 +83,13 @@ def _require_lead_management(access):
 
 
 def _apply_payload(lead, payload, organization, partial=False, save=True):
-    allowed = {"first_name", "last_name", "email", "phone", "source", "status", "next_follow_up", "assigned_membership"}
+    allowed = {"first_name", "last_name", "email", "phone", "source", "assigned_membership"}
     if not partial:
         missing = [field for field in ("first_name", "phone", "source") if field not in payload]
         if missing:
             raise ValidationError({field: "This field is required." for field in missing})
     for field in allowed & payload.keys():
         value = payload[field]
-        if field == "next_follow_up":
-            value = _parse_datetime(value, field)
         if field == "assigned_membership":
             value = OrganizationMembership.objects.filter(pk=value, organization=organization, is_active=True).first() if value else None
             if payload[field] and value is None:
@@ -111,7 +117,7 @@ def _create_pending_follow_up(lead, telecaller):
 
 
 def _update_follow_up_result(call, payload):
-    allowed = {"note", "outcome", "called_at"}
+    allowed = {"note", "outcome", "status", "next_follow_up", "called_at"}
     unknown = set(payload) - allowed
     if unknown:
         raise ValidationError({field: "This field cannot be updated." for field in unknown})
@@ -119,11 +125,15 @@ def _update_follow_up_result(call, payload):
         call.note = str(payload["note"]).strip()
     if "outcome" in payload:
         call.outcome = payload["outcome"]
+    if "status" in payload:
+        call.status = payload["status"]
+    if "next_follow_up" in payload:
+        call.next_follow_up = _parse_date(payload["next_follow_up"], "next_follow_up")
     if "called_at" in payload:
         call.called_at = _parse_datetime(payload["called_at"], "called_at")
     call.full_clean()
     if call.pk:
-        call.save(update_fields=["note", "outcome", "called_at"])
+        call.save(update_fields=["note", "outcome", "status", "next_follow_up", "called_at"])
     else:
         call.save()
     return call
@@ -298,13 +308,40 @@ def lead_list(request, organization_slug):
         return Response(lead_to_dict(lead), status=status.HTTP_201_CREATED)
 
     leads = _leads_for_access(access)
+    latest_follow_up = FollowUpCall.objects.filter(lead=OuterRef("pk")).order_by("-created_at")
+    # Add latest follow-up status to every lead
+    leads = leads.annotate(
+        latest_follow_up_status=Subquery(
+            latest_follow_up.values("status")[:1]
+        ),
+        latest_follow_up_id=Subquery(
+            latest_follow_up.values("id")[:1]
+        )
+    )
     if status_filter := request.query_params.get("status"):
-        leads = leads.filter(status=status_filter)
+        leads = leads.filter(
+            latest_follow_up_status=status_filter,
+            latest_follow_up_id__isnull=False
+        )
     if source := request.query_params.get("source"):
         leads = leads.filter(source=source)
     if search := request.query_params.get("search"):
-        leads = leads.filter(Q(first_name__icontains=search) | Q(last_name__icontains=search) | Q(email__icontains=search) | Q(phone__icontains=search))
-    return Response({"count": leads.count(), "results": [lead_to_dict(lead) for lead in leads]})
+        leads = leads.filter(
+            Q(first_name__icontains=search) |
+            Q(last_name__icontains=search) |
+            Q(email__icontains=search) |
+            Q(phone__icontains=search)
+        )
+    return Response({
+        "count": leads.count(),
+        "results": [
+            lead_to_dict(
+                lead,
+                latest_follow_up_status=lead.latest_follow_up_status
+            )
+            for lead in leads
+        ]
+    })
 
 
 @api_view(["GET", "PATCH", "PUT", "DELETE"])
@@ -314,11 +351,7 @@ def lead_detail(request, organization_slug, lead_id):
     lead = get_object_or_404(_leads_for_access(access), pk=lead_id)
     if request.method == "GET":
         return Response(lead_to_dict(lead, include_follow_ups=True))
-    if access.membership is not None and access.membership.role == OrganizationMembership.Role.TELECALLER:
-        if request.method != "PATCH" or set(request.data.keys()) != {"status"}:
-            raise PermissionDenied("Telecallers may update only the status of their assigned leads.")
-    else:
-        _require_lead_management(access)
+    _require_lead_management(access)
     if request.method == "DELETE":
         lead.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
@@ -339,6 +372,8 @@ def follow_up_list(request, organization_slug, lead_id):
     lead = get_object_or_404(_leads_for_access(access), pk=lead_id)
     if request.method == "GET":
         calls = lead.follow_up_calls.select_related("telecaller_membership__user").all()
+        if status_filter := request.query_params.get("status"):
+            calls = calls.filter(status=status_filter)
         return Response({"count": calls.count(), "results": [follow_up_to_dict(call) for call in calls]})
     if access.membership is None:
         raise PermissionDenied("A membership in this organization is required to log a follow-up call.")
@@ -346,7 +381,7 @@ def follow_up_list(request, organization_slug, lead_id):
     if not note:
         return Response({"note": ["This field is required."]}, status=status.HTTP_400_BAD_REQUEST)
     try:
-        result = {"note": note, "outcome": request.data.get("outcome", FollowUpCall.Outcome.CONNECTED), "called_at": request.data.get("called_at")}
+        result = {"note": note, "outcome": request.data.get("outcome", FollowUpCall.Outcome.CONNECTED), "status": request.data.get("status", FollowUpCall.Status.NEW), "next_follow_up": request.data.get("next_follow_up"), "called_at": request.data.get("called_at")}
         call = FollowUpCall.objects.filter(organization=access.organization, lead=lead, telecaller_membership=access.membership, called_at__isnull=True).order_by("created_at", "id").first()
         if call:
             _update_follow_up_result(call, result)
@@ -365,7 +400,8 @@ def follow_up_list(request, organization_slug, lead_id):
 def lead_summary(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
     leads = _leads_for_access(access)
-    statuses = {item["status"]: item["count"] for item in leads.values("status").annotate(count=Count("id"))}
+    follow_ups = FollowUpCall.objects.filter(organization=access.organization, lead__in=leads)
+    statuses = {item["status"]: item["count"] for item in follow_ups.values("status").annotate(count=Count("id"))}
     return Response({"total": leads.count(), "by_status": statuses})
 
 
@@ -374,9 +410,10 @@ def lead_summary(request, organization_slug):
 def lead_dashboard(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
     leads = _leads_for_access(access)
-    statuses = {item["status"]: item["count"] for item in leads.values("status").annotate(count=Count("id"))}
+    follow_ups = FollowUpCall.objects.filter(organization=access.organization, lead__in=leads)
+    statuses = {item["status"]: item["count"] for item in follow_ups.values("status").annotate(count=Count("id"))}
     sources = {item["source"]: item["count"] for item in leads.values("source").annotate(count=Count("id"))}
-    calls = FollowUpCall.objects.filter(organization=access.organization, lead__in=leads).select_related("lead", "telecaller_membership__user")[:20]
+    calls = follow_ups.select_related("lead", "telecaller_membership__user")[:20]
     return Response({"organization": access.organization.slug, "total_leads": leads.count(), "by_status": statuses, "by_source": sources, "recent_follow_up_calls": [follow_up_to_dict(call) for call in calls]})
 
 @api_view(["POST"])

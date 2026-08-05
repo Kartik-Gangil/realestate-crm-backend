@@ -60,7 +60,7 @@ All lead APIs require the organization slug in the path:
 | `GET/PATCH/PUT/DELETE` | `/api/organizations/<slug>/leads/<id>/` | Retrieve/manage one lead |
 | `GET/POST` | `/api/organizations/<slug>/leads/<id>/follow-ups/` | List/log separate follow-up calls |
 | `GET` | `/api/organizations/<slug>/dashboard/` | Lead counts and latest call records |
-| `GET` | `/api/organizations/<slug>/summary/` | Lead totals grouped by status |
+| `GET` | `/api/organizations/<slug>/summary/` | Lead total and follow-up counts grouped by status |
 
 Lead sources are limited to `facebook`, `instagram`, and `website`. Required create fields are `first_name`, `phone`, and `source`. Phone numbers are intentionally not unique.
 
@@ -80,8 +80,10 @@ Follow-up notes remain separate from the lead:
 ```json
 {
   "note": "Customer asked for a callback tomorrow.",
-  "outcome": "callback"
+  "outcome": "callback",
+  "status": "contacted"
 }
 ```
 
 Valid outcomes are `connected`, `no_answer`, `busy`, `callback`, `not_interested`, and `invalid_number`.
+Follow-up statuses are `new`, `contacted`, `qualified`, `site_visit`, `negotiation`, `won`, and `lost`.

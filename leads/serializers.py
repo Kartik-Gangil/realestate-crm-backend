@@ -20,12 +20,14 @@ def follow_up_to_dict(follow_up: FollowUpCall) -> dict:
         "telecaller": membership_to_dict(follow_up.telecaller_membership),
         "note": follow_up.note,
         "outcome": follow_up.outcome,
+        "status": follow_up.status,
+        "next_follow_up": follow_up.next_follow_up.isoformat() if follow_up.next_follow_up else None,
         "called_at": follow_up.called_at.isoformat() if follow_up.called_at else None,
         "created_at": follow_up.created_at.isoformat(),
     }
 
 
-def lead_to_dict(lead: Lead, include_follow_ups=False) -> dict:
+def lead_to_dict(lead: Lead, include_follow_ups=False , latest_follow_up_status=None) -> dict:
     data = {
         "id": lead.id,
         "organization": lead.organization.slug,
@@ -35,8 +37,9 @@ def lead_to_dict(lead: Lead, include_follow_ups=False) -> dict:
         "email": lead.email,
         "phone": lead.phone,
         "source": lead.source,
-        "status": lead.status,
-        "next_follow_up": lead.next_follow_up.isoformat() if lead.next_follow_up else None,
+        "alt_phone": lead.alt_phone,
+        "address": lead.address,
+        "status": latest_follow_up_status,
         # return only the membership name (or None)
         "assigned_membership": (membership_to_dict(lead.assigned_membership) or {}).get("name"),
         "created_at": lead.created_at.isoformat(),
