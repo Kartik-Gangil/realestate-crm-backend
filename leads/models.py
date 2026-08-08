@@ -9,10 +9,14 @@ class Lead(models.Model):
         FACEBOOK = "fb", "Facebook"
         INSTAGRAM = "ig", "Instagram"
         WEBSITE = "website", "Website"
+        SITEVISIT = "site_visit", "Site Visit"
+        OTHER = "other", "Other"
+        WALKIN = "walk_in", "Walk-in"
 
     organization = models.ForeignKey("organizations.Organization", on_delete=models.CASCADE, related_name="leads")
     first_name = models.CharField(max_length=100)
     last_name = models.CharField(max_length=100, blank=True)
+    occupation = models.CharField(max_length=100, blank=True)
     email = models.EmailField(blank=True)
     phone = models.CharField(max_length=20)
     alt_phone = models.CharField(max_length=20 , blank=True)
@@ -64,7 +68,7 @@ class FollowUpCall(models.Model):
     note = models.TextField(blank=True, default="")
     outcome = models.CharField(max_length=20, choices=Outcome.choices, blank=True, default="")
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.NEW)
-    next_follow_up = models.DateField(null=True, blank=True)
+    next_follow_up = models.DateTimeField(null=True, blank=True)
     called_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 

@@ -38,6 +38,7 @@ def lead_to_dict(lead: Lead, include_follow_ups=False , latest_follow_up_status=
         "phone": lead.phone,
         "source": lead.source,
         "alt_phone": lead.alt_phone,
+        "occupation": lead.occupation,
         "address": lead.address,
         "status": latest_follow_up_status,
         # return only the membership name (or None)

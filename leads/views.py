@@ -83,7 +83,7 @@ def _require_lead_management(access):
 
 
 def _apply_payload(lead, payload, organization, partial=False, save=True):
-    allowed = {"first_name", "last_name", "email", "phone", "source", "assigned_membership"}
+    allowed = {"first_name", "last_name", "email", "phone", "source", "assigned_membership" , "alt_phone", "address" , "occupation"}
     if not partial:
         missing = [field for field in ("first_name", "phone", "source") if field not in payload]
         if missing:
@@ -128,7 +128,7 @@ def _update_follow_up_result(call, payload):
     if "status" in payload:
         call.status = payload["status"]
     if "next_follow_up" in payload:
-        call.next_follow_up = _parse_date(payload["next_follow_up"], "next_follow_up")
+        call.next_follow_up = _parse_datetime(payload["next_follow_up"], "next_follow_up")
     if "called_at" in payload:
         call.called_at = _parse_datetime(payload["called_at"], "called_at")
     call.full_clean()
@@ -349,19 +349,49 @@ def lead_list(request, organization_slug):
 def lead_detail(request, organization_slug, lead_id):
     access = get_organization_access(request.user, organization_slug)
     lead = get_object_or_404(_leads_for_access(access), pk=lead_id)
+
     if request.method == "GET":
         return Response(lead_to_dict(lead, include_follow_ups=True))
-    _require_lead_management(access)
+
     if request.method == "DELETE":
+        _require_lead_management(access)
         lead.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+    # PATCH / PUT
+    if access.can_manage_leads:
+        # Admin / Manager / Platform
+        pass
+    else:
+        # Telecaller can edit only their assigned leads
+        if (
+            access.membership is None
+            or access.membership.role != OrganizationMembership.Role.TELECALLER
+            or lead.assigned_membership != access.membership
+        ):
+            raise PermissionDenied(
+                "You can only edit your assigned leads."
+            )
+
     try:
         previous_assignee_id = lead.assigned_membership_id
-        lead = _apply_payload(lead, request.data, access.organization, partial=request.method == "PATCH")
+
+        lead = _apply_payload(
+            lead,
+            request.data,
+            access.organization,
+            partial=request.method == "PATCH",
+        )
+
     except (ValidationError, ValueError, TypeError) as error:
         return _validation_response(error)
-    if lead.assigned_membership_id and lead.assigned_membership_id != previous_assignee_id:
+
+    if (
+        lead.assigned_membership_id
+        and lead.assigned_membership_id != previous_assignee_id
+    ):
         _create_pending_follow_up(lead, lead.assigned_membership)
+
     return Response(lead_to_dict(lead))
 
 
