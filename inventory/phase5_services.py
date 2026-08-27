@@ -1,0 +1,252 @@
+from datetime import date
+from decimal import Decimal
+import uuid
+
+from django.core.exceptions import ValidationError
+from django.db import transaction
+from django.db.models import Sum
+from django.utils import timezone
+
+from .models import (Agreement, Installment, InstallmentPayment, Payment, PaymentAdjustment,
+    PaymentAllocation, PaymentReceipt, PaymentRefund, PaymentStatusHistory, Plot, PlotBooking,
+    Possession, Registry, RegistryCharge, RegistryStatusHistory)
+from system_settings.models import MasterData
+
+
+def _confirmed(booking):
+    if booking.status != PlotBooking.Status.CONFIRMED:
+        raise ValidationError({"booking": "This operation requires a confirmed booking."})
+
+
+def _positive(value, field="amount"):
+    if value is None or value <= Decimal("0"):
+        raise ValidationError({field: "Must be greater than zero."})
+
+
+def payment_totals(booking):
+    payments = Payment.objects.filter(payment_allocations__booking=booking, status__in=[Payment.Status.SUCCESS, Payment.Status.REFUNDED]).distinct()
+    gross = PaymentAllocation.objects.filter(booking=booking, payment__status__in=[Payment.Status.SUCCESS, Payment.Status.REFUNDED]).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+    legacy = Payment.objects.filter(booking=booking, payment_allocations__isnull=True, status__in=[Payment.Status.SUCCESS, Payment.Status.REFUNDED]).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+    gross += legacy
+    refunded = PaymentRefund.objects.filter(payment__payment_allocations__booking=booking, status=PaymentRefund.Status.COMPLETED).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+    adjusted = PaymentAdjustment.objects.filter(payment__payment_allocations__booking=booking).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+    net = gross - refunded - adjusted
+    return {"final_price": booking.final_price, "total_paid": gross, "total_refunded": refunded,
+            "net_paid": net, "outstanding_amount": max((booking.final_price or Decimal("0.00")) - net, Decimal("0.00")) if booking.final_price is not None else None}
+
+
+def _payment_transition(payment, new_status):
+    allowed = {Payment.Status.PENDING: {Payment.Status.SUCCESS, Payment.Status.FAILED, Payment.Status.CANCELLED},
+               Payment.Status.SUCCESS: {Payment.Status.REFUNDED}, Payment.Status.FAILED: set(),
+               Payment.Status.CANCELLED: set(), Payment.Status.REFUNDED: set()}
+    if new_status not in allowed.get(payment.status, set()):
+        raise ValidationError({"status": f"Cannot change payment status from '{payment.status}' to '{new_status}'."})
+
+
+def create_payment(*, booking, amount, payment_method, transaction_reference, payment_date, notes, user):
+    return create_allocated_payment(organization=booking.organization, amount=amount, payment_method=payment_method,
+        payment_date=payment_date, transaction_reference=transaction_reference, notes=notes, user=user,
+        allocations=[{"booking": booking, "amount": amount}], compatibility_booking=booking)
+
+
+def _payment_mode_is_valid(organization, value):
+    value = (value or "").strip().lower()
+    configured = MasterData.objects.filter(organization=organization, master_type="payment_mode", is_active=True)
+    allowed = set(configured.values_list("code", flat=True)) or {choice for choice, _ in Payment.Method.choices} | {"net_banking", "wallet"}
+    if value not in allowed:
+        raise ValidationError({"payment_mode": "Use an active organization payment mode."})
+    return value
+
+
+def _allocation_outstanding(*, booking, installment=None, registry_charge=None):
+    if installment:
+        base = installment.amount
+        applied = PaymentAllocation.objects.filter(installment=installment, payment__status__in=[Payment.Status.SUCCESS, Payment.Status.REFUNDED]).aggregate(total=Sum("amount"))["total"] or Decimal("0")
+        applied += InstallmentPayment.objects.filter(installment=installment, payment__status__in=[Payment.Status.SUCCESS, Payment.Status.REFUNDED]).aggregate(total=Sum("amount"))["total"] or Decimal("0")
+    elif registry_charge:
+        base = registry_charge.amount
+        applied = PaymentAllocation.objects.filter(registry_charge=registry_charge, payment__status__in=[Payment.Status.SUCCESS, Payment.Status.REFUNDED]).aggregate(total=Sum("amount"))["total"] or Decimal("0")
+    else:
+        if Installment.objects.filter(booking=booking).exists():
+            raise ValidationError({"booking_allocations": "Allocate this booking payment to one of its installments."})
+        base = booking.final_price if booking.final_price is not None else booking.plot.total_price
+        if base is None: raise ValidationError({"booking": "Set a final price or create installments before accepting payment."})
+        applied = PaymentAllocation.objects.filter(booking=booking, installment__isnull=True, registry_charge__isnull=True, payment__status__in=[Payment.Status.SUCCESS, Payment.Status.REFUNDED]).aggregate(total=Sum("amount"))["total"] or Decimal("0")
+    return max(base - applied, Decimal("0"))
+
+
+def create_allocated_payment(*, organization, amount, payment_method, payment_date, transaction_reference, notes, user, allocations, compatibility_booking=None):
+    _positive(amount)
+    if not allocations: raise ValidationError({"booking_allocations": "At least one allocation is required."})
+    mode = _payment_mode_is_valid(organization, payment_method)
+    if payment_date is None: raise ValidationError({"payment_date": "This field is required."})
+    # Future-dated entries are permitted; confirmation retains the submitted date for reconciliation.
+    with transaction.atomic():
+        parsed, total = [], Decimal("0")
+        for data in allocations:
+            booking = PlotBooking.objects.select_for_update().select_related("plot").get(pk=data["booking"].pk)
+            if booking.organization_id != organization.id: raise ValidationError({"booking_id": "Use a booking in this organization."})
+            _confirmed(booking)
+            installment, charge = data.get("installment"), data.get("registry_charge")
+            value = data["amount"]; _positive(value)
+            if installment and (installment.booking_id != booking.id or installment.organization_id != organization.id): raise ValidationError({"installment_id": "Use an installment for the selected booking."})
+            if charge and charge.registry.booking_id != booking.id: raise ValidationError({"registry_charge_id": "Use a registry charge for the selected booking."})
+            if value > _allocation_outstanding(booking=booking, installment=installment, registry_charge=charge): raise ValidationError({"amount": "Allocation exceeds the current outstanding amount."})
+            parsed.append((booking, installment, charge, value)); total += value
+        if total != amount: raise ValidationError({"amount": "Payment amount must equal the allocation total."})
+        payment = Payment.objects.create(organization=organization, booking=compatibility_booking, payment_id=f"PAY-{timezone.now():%Y%m%d}-{uuid.uuid4().hex[:10].upper()}", amount=amount, payment_method=mode, transaction_reference=(transaction_reference or "").strip(), payment_date=payment_date, notes=(notes or "").strip(), received_by=user)
+        for booking, installment, charge, value in parsed:
+            PaymentAllocation.objects.create(payment=payment, booking=booking, installment=installment, registry_charge=charge, amount=value)
+        PaymentStatusHistory.objects.create(payment=payment, old_status="", new_status=Payment.Status.PENDING, reason="Payment created", changed_by=user)
+        return payment
+
+
+def confirm_payment(*, payment, user):
+    with transaction.atomic():
+        payment = Payment.objects.select_for_update().get(pk=payment.pk)
+        _payment_transition(payment, Payment.Status.SUCCESS)
+        allocations = list(PaymentAllocation.objects.select_for_update().select_related("booking", "installment", "registry_charge").filter(payment=payment))
+        for allocation in allocations:
+            locked_booking = PlotBooking.objects.select_for_update().select_related("plot").get(pk=allocation.booking_id)
+            _confirmed(locked_booking)
+            if allocation.amount > _allocation_outstanding(booking=locked_booking, installment=allocation.installment, registry_charge=allocation.registry_charge):
+                raise ValidationError({"amount": "Payment allocation is no longer outstanding."})
+        payment.status = Payment.Status.SUCCESS; payment.received_by = user
+        payment.save(update_fields=["status", "received_by", "updated_at"])
+        PaymentReceipt.objects.get_or_create(payment=payment, defaults={"organization": payment.organization, "receipt_number": f"RCT-{payment.organization_id}-{payment.id:08d}"})
+        PaymentStatusHistory.objects.create(payment=payment, old_status=Payment.Status.PENDING, new_status=Payment.Status.SUCCESS, reason="Payment confirmed", changed_by=user)
+        for allocation in allocations:
+            if allocation.installment: refresh_installment_status(allocation.installment)
+        return payment
+
+
+def fail_payment(*, payment):
+    with transaction.atomic():
+        payment = Payment.objects.select_for_update().get(pk=payment.pk)
+        _payment_transition(payment, Payment.Status.FAILED)
+        payment.status = Payment.Status.FAILED; payment.save(update_fields=["status", "updated_at"])
+        return payment
+
+
+def refund_payment(*, payment, amount, reason, refund_date, user):
+    _positive(amount)
+    if not (reason or "").strip(): raise ValidationError({"reason": "Provide a refund reason."})
+    with transaction.atomic():
+        payment = Payment.objects.select_for_update().get(pk=payment.pk)
+        if payment.status not in {Payment.Status.SUCCESS, Payment.Status.REFUNDED}:
+            raise ValidationError({"payment": "Only successful payments can be refunded."})
+        already = payment.refunds.exclude(status=PaymentRefund.Status.REJECTED).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+        if already + amount > payment.amount: raise ValidationError({"amount": "Refund exceeds the payment amount."})
+        refund = PaymentRefund.objects.create(organization=payment.organization, payment=payment, amount=amount, reason=reason.strip(), refund_date=refund_date, requested_by=user)
+        return refund
+
+
+def approve_refund(*, refund, user):
+    with transaction.atomic():
+        refund = PaymentRefund.objects.select_for_update().select_related("payment").get(pk=refund.pk)
+        if refund.status != PaymentRefund.Status.PENDING: raise ValidationError({"refund": "Only pending refunds can be approved."})
+        refund.status = PaymentRefund.Status.COMPLETED; refund.approved_by = user; refund.processed_by = user; refund.approved_at = timezone.now(); refund.save(update_fields=["status", "approved_by", "processed_by", "approved_at"])
+        if refund.payment.refunds.filter(status=PaymentRefund.Status.COMPLETED).aggregate(total=Sum("amount"))["total"] == refund.payment.amount:
+            old = refund.payment.status; refund.payment.status = Payment.Status.REFUNDED; refund.payment.save(update_fields=["status", "updated_at"]); PaymentStatusHistory.objects.create(payment=refund.payment, old_status=old, new_status=Payment.Status.REFUNDED, reason="Fully refunded", changed_by=user)
+        return refund
+
+
+def adjust_payment(*, payment, amount, reason, user):
+    _positive(amount)
+    if not (reason or "").strip(): raise ValidationError({"reason": "Provide an adjustment reason."})
+    with transaction.atomic():
+        payment = Payment.objects.select_for_update().get(pk=payment.pk)
+        if payment.status not in {Payment.Status.SUCCESS, Payment.Status.REFUNDED}: raise ValidationError({"payment": "Only effective payments can be adjusted."})
+        existing = payment.adjustments.aggregate(total=Sum("amount"))["total"] or Decimal("0")
+        if existing + amount > payment.amount: raise ValidationError({"amount": "Adjustment exceeds the payment amount."})
+        return PaymentAdjustment.objects.create(payment=payment, amount=amount, reason=reason.strip(), created_by=user)
+
+
+def refresh_installment_status(installment):
+    paid = installment.allocations.aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+    if installment.status == Installment.Status.CANCELLED: return installment
+    new_status = Installment.Status.PAID if paid == installment.amount else Installment.Status.PARTIALLY_PAID if paid else (Installment.Status.OVERDUE if installment.due_date < date.today() else Installment.Status.PENDING)
+    if new_status != installment.status:
+        installment.status = new_status; installment.save(update_fields=["status", "updated_at"])
+    return installment
+
+
+def create_installment(*, booking, installment_number, title, due_date, amount, notes):
+    _confirmed(booking); _positive(amount)
+    installment = Installment(organization=booking.organization, booking=booking, installment_number=installment_number,
+                              title=title, due_date=due_date, amount=amount, notes=notes or "")
+    installment.full_clean(); installment.save(); return installment
+
+
+def allocate_payment(*, payment, installment, amount):
+    _positive(amount)
+    with transaction.atomic():
+        payment = Payment.objects.select_for_update().get(pk=payment.pk)
+        installment = Installment.objects.select_for_update().get(pk=installment.pk)
+        if payment.booking_id != installment.booking_id: raise ValidationError({"installment": "Payment and installment must belong to the same booking."})
+        if payment.status != Payment.Status.SUCCESS: raise ValidationError({"payment": "Only successful payments can be allocated."})
+        allocated = payment.allocations.aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+        paid = installment.allocations.aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+        if allocated + amount > payment.amount: raise ValidationError({"amount": "Allocation exceeds payment amount."})
+        if paid + amount > installment.amount: raise ValidationError({"amount": "Allocation exceeds installment amount."})
+        allocation = InstallmentPayment.objects.create(payment=payment, installment=installment, amount=amount)
+        refresh_installment_status(installment); return allocation
+
+
+def _transition(instance, new_status, transitions, label):
+    if new_status not in transitions.get(instance.status, set()): raise ValidationError({"status": f"Cannot change {label} status from '{instance.status}' to '{new_status}'."})
+    instance.status = new_status; instance.save(update_fields=["status", "updated_at"]); return instance
+
+
+AGREEMENT_TRANSITIONS = {Agreement.Status.DRAFT: {Agreement.Status.READY, Agreement.Status.CANCELLED}, Agreement.Status.READY: {Agreement.Status.SIGNED, Agreement.Status.CANCELLED}, Agreement.Status.SIGNED: set(), Agreement.Status.CANCELLED: set()}
+REGISTRY_TRANSITIONS = {Registry.Status.PENDING: {Registry.Status.SCHEDULED, Registry.Status.IN_PROCESS, Registry.Status.CANCELLED}, Registry.Status.SCHEDULED: {Registry.Status.COMPLETED, Registry.Status.CANCELLED}, Registry.Status.IN_PROCESS: {Registry.Status.COMPLETED, Registry.Status.CANCELLED}, Registry.Status.COMPLETED: set(), Registry.Status.CANCELLED: set()}
+POSSESSION_TRANSITIONS = {Possession.Status.PENDING: {Possession.Status.SCHEDULED, Possession.Status.CANCELLED}, Possession.Status.SCHEDULED: {Possession.Status.COMPLETED, Possession.Status.CANCELLED}, Possession.Status.COMPLETED: set(), Possession.Status.CANCELLED: set()}
+
+
+def create_agreement(*, booking, **data):
+    _confirmed(booking)
+    if Agreement.objects.filter(booking=booking).exists(): raise ValidationError({"booking": "An agreement already exists for this booking."})
+    return Agreement.objects.create(organization=booking.organization, booking=booking, **data)
+def transition_agreement(*, agreement, status):
+    with transaction.atomic(): return _transition(Agreement.objects.select_for_update().get(pk=agreement.pk), status, AGREEMENT_TRANSITIONS, "agreement")
+def calculate_registry_charges(*, organization, booking, consideration_amount):
+    result = []
+    for item in MasterData.objects.filter(organization=organization, master_type="registry_charge_type", is_active=True):
+        config = item.description.strip()
+        try: kind, value = config.split(":", 1); value = Decimal(value)
+        except (ValueError, ArithmeticError): kind, value = "fixed", Decimal("0")
+        amount = value if kind == "fixed" else (consideration_amount * value / Decimal("100"))
+        result.append((item.code, item.name, kind, value, amount.quantize(Decimal("0.01"))))
+    return result
+
+
+def create_registry(*, booking, **data):
+    with transaction.atomic():
+        booking = PlotBooking.objects.select_for_update().select_related("plot").get(pk=booking.pk)
+        _confirmed(booking)
+        if booking.plot.status != Plot.Status.BOOKED: raise ValidationError({"plot": "Registry requires a booked plot."})
+        if not Agreement.objects.filter(booking=booking, status=Agreement.Status.SIGNED).exists(): raise ValidationError({"agreement": "A signed agreement is required."})
+        if Registry.objects.filter(booking=booking).exists(): raise ValidationError({"booking": "A registry already exists for this booking."})
+        registry = Registry.objects.create(organization=booking.organization, booking=booking, **data)
+        consideration = registry.consideration_amount or booking.final_price or booking.plot.total_price or Decimal("0")
+        for code, label, kind, value, amount in calculate_registry_charges(organization=booking.organization, booking=booking, consideration_amount=consideration): RegistryCharge.objects.create(registry=registry, code=code, label=label, calculation_type=kind, calculation_value=value, amount=amount)
+        RegistryStatusHistory.objects.create(registry=registry, old_status="", new_status=Registry.Status.PENDING, remarks="Registry created", changed_by=data.get("created_by"))
+        return registry
+def transition_registry(*, registry, status, user=None, remarks=""):
+    with transaction.atomic():
+        registry = Registry.objects.select_for_update().get(pk=registry.pk)
+        if status == Registry.Status.COMPLETED:
+            if not registry.registry_date: raise ValidationError({"registry_date": "Registry date is required before completion."})
+            from documents.services import validate_customer_documents_for_booking
+            validation = validate_customer_documents_for_booking(registry.booking.lead)
+            if not validation["allowed"]: raise ValidationError({"documents": validation})
+        old = registry.status; result = _transition(registry, status, REGISTRY_TRANSITIONS, "registry")
+        RegistryStatusHistory.objects.create(registry=result, old_status=old, new_status=status, remarks=remarks, changed_by=user)
+        return result
+def create_possession(*, booking, **data):
+    _confirmed(booking)
+    if not Registry.objects.filter(booking=booking, status=Registry.Status.COMPLETED).exists(): raise ValidationError({"registry": "A completed registry is required."})
+    if Possession.objects.filter(booking=booking).exists(): raise ValidationError({"booking": "A possession record already exists for this booking."})
+    return Possession.objects.create(organization=booking.organization, booking=booking, **data)
+def transition_possession(*, possession, status):
+    with transaction.atomic(): return _transition(Possession.objects.select_for_update().get(pk=possession.pk), status, POSSESSION_TRANSITIONS, "possession")

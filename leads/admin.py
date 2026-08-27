@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import FollowUpCall, Lead
+from .models import FollowUpCall, Lead , Sitevisit , SitevisitReschedule
 
 
 class FollowUpCallInline(admin.TabularInline):
@@ -25,3 +25,28 @@ class FollowUpCallAdmin(admin.ModelAdmin):
     list_filter = ("organization", "status", "outcome", "telecaller_membership")
     search_fields = ("lead__first_name", "lead__last_name", "lead__phone", "note")
     list_select_related = ("organization", "lead", "telecaller_membership__user")
+    
+@admin.register(Sitevisit)
+class SiteVisit(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "organization",
+        "lead",
+        "visit_date",
+        "visit_time",
+        "site",
+        "location",
+    )
+    
+@admin.register(SitevisitReschedule)
+class SitevisitReschedule(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "site_visit",
+        "old_date",
+        "old_time",
+        "new_date",
+        "new_time",
+        "reason",
+        "rescheduled_at",
+    )

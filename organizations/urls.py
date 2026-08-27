@@ -1,12 +1,31 @@
 from django.urls import path
 
-from . import views
+from . import employee_views, hr_views, views
 
 urlpatterns = [
     path("platform/admins/", views.platform_admins, name="platform-admins"),
     path("platform/organizations/", views.platform_organizations, name="platform-organizations"),
     path("platform/organizations/<slug:slug>/access/", views.platform_organization_access, name="platform-organization-access"),
     path("organizations/<slug:slug>/members/", views.organization_members, name="organization-members"),
-    path("organizations/<slug:slug>/members/<int:membership_id>/tab-permissions/", views.member_tab_permissions, name="member-tab-permissions"),
     path("organizations/<slug:slug>/my-tab-permissions/", views.my_tab_permissions, name="my-tab-permissions"),
+    path("organizations/<slug:organization_slug>/employees/", employee_views.employee_list, name="employee-list"),
+    path("organizations/<slug:organization_slug>/employees/<int:employee_id>/", employee_views.employee_detail, name="employee-detail"),
+    path("organizations/<slug:organization_slug>/employees/<int:employee_id>/activate/", employee_views.employee_activate, name="employee-activate"),
+    path("organizations/<slug:organization_slug>/employees/<int:employee_id>/deactivate/", employee_views.employee_deactivate, name="employee-deactivate"),
+    path("organizations/<slug:organization_slug>/employees/<int:employee_id>/reset-password/", employee_views.employee_reset_password, name="employee-reset-password"),
+    path("organizations/<slug:organization_slug>/employees/<int:employee_id>/activity-history/", employee_views.employee_activity_history, name="employee-activity-history"),
+    path("organizations/<slug:organization_slug>/departments/", employee_views.department_list, name="department-list"),
+    path("organizations/<slug:organization_slug>/departments/<int:department_id>/", employee_views.department_detail, name="department-detail"),
+    path("organizations/<slug:organization_slug>/roles/", hr_views.roles, name="role-list"),
+    path("organizations/<slug:organization_slug>/roles/<int:role_id>/", hr_views.role_detail, name="role-detail"),
+    path("organizations/<slug:organization_slug>/permissions/", hr_views.permissions, name="permission-list"),
+    path("organizations/<slug:organization_slug>/holidays/", hr_views.holidays, name="holiday-list"),
+    path("organizations/<slug:organization_slug>/attendance/", hr_views.attendance, name="attendance-list"),
+    path("organizations/<slug:organization_slug>/attendance/check-in/", hr_views.attendance_check_in, name="attendance-check-in"),
+    path("organizations/<slug:organization_slug>/attendance/check-out/", hr_views.attendance_check_out, name="attendance-check-out"),
+    path("organizations/<slug:organization_slug>/leaves/", hr_views.leaves, name="leave-list"),
+    path("organizations/<slug:organization_slug>/leaves/<int:leave_id>/", hr_views.leave_detail, name="leave-detail"),
+    path("organizations/<slug:organization_slug>/leaves/<int:leave_id>/approve/", hr_views.leave_approve, name="leave-approve"),
+    path("organizations/<slug:organization_slug>/leaves/<int:leave_id>/reject/", hr_views.leave_reject, name="leave-reject"),
+    path("organizations/<slug:organization_slug>/leaves/<int:leave_id>/cancel/", hr_views.leave_cancel, name="leave-cancel"),
 ]

@@ -8,9 +8,11 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from .models import Organization, OrganizationMembership, PlatformOrganizationAccess, TAB_PERMISSIONS
-from .serializers import AddMembershipSerializer, MembershipSerializer, OrganizationSerializer, TabPermissionsSerializer
-from .services import PLATFORM_ADMIN_GROUP, get_organization_access, is_platform_admin
+from .models import Organization, OrganizationMembership, Permission, PlatformOrganizationAccess, TAB_PERMISSIONS
+from .serializers import AddMembershipSerializer, MembershipSerializer, OrganizationSerializer
+from .services import (PLATFORM_ADMIN_GROUP,
+                       ensure_default_roles, get_organization_access,
+                       is_platform_admin, membership_permission_codes)
 
 
 @api_view(["GET", "POST"])
@@ -30,6 +32,7 @@ def platform_organizations(request):
     org_admin = get_object_or_404(get_user_model(), email__iexact=admin_email)
     with transaction.atomic():
         organization = serializer.save(created_by=request.user)
+        ensure_default_roles(organization)
         OrganizationMembership.objects.create(organization=organization, user=org_admin, role=OrganizationMembership.Role.ADMIN)
         if not request.user.is_superuser:
             PlatformOrganizationAccess.objects.create(organization=organization, user=request.user, granted_by=request.user)
@@ -52,9 +55,6 @@ def organization_members(request, slug):
         user=user,
         defaults={"role": serializer.validated_data["role"], "is_active": True},
     )
-    if "tab_permissions" in serializer.validated_data:
-        membership.tab_permissions = serializer.validated_data["tab_permissions"]
-        membership.save(update_fields=["tab_permissions"])
     return Response(MembershipSerializer(membership).data, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
 
 @api_view(["POST"])
@@ -82,25 +82,18 @@ def platform_organization_access(request, slug):
         return Response({"email": ["User must be a platform admin first."]}, status=status.HTTP_400_BAD_REQUEST)
     access, created = PlatformOrganizationAccess.objects.get_or_create(organization=organization, user=user, defaults={"granted_by": request.user})
     return Response({"organization": organization.slug, "email": user.email}, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
-@api_view(["GET", "PATCH"])
-@permission_classes([IsAuthenticated])
-def member_tab_permissions(request, slug, membership_id):
-    access = get_organization_access(request.user, slug)
-    if not access.can_manage_members:
-        raise PermissionDenied("Only organization admins can manage tab permissions.")
-    membership = get_object_or_404(access.organization.memberships.select_related("user"), pk=membership_id)
-    if request.method == "GET":
-        return Response({"available_tabs": TAB_PERMISSIONS, "member": MembershipSerializer(membership).data})
-    serializer = TabPermissionsSerializer(data=request.data)
-    serializer.is_valid(raise_exception=True)
-    membership.tab_permissions = serializer.validated_data["tab_permissions"]
-    membership.save(update_fields=["tab_permissions"])
-    return Response(MembershipSerializer(membership).data)
-
-
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def my_tab_permissions(request, slug):
     access = get_organization_access(request.user, slug)
-    enabled_tabs = list(TAB_PERMISSIONS) if access.is_platform else access.membership.tab_permissions
-    return Response({"organization": access.organization.slug, "available_tabs": TAB_PERMISSIONS, "tab_permissions": enabled_tabs})
+    permission_codes = (
+        [permission.code for permission in Permission.objects.all()]
+        if access.is_platform
+        else [f"{module}.{action}" for module, action in membership_permission_codes(access.membership)]
+    )
+    return Response({
+        "organization": access.organization.slug,
+        "role": "platform_admin" if access.is_platform else access.membership.organization_role.code if access.membership.organization_role_id else access.membership.role,
+        "available_tabs": TAB_PERMISSIONS,
+        "permissions": permission_codes,
+    })

@@ -1,6 +1,8 @@
 from django.contrib.auth import authenticate, get_user_model
 from rest_framework import serializers
 
+from organizations.services import membership_permission_codes
+
 
 class UserSerializer(serializers.ModelSerializer):
     organization_memberships = serializers.SerializerMethodField()
@@ -18,7 +20,7 @@ class UserSerializer(serializers.ModelSerializer):
                 "organization": membership.organization.slug,
                 "organization_name": membership.organization.name,
                 "role": membership.role,
-                "tab_permissions": membership.tab_permissions,
+                "permissions": [f"{module}.{action}" for module, action in membership_permission_codes(membership)],
             }
             for membership in memberships
         ]

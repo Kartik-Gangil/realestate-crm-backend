@@ -10,10 +10,26 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
+import os
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+def _load_local_env_file(path):
+    """Load simple KEY=VALUE settings without requiring another runtime package."""
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+_load_local_env_file(BASE_DIR / ".env")
 
 
 # Quick-start development settings - unsuitable for production
@@ -47,6 +63,9 @@ INSTALLED_APPS = [
     'users',
     'organizations',
     'leads',
+    'inventory',
+    'documents',
+    'system_settings',
     'corsheaders',
 ]
 
@@ -128,6 +147,22 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = 'static/'
+MEDIA_URL = '/media/'
+MEDIA_ROOT = BASE_DIR / 'media'
+DOCUMENT_MAX_UPLOAD_SIZE = 10 * 1024 * 1024
+DOCUMENT_EXPIRY_WARNING_DAYS = 30
+
+# SMTP credentials live in the ignored .env file.  See .env.example.
+EMAIL_BACKEND = os.getenv("EMAIL_BACKEND", "django.core.mail.backends.smtp.EmailBackend")
+EMAIL_HOST = os.getenv("EMAIL_HOST", "")
+EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
+EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "")
+EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "")
+EMAIL_USE_TLS = os.getenv("EMAIL_USE_TLS", "true").lower() in {"1", "true", "yes"}
+DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", EMAIL_HOST_USER or "noreply@example.com")
+PASSWORD_RESET_FRONTEND_URL = os.getenv("PASSWORD_RESET_FRONTEND_URL", "http://localhost:5173/reset-password")
+INTEGRATION_ENCRYPTION_KEY = os.getenv("INTEGRATION_ENCRYPTION_KEY", "")
+ENVIRONMENT_NAME = os.getenv("ENVIRONMENT_NAME", "development")
 
 AUTHENTICATION_BACKENDS = [
     "users.backends.EmailBackend",

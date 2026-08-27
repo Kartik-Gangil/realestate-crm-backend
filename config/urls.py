@@ -21,5 +21,9 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/auth/', include('users.urls')),
     path('api/', include('organizations.urls')),
+    path('api/settings/', include('system_settings.urls')),
+    path('api/organizations/<slug:organization_slug>/', include('system_settings.organization_urls')),
     path('api/organizations/<slug:organization_slug>/', include('leads.urls')),
+    path('api/organizations/<slug:organization_slug>/', include('inventory.urls')),
+    path('api/organizations/<slug:organization_slug>/', include('documents.urls')),
 ]
