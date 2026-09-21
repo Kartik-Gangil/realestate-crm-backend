@@ -3,7 +3,9 @@ from . import views
 
 app_name = "documents"
 urlpatterns = [
+    path("documents/", views.document_list, name="documents"),
     path("documents/", views.document_list, name="list"), 
+    path("documents/verify-ekyc/", views.verify_ekyc, name="verify-ekyc"),
     path("documents/categories/", views.categories, name="categories"), 
     path("documents/categories/<int:category_id>/", views.category_detail, name="category-detail"),
     path("documents/pending-verification/", views.pending_verification, name="pending"), 

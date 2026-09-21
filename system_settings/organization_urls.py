@@ -2,6 +2,7 @@ from django.urls import path
 from . import views
 
 urlpatterns = [
+    path("master-data/<slug:master_type>/", views.master_data_lookup),
     path("settings/general/", views.general_settings),
     path("settings/integrations/", views.integrations),
     path("settings/integrations/<int:integration_id>/", views.integration_detail),

@@ -1,19 +1,23 @@
 from datetime import date, timedelta
 from decimal import Decimal
+import tempfile
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
-from django.test import TestCase
+from django.test import TestCase, override_settings
+from django.core.files.uploadedfile import SimpleUploadedFile
 
 from leads.models import Lead
 from organizations.models import Organization, OrganizationMembership
 
-from .models import Agreement, Block, Installment, Payment, Plot, PlotBooking, Possession, Registry
+from .models import Agreement, Block, Installment, Payment, Plot, PlotBooking, Possession, Registry, RegistryDocument
+from documents.models import CustomerDocument, DocumentCategory
 from .phase5_services import (allocate_payment, confirm_payment, create_agreement, create_installment,
     approve_refund, create_payment, create_possession, create_registry, fail_payment, payment_totals, refund_payment,
     transition_agreement, transition_possession, transition_registry)
 
 
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp())
 class Phase5ServiceTests(TestCase):
     def setUp(self):
         user_model = get_user_model(); self.user = user_model.objects.create_user(username="manager", password="x")
@@ -49,7 +53,11 @@ class Phase5ServiceTests(TestCase):
         transition_agreement(agreement=agreement, status=Agreement.Status.READY)
         transition_agreement(agreement=agreement, status=Agreement.Status.SIGNED)
         with self.assertRaises(ValidationError): transition_agreement(agreement=agreement, status=Agreement.Status.READY)
+        Payment.objects.create(organization=self.org, booking=self.booking, payment_id="P5-REG-PAID", amount=Decimal("1000"), payment_method=Payment.Method.CASH, status=Payment.Status.SUCCESS, payment_date=date.today(), received_by=self.user)
         registry = create_registry(booking=self.booking, created_by=self.user)
+        category = DocumentCategory.objects.create(organization=self.org, name="PAN", code="pan")
+        document = CustomerDocument.objects.create(organization=self.org, customer=self.booking.lead, document_category=category, document_name="PAN", file=SimpleUploadedFile("pan.pdf", b"%PDF-1.4 valid", content_type="application/pdf"), file_name="pan.pdf", file_size=14, content_type="application/pdf", version=1, status=CustomerDocument.Status.VERIFIED)
+        RegistryDocument.objects.create(registry=registry, organization=self.org, customer_document=document, document_label="PAN")
         with self.assertRaises(ValidationError): transition_registry(registry=registry, status=Registry.Status.COMPLETED)
         registry.registry_date = date.today(); registry.save(update_fields=["registry_date", "updated_at"])
         transition_registry(registry=registry, status=Registry.Status.SCHEDULED)

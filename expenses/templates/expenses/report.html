@@ -1,0 +1,35 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { font-family: Helvetica, Arial, sans-serif; font-size: 10px; }
+    h1 { font-size: 18px; } h2 { font-size: 13px; margin-top: 16px; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #777; padding: 5px; }
+    th { background: #eeeeee; }
+  </style>
+</head>
+<body>
+  <h1>Expense Report</h1>
+  <p>Date range: {{ report.filters.start|default:"All" }} to {{ report.filters.end|default:"All" }}</p>
+  <h2>Summary</h2>
+  <table>
+    <tr><th>Metric</th><th>Amount</th></tr>
+    <tr><td>Total Expenses</td><td>{{ report.totals.total_expenses }}</td></tr>
+    <tr><td>Paid</td><td>{{ report.totals.paid }}</td></tr>
+    <tr><td>Pending</td><td>{{ report.totals.pending }}</td></tr>
+    <tr><td>Reimbursements</td><td>{{ report.totals.reimbursements }}</td></tr>
+  </table>
+  <h2>Category Breakdown</h2>
+  <table>
+    <tr><th>Category</th><th>Amount</th><th>Count</th></tr>
+    {% for item in report.category_breakdown %}<tr><td>{{ item.category }}</td><td>{{ item.amount }}</td><td>{{ item.count }}</td></tr>{% endfor %}
+  </table>
+  <h2>Expenses Over Time</h2>
+  <table>
+    <tr><th>Date</th><th>Amount</th><th>Count</th></tr>
+    {% for item in report.expenses_over_time %}<tr><td>{{ item.date }}</td><td>{{ item.amount }}</td><td>{{ item.count }}</td></tr>{% endfor %}
+  </table>
+</body>
+</html>

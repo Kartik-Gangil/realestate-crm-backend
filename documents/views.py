@@ -2,7 +2,7 @@ from datetime import timedelta
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.http import FileResponse
+from django.http import FileResponse, HttpResponse
 from django.shortcuts import get_object_or_404
 from django.db.models import Q
 from django.utils import timezone
@@ -13,10 +13,11 @@ from rest_framework import status
 
 from leads.models import Lead
 from organizations.services import get_organization_access
-from .models import CustomerDocument, CustomerDocumentRequirement, DocumentCategory, EmployeeDocument, EmployeeDocumentCategory
+from .models import CustomerDocument, CustomerDocumentRequirement, DocumentCategory, EmployeeDocument, EmployeeDocumentCategory, EkycVerification
 from .permissions import require_document_management
 from .serializers import CustomerDocumentSerializer, CustomerDocumentUploadSerializer, DocumentCategorySerializer, DocumentRequirementSerializer, VerificationHistorySerializer
-from .services import archive_customer_document, archive_employee_document, get_customer_document_summary, put_document_under_verification, reject_customer_document, upload_customer_document, upload_employee_document, verify_customer_document
+from .services import archive_customer_document, archive_employee_document, create_expiry_notifications, get_customer_document_summary, put_document_under_verification, reject_customer_document, upload_customer_document, upload_employee_document, verify_customer_document, verify_ekyc as run_ekyc
+from .security import decrypt_bytes
 from organizations.models import OrganizationActivity, OrganizationMembership
 
 
@@ -55,7 +56,9 @@ def document_detail(request, organization_slug, document_id): return Response(Cu
 @permission_classes([IsAuthenticated])
 def document_download(request, organization_slug, document_id):
     document = _doc(get_organization_access(request.user, organization_slug), document_id)
-    return FileResponse(document.file.open("rb"), as_attachment=True, filename=document.file_name, content_type=document.content_type)
+    with document.file.open("rb") as stored:
+        content = stored.read()
+    return HttpResponse(decrypt_bytes(content), content_type=document.content_type, headers={"Content-Disposition": f'attachment; filename="{document.file_name}"'})
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
@@ -91,7 +94,50 @@ def document_archive(request, organization_slug, document_id): return _action(re
 def customer_documents(request, organization_slug, customer_id):
     access = get_organization_access(request.user, organization_slug); customer = _customer(access, customer_id)
     requirements = CustomerDocumentRequirement.objects.filter(organization=access.organization, customer=customer).select_related("document_category")
-    return Response({"customer": {"id": customer.id, "full_name": customer.full_name}, "requirements": DocumentRequirementSerializer(requirements, many=True).data, "documents": CustomerDocumentSerializer(_docs(access).filter(customer=customer, is_active=True), many=True).data, "summary": get_customer_document_summary(customer)})
+
+    from inventory.models import PlotBooking, RegistryDocument
+    bookings = PlotBooking.objects.filter(
+        organization=access.organization, lead=customer,
+        status__in=[PlotBooking.Status.PENDING, PlotBooking.Status.CONFIRMED],
+    ).select_related("plot", "plot__block")
+
+    booked_plots = []
+    for booking in bookings:
+        plot_data = {
+            "booking_id": booking.id,
+            "plot": {"id": booking.plot_id, "plot_number": booking.plot.plot_number, "block": booking.plot.block.name},
+            "status": booking.status,
+            "registry": None,
+        }
+        if hasattr(booking, "registry"):
+            registry = booking.registry
+            registry_docs = RegistryDocument.objects.filter(registry=registry).select_related("customer_document", "uploaded_by")
+            plot_data["registry"] = {
+                "id": registry.id,
+                "status": registry.status,
+                "documents": [
+                    {
+                        "id": d.id,
+                        "document_label": d.document_label,
+                        "document_type": d.document_type,
+                        "source": "reference" if d.customer_document_id else "upload",
+                        "customer_document_id": d.customer_document_id,
+                        "file_name": d.file_name or (d.customer_document.file_name if d.customer_document_id else None),
+                        "uploaded_by": {"id": d.uploaded_by_id, "name": d.uploaded_by.get_full_name()} if d.uploaded_by_id else None,
+                        "created_at": d.created_at.isoformat(),
+                    }
+                    for d in registry_docs
+                ],
+            }
+        booked_plots.append(plot_data)
+
+    return Response({
+        "customer": {"id": customer.id, "full_name": customer.full_name},
+        "requirements": DocumentRequirementSerializer(requirements, many=True).data,
+        "documents": CustomerDocumentSerializer(_docs(access).filter(customer=customer, is_active=True), many=True).data,
+        "summary": get_customer_document_summary(customer),
+        "booked_plots": booked_plots,
+    })
 
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
@@ -127,12 +173,28 @@ def pending_verification(request, organization_slug):
 @permission_classes([IsAuthenticated])
 def expiry_alerts(request, organization_slug):
     access = get_organization_access(request.user, organization_slug); 
+    create_expiry_notifications()
     today = timezone.localdate(); 
     soon = today + timedelta(days=getattr(settings, "DOCUMENT_EXPIRY_WARNING_DAYS", 30)); 
     state = request.query_params.get("state", "expired"); 
     query = _docs(access).filter(is_active=True)
     query = query.filter(expiry_date__lt=today) if state == "expired" else query.filter(expiry_date__gte=today, expiry_date__lte=soon)
     return _page(request, query, CustomerDocumentSerializer)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def verify_ekyc(request, organization_slug):
+    access = get_organization_access(request.user, organization_slug)
+    require_document_management(access)
+    if access.membership and access.membership.role == OrganizationMembership.Role.TELECALLER:
+        return Response({"detail": "Only managers and admins can run eKYC."}, status=status.HTTP_403_FORBIDDEN)
+    customer = _customer(access, request.data.get("customer"))
+    try:
+        verification = run_ekyc(customer=customer, provider=request.data.get("provider", "mock"), id_number=request.data.get("id_number", ""), checks=request.data.get("checks", {}), actor=request.user)
+    except ValidationError as error:
+        return _error(error)
+    return Response({"id": verification.id, "status": verification.verification_status, "attempts": verification.attempts}, status=202 if verification.verification_status == EkycVerification.Status.PENDING else 200)
 
 
 def _employee_document(access, document_id):

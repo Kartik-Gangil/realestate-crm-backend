@@ -8,8 +8,10 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from .models import Organization, OrganizationMembership, Permission, PlatformOrganizationAccess, TAB_PERMISSIONS
-from .serializers import AddMembershipSerializer, MembershipSerializer, OrganizationSerializer
+from .models import Organization, OrganizationMembership, Permission, PlatformOrganizationAccess, Project, TAB_PERMISSIONS
+from .phase0 import (accessible_organizations, accessible_projects, api_error, api_success,
+                     can_manage_projects, resolve_project_context)
+from .serializers import AddMembershipSerializer, MembershipSerializer, OrganizationSerializer, ProjectSerializer
 from .services import (PLATFORM_ADMIN_GROUP,
                        ensure_default_roles, get_organization_access,
                        is_platform_admin, membership_permission_codes)
@@ -39,6 +41,84 @@ def platform_organizations(request):
     return Response(OrganizationSerializer(organization).data, status=status.HTTP_201_CREATED)
 
 
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def organization_list(request):
+    """API-P0-01: organizations assigned to the authenticated user."""
+    data = OrganizationSerializer(accessible_organizations(request.user), many=True).data
+    return api_success(data)
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def project_list(request):
+    """API-P0-02/API-P0-03: assigned project discovery and Admin-only creation."""
+    if request.method == "GET":
+        return api_success(ProjectSerializer(accessible_projects(request.user), many=True).data)
+
+    serializer = ProjectSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    organization = serializer.validated_data["organization"]
+    if not can_manage_projects(request.user, organization):
+        raise PermissionDenied("Only Super Admin or Admin roles may create projects.")
+    project = serializer.save()
+    from system_settings.audit import log_audit
+    serialized = ProjectSerializer(project).data
+    log_audit(
+        request=request,
+        organization=organization,
+        module="projects",
+        action="create",
+        details={"payload_before": None, "payload_after": serialized},
+        target=project,
+    )
+    return api_success(serialized, project=project, response_status=status.HTTP_201_CREATED)
+
+
+@api_view(["GET", "PATCH", "DELETE"])
+@permission_classes([IsAuthenticated])
+def project_detail(request, project_id):
+    project = accessible_projects(request.user, include_inactive=True).filter(pk=project_id).first()
+    if project is None:
+        return api_error(
+            "project_not_found", "Project not found.", response_status=status.HTTP_404_NOT_FOUND
+        )
+
+    if request.method == "GET":
+        context, error = resolve_project_context(request, expected_project=project)
+        if error:
+            return error
+        return api_success(ProjectSerializer(project).data, project=context)
+
+    context, error = resolve_project_context(request, expected_project=project)
+    if error:
+        return error
+    if not can_manage_projects(request.user, project.organization):
+        raise PermissionDenied("Only Super Admin or Admin roles may modify projects.")
+
+    from system_settings.audit import log_audit
+    before = ProjectSerializer(project).data
+    if request.method == "PATCH":
+        serializer = ProjectSerializer(project, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        project = serializer.save()
+        after = ProjectSerializer(project).data
+        log_audit(
+            request=request, organization=project.organization, module="projects", action="update",
+            details={"payload_before": before, "payload_after": after}, target=project,
+        )
+        return api_success(after, project=context)
+
+    project.status = Project.Status.INACTIVE
+    project.save(update_fields=["status", "updated_at"])
+    after = ProjectSerializer(project).data
+    log_audit(
+        request=request, organization=project.organization, module="projects", action="delete",
+        details={"payload_before": before, "payload_after": after}, target=project,
+    )
+    return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def organization_members(request, slug):
@@ -49,7 +129,7 @@ def organization_members(request, slug):
         raise PermissionDenied("Only organization admins can manage members.")
     serializer = AddMembershipSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
-    user = serializer.user
+    user = serializer.validated_data["user"]
     membership, created = OrganizationMembership.objects.update_or_create(
         organization=access.organization,
         user=user,

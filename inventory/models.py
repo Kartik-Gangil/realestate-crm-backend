@@ -4,13 +4,14 @@ from django.db import models
 from django.db.models import Q
 from django.utils import timezone
 from datetime import timedelta
+from organizations.models import ProjectScopedModel
 
 
 def default_selection_expiry():
     return timezone.now() + timedelta(minutes=30)
 
 
-class Block(models.Model):
+class Block(ProjectScopedModel):
     """Top-level inventory grouping, scoped only to the organization."""
 
     organization = models.ForeignKey(
@@ -25,7 +26,12 @@ class Block(models.Model):
         ordering = ["name"]
         constraints = [
             models.UniqueConstraint(
-                fields=["organization", "code"], name="unique_inventory_block_code"
+                fields=["organization", "project", "code"], name="unique_inventory_block_code"
+            ),
+            models.UniqueConstraint(
+                fields=["organization", "code"],
+                condition=Q(project__isnull=True),
+                name="unique_inventory_block_code_legacy",
             ),
         ]
 
@@ -33,7 +39,7 @@ class Block(models.Model):
         return f"{self.organization} - {self.name}"
 
 
-class Plot(models.Model):
+class Plot(ProjectScopedModel):
     class PlotType(models.TextChoices):
         RESIDENTIAL = "residential", "Residential"
         COMMERCIAL = "commercial", "Commercial"
@@ -59,7 +65,8 @@ class Plot(models.Model):
     total_price = models.DecimalField(max_digits=16, decimal_places=2, null=True, blank=True)
     facing = models.CharField(max_length=50, blank=True)
     dimensions = models.CharField(max_length=100, blank=True)
-    status = models.CharField(max_length=24, choices=Status.choices, default=Status.AVAILABLE)
+    # FR-P2-01/GNFR-09: accepted values are bound to active plot_status master data.
+    status = models.CharField(max_length=64, default=Status.AVAILABLE)
     description = models.TextField(blank=True)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
@@ -72,8 +79,13 @@ class Plot(models.Model):
         ordering = ["block__name", "plot_number"]
         constraints = [
             models.UniqueConstraint(
-                fields=["organization", "block", "plot_number"],
+                fields=["organization", "project", "block", "plot_number"],
                 name="unique_inventory_plot_number",
+            ),
+            models.UniqueConstraint(
+                fields=["organization", "block", "plot_number"],
+                condition=Q(project__isnull=True),
+                name="unique_inventory_plot_number_legacy",
             ),
             models.CheckConstraint(condition=Q(size__gt=0), name="inventory_plot_size_positive"),
             models.CheckConstraint(
@@ -106,8 +118,8 @@ class PlotStatusHistory(models.Model):
     """Immutable audit event for a plot status transition."""
 
     plot = models.ForeignKey(Plot, on_delete=models.CASCADE, related_name="status_history")
-    old_status = models.CharField(max_length=24, choices=Plot.Status.choices)
-    new_status = models.CharField(max_length=24, choices=Plot.Status.choices)
+    old_status = models.CharField(max_length=64)
+    new_status = models.CharField(max_length=64)
     reason = models.TextField(blank=True)
     changed_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
@@ -172,13 +184,14 @@ class PlotHold(models.Model):
         return f"{self.plot} - {self.get_action_type_display()}"
 
 
-class PlotBooking(models.Model):
+class PlotBooking(ProjectScopedModel):
     """A lead's booking intent; plot state remains owned by inventory services."""
 
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
         CONFIRMED = "confirmed", "Confirmed"
         CANCELLED = "cancelled", "Cancelled"
+        EXPIRED = "expired", "Expired"
 
     organization = models.ForeignKey(
         "organizations.Organization", on_delete=models.CASCADE, related_name="plot_bookings"
@@ -189,10 +202,14 @@ class PlotBooking(models.Model):
         "leads.Sitevisit", null=True, blank=True, on_delete=models.SET_NULL,
         related_name="plot_bookings",
     )
-    status = models.CharField(max_length=12, choices=Status.choices, default=Status.PENDING)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
     notes = models.TextField(blank=True)
     cancellation_reason = models.TextField(blank=True)
     final_price = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
+    idempotency_key = models.CharField(max_length=128, blank=True, default="")
+    idempotency_request_hash = models.CharField(max_length=64, blank=True, default="")
+    hold_expires_at = models.DateTimeField(null=True, blank=True)
+    minimum_payment_amount = models.DecimalField(max_digits=15, decimal_places=2, default=0)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
         related_name="created_plot_bookings",
@@ -202,11 +219,25 @@ class PlotBooking(models.Model):
 
     class Meta:
         ordering = ["-created_at", "-id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["organization", "project", "idempotency_key"],
+                condition=~Q(idempotency_key="") & Q(project__isnull=False),
+                name="inventory_booking_project_idempotency_unique",
+            ),
+            models.UniqueConstraint(
+                fields=["organization", "idempotency_key"],
+                condition=~Q(idempotency_key="") & Q(project__isnull=True),
+                name="inventory_booking_legacy_idempotency_unique",
+            ),
+        ]
         indexes = [
             models.Index(fields=["organization", "status"]),
             models.Index(fields=["organization", "lead", "created_at"]),
             models.Index(fields=["organization", "plot", "status"]),
             models.Index(fields=["site_visit"]),
+            models.Index(fields=["organization", "idempotency_key"]),
+            models.Index(fields=["status", "hold_expires_at"]),
         ]
 
     def clean(self):
@@ -228,9 +259,35 @@ class PlotBooking(models.Model):
         return f"Booking #{self.pk or 'new'}: {self.plot} for {self.lead}"
 
 
-class Payment(models.Model):
+class BookingReceipt(ProjectScopedModel):
+    """FR-P9-08: immutable, organization-sequential booking receipt identity."""
+
+    organization = models.ForeignKey(
+        "organizations.Organization", on_delete=models.CASCADE, related_name="booking_receipts"
+    )
+    booking = models.OneToOneField(PlotBooking, on_delete=models.PROTECT, related_name="receipt")
+    sequence = models.PositiveBigIntegerField()
+    receipt_number = models.CharField(max_length=48)
+    generated_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["organization", "project", "sequence"],
+                name="inventory_booking_receipt_org_sequence_unique",
+            ),
+            models.UniqueConstraint(
+                fields=["organization", "sequence"],
+                condition=Q(project__isnull=True),
+                name="inventory_booking_receipt_org_sequence_legacy",
+            ),
+        ]
+
+
+class Payment(ProjectScopedModel):
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
+        PENDING_REALIZATION = "pending_realization", "Pending Realization"
         SUCCESS = "success", "Success"
         FAILED = "failed", "Failed"
         CANCELLED = "cancelled", "Cancelled"
@@ -250,26 +307,40 @@ class Payment(models.Model):
     booking = models.ForeignKey(PlotBooking, null=True, blank=True, on_delete=models.SET_NULL, related_name="payments")
     payment_id = models.CharField(max_length=40, blank=True)
     amount = models.DecimalField(max_digits=15, decimal_places=2)
-    payment_method = models.CharField(max_length=64)
-    status = models.CharField(max_length=12, choices=Status.choices, default=Status.PENDING)
+    payment_method = models.CharField(max_length=64, choices=Method.choices)
+    status = models.CharField(max_length=24, choices=Status.choices, default=Status.PENDING)
     transaction_reference = models.CharField(max_length=100, blank=True)
     payment_date = models.DateField()
     notes = models.TextField(blank=True)
+    idempotency_key = models.CharField(max_length=128, blank=True, default="")
+    idempotency_request_hash = models.CharField(max_length=64, blank=True, default="")
+    advance_amount = models.DecimalField(max_digits=15, decimal_places=2, default=0)
     received_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="received_payments")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ["-payment_date", "-id"]
-        constraints = [models.CheckConstraint(condition=Q(amount__gt=0), name="inventory_payment_amount_positive"), models.UniqueConstraint(fields=["organization", "payment_id"], name="inventory_payment_org_payment_id_unique")]
+        constraints = [models.CheckConstraint(condition=Q(amount__gt=0), name="inventory_payment_amount_positive"), models.UniqueConstraint(fields=["organization", "project", "payment_id"], name="inventory_payment_org_payment_id_unique"), models.UniqueConstraint(fields=["organization", "payment_id"], condition=Q(project__isnull=True), name="inventory_payment_org_payment_id_legacy"), models.UniqueConstraint(fields=["organization", "project", "idempotency_key"], condition=~Q(idempotency_key="") & Q(project__isnull=False), name="inventory_payment_project_idempotency_unique"), models.UniqueConstraint(fields=["organization", "idempotency_key"], condition=~Q(idempotency_key="") & Q(project__isnull=True), name="inventory_payment_legacy_idempotency_unique")]
         indexes = [models.Index(fields=["organization", "booking", "status"]), models.Index(fields=["organization", "payment_date"]), models.Index(fields=["organization", "transaction_reference"])]
 
     def clean(self):
         if self.booking_id and self.organization_id != self.booking.organization_id:
             raise ValidationError({"booking": "Booking must belong to this organization."})
 
+    def save(self, *args, **kwargs):
+        if self.pk and not getattr(self, "_allow_mutation", False):
+            previous = type(self).objects.get(pk=self.pk)
+            immutable = ("organization_id", "project_id", "booking_id", "payment_id", "amount", "payment_method", "transaction_reference", "payment_date", "notes", "received_by_id", "idempotency_key", "idempotency_request_hash", "advance_amount")
+            if any(getattr(previous, field) != getattr(self, field) for field in immutable):
+                raise ValidationError("Payment rows are immutable; use an adjustment or refund entry.")
+        return super().save(*args, **kwargs)
 
-class PaymentRefund(models.Model):
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Payment rows are immutable and cannot be deleted.")
+
+
+class PaymentRefund(ProjectScopedModel):
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
         APPROVED = "approved", "Approved"
@@ -319,15 +390,23 @@ class PaymentAllocation(models.Model):
         if errors:
             raise ValidationError(errors)
 
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise ValidationError("Payment allocations are immutable.")
+        return super().save(*args, **kwargs)
 
-class PaymentReceipt(models.Model):
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Payment allocations are immutable and cannot be deleted.")
+
+
+class PaymentReceipt(ProjectScopedModel):
     payment = models.OneToOneField(Payment, on_delete=models.CASCADE, related_name="receipt")
     organization = models.ForeignKey("organizations.Organization", on_delete=models.CASCADE, related_name="payment_receipts")
     receipt_number = models.CharField(max_length=48)
     generated_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        constraints = [models.UniqueConstraint(fields=["organization", "receipt_number"], name="inventory_receipt_org_number_unique")]
+        constraints = [models.UniqueConstraint(fields=["organization", "project", "receipt_number"], name="inventory_receipt_org_number_unique"), models.UniqueConstraint(fields=["organization", "receipt_number"], condition=Q(project__isnull=True), name="inventory_receipt_org_number_legacy")]
 
 
 class PaymentStatusHistory(models.Model):
@@ -352,7 +431,7 @@ class PaymentAdjustment(models.Model):
     class Meta: constraints = [models.CheckConstraint(condition=Q(amount__gt=0), name="inventory_payment_adjustment_positive")]
 
 
-class Installment(models.Model):
+class Installment(ProjectScopedModel):
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
         PARTIALLY_PAID = "partially_paid", "Partially paid"
@@ -396,7 +475,25 @@ class InstallmentPayment(models.Model):
             raise ValidationError({"installment": "Payment and installment must belong to the same booking."})
 
 
-class Agreement(models.Model):
+def agreement_signed_upload_path(instance, filename):
+    import os, uuid
+    from django.utils.text import get_valid_filename
+    safe_name = get_valid_filename(os.path.basename(filename)) or "signed"
+    return "agreements/signed/{}/{}/{}_{}".format(
+        instance.organization.slug, instance.booking_id, uuid.uuid4().hex, safe_name,
+    )
+
+
+def agreement_generated_upload_path(instance, filename):
+    import os, uuid
+    from django.utils.text import get_valid_filename
+    safe_name = get_valid_filename(os.path.basename(filename)) or "template"
+    return "agreements/generated/{}/{}/{}_{}".format(
+        instance.organization.slug, instance.booking_id, uuid.uuid4().hex, safe_name,
+    )
+
+
+class Agreement(ProjectScopedModel):
     class Status(models.TextChoices):
         DRAFT = "draft", "Draft"
         READY = "ready", "Ready"
@@ -410,6 +507,10 @@ class Agreement(models.Model):
     status = models.CharField(max_length=12, choices=Status.choices, default=Status.DRAFT)
     document_reference = models.CharField(max_length=500, blank=True)
     notes = models.TextField(blank=True)
+    generated_pdf = models.FileField(upload_to=agreement_generated_upload_path, null=True, blank=True)
+    signed_file = models.FileField(upload_to=agreement_signed_upload_path, null=True, blank=True)
+    signed_file_name = models.CharField(max_length=255, blank=True)
+    signed_file_size = models.PositiveBigIntegerField(null=True, blank=True)
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="created_agreements")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -422,7 +523,7 @@ class Agreement(models.Model):
             raise ValidationError({"booking": "Booking must belong to this organization."})
 
 
-class Registry(models.Model):
+class Registry(ProjectScopedModel):
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
         IN_PROCESS = "in_process", "In process"
@@ -481,7 +582,52 @@ class RegistryStatusHistory(models.Model):
         return super().save(*args, **kwargs)
 
 
-class Possession(models.Model):
+def registry_document_upload_path(instance, filename):
+    import os, uuid
+    from django.utils.text import get_valid_filename
+    safe_name = get_valid_filename(os.path.basename(filename)) or "document"
+    return "registry_documents/{}/{}/{}_{}".format(
+        instance.registry.booking.organization.slug, instance.registry_id, uuid.uuid4().hex, safe_name,
+    )
+
+
+class RegistryDocument(ProjectScopedModel):
+    registry = models.ForeignKey(Registry, on_delete=models.CASCADE, related_name="documents")
+    organization = models.ForeignKey("organizations.Organization", on_delete=models.CASCADE, related_name="registry_documents")
+    customer_document = models.ForeignKey(
+        "documents.CustomerDocument", null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="registry_links",
+    )
+    file = models.FileField(upload_to=registry_document_upload_path, null=True, blank=True)
+    file_name = models.CharField(max_length=255, blank=True)
+    file_size = models.PositiveBigIntegerField(null=True, blank=True)
+    content_type = models.CharField(max_length=100, blank=True)
+    document_label = models.CharField(max_length=200, blank=True)
+    document_type = models.CharField(max_length=50, blank=True)
+    uploaded_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="uploaded_registry_documents")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        indexes = [
+            models.Index(fields=["organization", "registry"]),
+            models.Index(fields=["customer_document"]),
+        ]
+
+    def clean(self):
+        errors = {}
+        if self.customer_document and self.file:
+            errors["file"] = "Provide either a customer document reference or a file upload, not both."
+        if not self.customer_document and not self.file:
+            errors["file"] = "Provide either a customer document reference or a file upload."
+        if self.customer_document and self.customer_document.organization_id != self.organization_id:
+            errors["customer_document"] = "Document must belong to this organization."
+        if errors:
+            raise ValidationError(errors)
+
+
+class Possession(ProjectScopedModel):
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
         SCHEDULED = "scheduled", "Scheduled"
@@ -505,7 +651,7 @@ class Possession(models.Model):
             raise ValidationError({"booking": "Booking must belong to this organization."})
 
 
-class PlotSelection(models.Model):
+class PlotSelection(ProjectScopedModel):
     """Temporary executive selection. It deliberately does not change plot status."""
     class Status(models.TextChoices):
         ACTIVE = "active", "Active"
@@ -540,12 +686,12 @@ class PlotSelection(models.Model):
         if errors: raise ValidationError(errors)
 
 
-class RecentlyViewedPlot(models.Model):
+class RecentlyViewedPlot(ProjectScopedModel):
     organization = models.ForeignKey("organizations.Organization", on_delete=models.CASCADE)
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     plot = models.ForeignKey(Plot, on_delete=models.CASCADE)
-    viewed_at = models.DateTimeField(auto_now=True)
+    viewed_at = models.DateTimeField(default=timezone.now)
 
     class Meta:
-        constraints = [models.UniqueConstraint(fields=["organization", "user", "plot"], name="unique_recently_viewed_plot")]
+        constraints = [models.UniqueConstraint(fields=["organization", "project", "user", "plot"], name="unique_recently_viewed_plot"), models.UniqueConstraint(fields=["organization", "user", "plot"], condition=Q(project__isnull=True), name="unique_recently_viewed_plot_legacy")]
         indexes = [models.Index(fields=["organization", "user", "-viewed_at"])]

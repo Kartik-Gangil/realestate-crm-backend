@@ -14,9 +14,15 @@ from organizations.services import get_organization_access, has_permission
 from .audit import log_audit
 from .integrations import encrypt_secret
 from .maintenance import clear_system_cache, health_check, rebuild_search_index
-from .models import AuditLog, BackupRecord, IntegrationConfiguration, MasterData, OrganizationSettings, SystemParameter
-from .permissions import require_organization_settings, require_platform_settings
+from .master_data import (
+    CALL_DISPOSITION_MASTER_TYPE,
+    LEAD_STATUS_MASTER_TYPE,
+    ensure_lead_statuses,
+)
+from .models import AuditLog, BackupRecord, IntegrationConfiguration, MasterData, MasterDataCategory, OrganizationSettings, SystemParameter
+from .permissions import require_organization_settings, require_phase2_configuration_admin, require_platform_settings
 from .serializers import AuditLogSerializer, BackupRecordSerializer, IntegrationSerializer, MasterDataSerializer, OrganizationSettingsSerializer, SystemParameterSerializer
+from .services import invalidate_system_parameter
 
 
 def _page(query, request, serializer):
@@ -124,25 +130,65 @@ def access_matrix(request, organization_slug):
 @permission_classes([IsAuthenticated])
 def masters(request, organization_slug, master_type=None):
     access = _org_access(request, organization_slug, request.method == "POST")
+    if request.method == "POST":
+        require_phase2_configuration_admin(access)
+    project = getattr(request, "project", None)
     query = MasterData.objects.filter(organization=access.organization)
     if master_type: query = query.filter(master_type=master_type)
     if request.method == "GET": return Response(MasterDataSerializer(query, many=True).data)
     if not master_type: return Response({"master_type": "Use a controlled master type URL."}, status=400)
-    serializer = MasterDataSerializer(data=request.data); serializer.is_valid(raise_exception=True)
+    if master_type == CALL_DISPOSITION_MASTER_TYPE:
+        return Response({"master_type": "Call dispositions are a fixed catalogue and cannot be added."}, status=400)
+    serializer = MasterDataSerializer(
+        data=request.data,
+        context={"organization": access.organization, "project": project, "master_type": master_type},
+    ); serializer.is_valid(raise_exception=True)
     with transaction.atomic():
-        item = serializer.save(organization=access.organization, master_type=master_type)
+        category, _ = MasterDataCategory.objects.get_or_create(
+            organization=access.organization,
+            project=project,
+            code=master_type,
+            defaults={"name": master_type.replace("_", " ").title()},
+        )
+        item = serializer.save(organization=access.organization, category=category, master_type=master_type)
         log_audit(request=request, organization=access.organization, module="master_data", action="master_created", details={"master_type": master_type, "code": item.code}, target=item)
     return Response(MasterDataSerializer(item).data, status=201)
 
 
-@api_view(["PATCH", "DELETE"])
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def master_data_lookup(request, organization_slug, master_type):
+    """NFR-P2-02: active-only lookup for authenticated project consumers."""
+    access = get_organization_access(request.user, organization_slug)
+    if master_type == LEAD_STATUS_MASTER_TYPE:
+        ensure_lead_statuses(access.organization)
+    query = MasterData.objects.select_related("category").filter(
+        organization=access.organization,
+        master_type=master_type,
+        is_active=True,
+    )
+    return Response(MasterDataSerializer(query, many=True).data)
+
+
+@api_view(["PUT", "PATCH", "DELETE"])
 @permission_classes([IsAuthenticated])
 def master_detail(request, organization_slug, master_type, item_id):
-    access = _org_access(request, organization_slug, True); item = get_object_or_404(MasterData, organization=access.organization, master_type=master_type, pk=item_id)
+    access = _org_access(request, organization_slug, True)
+    require_phase2_configuration_admin(access)
+    item = get_object_or_404(MasterData, organization=access.organization, master_type=master_type, pk=item_id)
     if request.method == "DELETE":
+        if item.is_system:
+            return Response({"code": "protected_master_data", "detail": "System master data may be deactivated but not deleted."}, status=409)
         if not request.data.get("confirmation"): return Response({"code": "confirmation_required"}, status=409)
         log_audit(request=request, organization=access.organization, module="master_data", action="master_deleted", details={"code": item.code}, target=item); item.delete(); return Response(status=204)
-    serializer = MasterDataSerializer(item, data=request.data, partial=True); serializer.is_valid(raise_exception=True); item = serializer.save(); log_audit(request=request, organization=access.organization, module="master_data", action="master_updated", details={"fields": list(serializer.validated_data)}, target=item); return Response(MasterDataSerializer(item).data)
+    if master_type == CALL_DISPOSITION_MASTER_TYPE and ({"code", "name"} & set(request.data)):
+        return Response({"detail": "Call disposition codes and names are fixed."}, status=400)
+    serializer = MasterDataSerializer(
+        item,
+        data=request.data,
+        partial=request.method == "PATCH",
+        context={"organization": access.organization, "project": item.project, "master_type": master_type},
+    ); serializer.is_valid(raise_exception=True); item = serializer.save(); log_audit(request=request, organization=access.organization, module="master_data", action="master_updated", details={"fields": list(serializer.validated_data)}, target=item); return Response(MasterDataSerializer(item).data)
 
 
 @api_view(["GET", "POST"])
@@ -175,22 +221,40 @@ def integration_detail(request, organization_slug, integration_id):
 @permission_classes([IsAuthenticated])
 def system_parameters(request, organization_slug):
     access = _org_access(request, organization_slug, request.method == "POST")
+    if request.method == "POST":
+        require_phase2_configuration_admin(access)
     if request.method == "GET": return Response(SystemParameterSerializer(SystemParameter.objects.filter(organization=access.organization), many=True).data)
     serializer = SystemParameterSerializer(data=request.data); serializer.is_valid(raise_exception=True)
     if serializer.validated_data.get("is_critical") and not serializer.validated_data.pop("confirmation", False): return Response({"code": "confirmation_required"}, status=409)
-    item = serializer.save(organization=access.organization); log_audit(request=request, organization=access.organization, module="parameters", action="system_parameter_created", details={"key": item.parameter_key}, target=item); return Response(SystemParameterSerializer(item).data, status=201)
+    item = serializer.save(organization=access.organization)
+    invalidate_system_parameter(item.organization, item.parameter_key, project=item.project_id)
+    log_audit(request=request, organization=access.organization, module="parameters", action="system_parameter_created", details={"key": item.parameter_key}, target=item); return Response(SystemParameterSerializer(item).data, status=201)
 
 
-@api_view(["PATCH", "DELETE"])
+@api_view(["PUT", "PATCH", "DELETE"])
 @permission_classes([IsAuthenticated])
 def system_parameter_detail(request, organization_slug, parameter_id):
-    access = _org_access(request, organization_slug, True); item = get_object_or_404(SystemParameter, organization=access.organization, pk=parameter_id)
+    access = _org_access(request, organization_slug, True)
+    require_phase2_configuration_admin(access)
+    item = get_object_or_404(SystemParameter, organization=access.organization, pk=parameter_id)
     if request.method == "DELETE":
         if item.is_critical and not request.data.get("confirmation"): return Response({"code": "confirmation_required"}, status=409)
-        log_audit(request=request, organization=access.organization, module="parameters", action="system_parameter_deleted", details={"key": item.parameter_key}, target=item); item.delete(); return Response(status=204)
-    serializer = SystemParameterSerializer(item, data=request.data, partial=True); serializer.is_valid(raise_exception=True)
+        parameter_key, project_id = item.parameter_key, item.project_id
+        log_audit(request=request, organization=access.organization, module="parameters", action="system_parameter_deleted", details={"key": item.parameter_key}, target=item); item.delete()
+        invalidate_system_parameter(access.organization, parameter_key, project=project_id)
+        return Response(status=204)
+    serializer = SystemParameterSerializer(
+        item,
+        data=request.data,
+        partial=request.method == "PATCH",
+    ); serializer.is_valid(raise_exception=True)
     if item.is_critical and "value" in serializer.validated_data and not serializer.validated_data.pop("confirmation", False): return Response({"code": "confirmation_required"}, status=409)
-    item = serializer.save(); log_audit(request=request, organization=access.organization, module="parameters", action="system_parameter_updated", details={"key": item.parameter_key, "fields": list(serializer.validated_data)}, target=item); return Response(SystemParameterSerializer(item).data)
+    previous_key = item.parameter_key
+    item = serializer.save()
+    invalidate_system_parameter(item.organization, previous_key, project=item.project_id)
+    if item.parameter_key != previous_key:
+        invalidate_system_parameter(item.organization, item.parameter_key, project=item.project_id)
+    log_audit(request=request, organization=access.organization, module="parameters", action="system_parameter_updated", details={"key": item.parameter_key, "fields": list(serializer.validated_data)}, target=item); return Response(SystemParameterSerializer(item).data)
 
 
 @api_view(["GET"])

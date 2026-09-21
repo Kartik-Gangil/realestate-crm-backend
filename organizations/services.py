@@ -25,7 +25,13 @@ class OrganizationAccess:
 
     @property
     def can_view_all_leads(self):
-        return self.is_platform or (has_permission(self.membership.user, self.organization, "leads.view") and membership_role_code(self.membership) != OrganizationMembership.Role.TELECALLER)
+        return self.is_platform or (
+            membership_role_code(self.membership) in {
+                OrganizationMembership.Role.ADMIN,
+                OrganizationMembership.Role.MANAGER,
+            }
+            or has_permission(self.membership.user, self.organization, "leads.view_team")
+        )
 
     @property
     def can_manage_leads(self):
@@ -59,6 +65,9 @@ def ensure_default_roles(organization):
         roles["manager"].permissions.set(Permission.objects.filter(module__in=["dashboard", "leads", "customers", "plots", "documents", "employees", "attendance", "leave"]).exclude(action__in=["delete", "export"]))
     if not roles["telecaller"].permissions.exists():
         roles["telecaller"].permissions.set(Permission.objects.filter(module__in=["dashboard", "leads", "customers", "documents"], action__in=["view", "add", "edit"]))
+    expense_permissions = Permission.objects.filter(module="expenses", action__in=["view_own", "edit_own", "submit", "view_team", "approve"])
+    roles["manager"].permissions.add(*expense_permissions)
+    roles["telecaller"].permissions.add(*expense_permissions)
     return roles
 
 
@@ -80,8 +89,18 @@ def has_permission(user, organization, permission_code):
             module=permission_code.split(".", 1)[0],
             action=permission_code.split(".", 1)[1] if "." in permission_code else "",
         ).exists()
-    # Compatibility only until the data migration has run.
-    return membership.role == OrganizationMembership.Role.ADMIN
+    # Compatibility for memberships created by older integrations (and for
+    # deployments where the role-mapping migration has not yet linked every
+    # membership). Keep the same baseline matrix as ensure_default_roles()
+    # instead of treating every unlinked role as an organization admin.
+    module, _, action = permission_code.partition(".")
+    if membership.role == OrganizationMembership.Role.ADMIN:
+        return True
+    if membership.role == OrganizationMembership.Role.MANAGER:
+        return (module in {"dashboard", "leads", "customers", "plots", "documents", "employees", "attendance", "leave"} and action not in {"delete", "export"}) or (module == "expenses" and action in {"view_own", "edit_own", "submit", "view_team", "approve"})
+    if membership.role == OrganizationMembership.Role.TELECALLER:
+        return (module in {"dashboard", "leads", "customers", "documents"} and action in {"view", "add", "edit"}) or (module == "expenses" and action in {"view_own", "edit_own", "submit"})
+    return False
 
 
 def membership_permission_codes(membership):
@@ -90,10 +109,18 @@ def membership_permission_codes(membership):
         return []
     if membership.organization_role_id:
         return list(membership.organization_role.permissions.values_list("module", "action"))
-    # Legacy fallback is deliberately narrow: only legacy organization admins
-    # retain full access until their membership is linked to a canonical role.
+    # Match the compatibility matrix used by has_permission().
     if membership.role == OrganizationMembership.Role.ADMIN:
         return list(Permission.objects.values_list("module", "action"))
+    if membership.role == OrganizationMembership.Role.MANAGER:
+        return list(Permission.objects.filter(
+            module__in=["dashboard", "leads", "customers", "plots", "documents", "employees", "attendance", "leave"],
+        ).exclude(action__in=["delete", "export"]).values_list("module", "action")) + [("expenses", action) for action in ("view_own", "edit_own", "submit", "view_team", "approve")]
+    if membership.role == OrganizationMembership.Role.TELECALLER:
+        return list(Permission.objects.filter(
+            module__in=["dashboard", "leads", "customers", "documents"],
+            action__in=["view", "add", "edit"],
+        ).values_list("module", "action")) + [("expenses", action) for action in ("view_own", "edit_own", "submit")]
     return []
 
 

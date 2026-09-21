@@ -8,7 +8,7 @@ from rest_framework.test import APIClient
 from leads.models import Lead, Sitevisit
 from organizations.models import Organization, OrganizationMembership
 
-from .models import Block, Plot, PlotBooking, PlotStatusHistory, Project
+from .models import Block, Plot, PlotBooking, PlotStatusHistory
 
 
 class PlotBookingApiTests(TestCase):
@@ -22,10 +22,8 @@ class PlotBookingApiTests(TestCase):
         OrganizationMembership.objects.create(organization=self.organization, user=self.manager, role=OrganizationMembership.Role.MANAGER)
         OrganizationMembership.objects.create(organization=self.organization, user=self.viewer, role=OrganizationMembership.Role.TELECALLER)
         OrganizationMembership.objects.create(organization=self.other_organization, user=self.other_user, role=OrganizationMembership.Role.MANAGER)
-        self.project = Project.objects.create(organization=self.organization, name="Green", code="G")
-        self.block = Block.objects.create(organization=self.organization, project=self.project, name="A", code="A")
-        self.other_project = Project.objects.create(organization=self.other_organization, name="Other", code="O")
-        self.other_block = Block.objects.create(organization=self.other_organization, project=self.other_project, name="B", code="B")
+        self.block = Block.objects.create(organization=self.organization, name="A", code="A")
+        self.other_block = Block.objects.create(organization=self.other_organization, name="B", code="B")
         self.lead = Lead.objects.create(organization=self.organization, first_name="Ada", last_name="Lovelace", phone="111")
         self.other_lead = Lead.objects.create(organization=self.other_organization, first_name="Grace", phone="222")
         self.visit = Sitevisit.objects.create(organization=self.organization, lead=self.lead, site="Green")
@@ -37,7 +35,6 @@ class PlotBookingApiTests(TestCase):
         organization = organization or self.organization
         return Plot.objects.create(
             organization=organization,
-            project=self.project if organization == self.organization else self.other_project,
             block=self.block if organization == self.organization else self.other_block,
             plot_number=number, size=Decimal("100.00"), status=status,
         )

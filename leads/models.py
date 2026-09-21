@@ -2,9 +2,24 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils import timezone
+from pathlib import Path
+from uuid import uuid4
+from organizations.models import ProjectScopedModel
 
 
-class Lead(models.Model):
+def call_recording_upload_to(instance, filename):
+    """FR-P6-08: store recordings under an organization-scoped opaque name."""
+    suffix = Path(filename).suffix.lower()
+    return f"call-recordings/org/{instance.organization_id}/{uuid4().hex}{suffix}"
+
+
+class Lead(ProjectScopedModel):
+
+    class EkycStatus(models.TextChoices):
+        PENDING = "pending", "Pending"
+        VERIFIED = "verified", "Verified"
+        REJECTED = "rejected", "Rejected"
+        EXPIRED = "expired", "Expired"
 
     class Source(models.TextChoices):
         FACEBOOK = "fb", "Facebook"
@@ -22,7 +37,17 @@ class Lead(models.Model):
     phone = models.CharField(max_length=20)
     alt_phone = models.CharField(max_length=20 , blank=True)
     address = models.CharField(max_length=200 , blank=True)
-    source = models.CharField(max_length=20, choices=Source.choices, default=Source.WEBSITE)
+    city = models.CharField(max_length=100, blank=True, default="")
+    score = models.PositiveIntegerField(default=0)
+    status = models.CharField(max_length=64, default="new")
+    # FR-P9-10: explicit booking eligibility gates. Defaults preserve legacy
+    # records while allowing pending/unqualified leads to be blocked at confirm.
+    is_qualified = models.BooleanField(default=True)
+    ekyc_status = models.CharField(max_length=16, choices=EkycStatus.choices, default=EkycStatus.VERIFIED)
+    # FR-P2-01/GNFR-09: accepted values are validated against active lead_source master data.
+    source = models.CharField(max_length=64, default=Source.WEBSITE)
+    external_source = models.CharField(max_length=32, blank=True, default="")
+    external_lead_id = models.CharField(max_length=150, blank=True, default="")
     assigned_membership = models.ForeignKey("organizations.OrganizationMembership", null=True, blank=True, on_delete=models.SET_NULL, related_name="assigned_leads")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -31,6 +56,13 @@ class Lead(models.Model):
         ordering = ["-created_at"]
         indexes = [
             models.Index(fields=["organization", "source"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["organization", "external_source", "external_lead_id"],
+                condition=~models.Q(external_source="") & ~models.Q(external_lead_id=""),
+                name="lead_external_identity_unique",
+            ),
         ]
 
     @property
@@ -44,7 +76,86 @@ class Lead(models.Model):
 
     def __str__(self):
         return self.full_name
-class Sitevisit(models.Model):
+
+
+class LeadStatusHistory(models.Model):
+    """FR-P5-06: append-only lead lifecycle history."""
+    lead = models.ForeignKey(Lead, on_delete=models.PROTECT, related_name="status_history")
+    old_status = models.CharField(max_length=64, blank=True, default="")
+    new_status = models.CharField(max_length=64)
+    changed_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL, related_name="lead_status_changes")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+
+    def save(self, *args, **kwargs):
+        if self.pk and type(self).objects.filter(pk=self.pk).exists():
+            raise ValidationError("Lead status history is immutable.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Lead status history is immutable.")
+
+
+class LeadAssignmentHistory(models.Model):
+    """FR-P5-03: append-only lead ownership history."""
+    lead = models.ForeignKey(Lead, on_delete=models.PROTECT, related_name="assignment_history")
+    assigned_from = models.ForeignKey("organizations.OrganizationMembership", null=True, blank=True, on_delete=models.SET_NULL, related_name="lead_assignments_from")
+    assigned_to = models.ForeignKey("organizations.OrganizationMembership", null=True, blank=True, on_delete=models.SET_NULL, related_name="lead_assignments_to")
+    reason = models.TextField()
+    assigned_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL, related_name="lead_assignments_made")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+    def save(self, *args, **kwargs):
+        if self.pk and type(self).objects.filter(pk=self.pk).exists():
+            raise ValidationError("Lead assignment history is immutable.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Lead assignment history is immutable.")
+
+
+class LeadTag(models.Model):
+    """DM-P5-03: project-scoped lead tag."""
+    lead = models.ForeignKey(Lead, on_delete=models.CASCADE, related_name="tags")
+    tag_name = models.CharField(max_length=80)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["lead", "tag_name"], name="lead_tag_unique")]
+        ordering = ["tag_name", "id"]
+
+
+class LeadImportBatch(ProjectScopedModel):
+    """FR-P4-03/DM-P4-02 asynchronous CSV import state and error report."""
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        PROCESSING = "processing", "Processing"
+        COMPLETED = "completed", "Completed"
+        FAILED = "failed", "Failed"
+
+    organization = models.ForeignKey("organizations.Organization", on_delete=models.CASCADE, related_name="lead_import_batches")
+    file_name = models.CharField(max_length=255)
+    raw_content = models.TextField()
+    field_mapping = models.JSONField(default=dict, blank=True)
+    total_rows = models.PositiveIntegerField(default=0)
+    imported_rows = models.PositiveIntegerField(default=0)
+    skipped_rows = models.PositiveIntegerField(default=0)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
+    error_report = models.JSONField(default=list, blank=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="lead_import_batches")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        indexes = [models.Index(fields=["organization", "status", "created_at"])]
+class Sitevisit(ProjectScopedModel):
     class Status(models.TextChoices):
         SCHEDULED = "scheduled", "Scheduled"
         UPCOMING = "upcoming", "Upcoming"
@@ -79,7 +190,8 @@ class Sitevisit(models.Model):
     cancellation_reason = models.TextField(null=True , blank=True)
     cancellation_notes = models.TextField(null=True, blank=True)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.UPCOMING)
-    outcome = models.CharField(max_length=30, choices=Outcome.choices, null=True, blank=True)
+    # FR-P2-01/GNFR-09: accepted values come from active site_visit_outcome master data.
+    outcome = models.CharField(max_length=64, null=True, blank=True)
     interest_level = models.PositiveSmallIntegerField(null=True, blank=True)
     remarks = models.TextField(null=True, blank=True)
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="created_site_visits")
@@ -173,7 +285,7 @@ class SitevisitReschedule(models.Model):
         return self.site_visit.organization_id
 
 
-class FollowUpCall(models.Model):
+class FollowUpCall(ProjectScopedModel):
     class Status(models.TextChoices):
         NEW = "new", "New"
         CONTACTED = "contacted", "Contacted"
@@ -182,22 +294,17 @@ class FollowUpCall(models.Model):
         NEGOTIATION = "negotiation", "Negotiation"
         WON = "won", "Won"
         LOST = "lost", "Lost"
-    class Outcome(models.TextChoices):
-        CONNECTED = "connected", "Connected"
-        NO_ANSWER = "no_answer", "No answer"
-        BUSY = "busy", "Busy"
-        CALLBACK = "callback", "Callback requested"
-        NOT_INTERESTED = "not_interested", "Not interested"
-        INVALID_NUMBER = "invalid_number", "Invalid number"
-
     organization = models.ForeignKey("organizations.Organization", on_delete=models.CASCADE, related_name="follow_up_calls")
     lead = models.ForeignKey(Lead, on_delete=models.CASCADE, related_name="follow_up_calls")
     telecaller_membership = models.ForeignKey("organizations.OrganizationMembership", null=True, on_delete=models.SET_NULL, related_name="follow_up_calls")
     note = models.TextField(blank=True, default="")
-    outcome = models.CharField(max_length=20, choices=Outcome.choices, blank=True, default="")
+    # FR-P6-03: accepted values come from active call_disposition master data.
+    outcome = models.CharField(max_length=20, blank=True, default="")
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.NEW)
     next_follow_up = models.DateTimeField(null=True, blank=True)
+    reminder_sent = models.BooleanField(default=False)
     called_at = models.DateTimeField(null=True, blank=True)
+    call_recording = models.FileField(upload_to=call_recording_upload_to, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -206,6 +313,7 @@ class FollowUpCall(models.Model):
             models.Index(fields=["organization", "lead", "called_at"]),
             models.Index(fields=["organization", "status"]),
             models.Index(fields=["organization", "next_follow_up"]),
+            models.Index(fields=["organization", "telecaller_membership", "called_at"]),
             models.Index(fields=["lead", "-created_at"]),
         ]
 
@@ -217,4 +325,59 @@ class FollowUpCall(models.Model):
             raise ValidationError({"telecaller_membership": "Telecaller must belong to this organization."})
 
     def __str__(self):
-        return f"{self.lead} - {self.get_outcome_display()}"
+        return f"{self.lead} - {self.outcome or 'Pending'}"
+
+
+class FollowUpReminder(ProjectScopedModel):
+    """Durable FR-P6-06 outbox event for the Phase 14 communication engine."""
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        DISPATCHED = "dispatched", "Dispatched"
+        FAILED = "failed", "Failed"
+        CANCELLED = "cancelled", "Cancelled"
+
+    organization = models.ForeignKey(
+        "organizations.Organization",
+        on_delete=models.CASCADE,
+        related_name="follow_up_reminders",
+    )
+    follow_up = models.OneToOneField(
+        FollowUpCall,
+        on_delete=models.CASCADE,
+        related_name="reminder",
+    )
+    recipient_membership = models.ForeignKey(
+        "organizations.OrganizationMembership",
+        null=True,
+        on_delete=models.SET_NULL,
+        related_name="follow_up_reminders",
+    )
+    scheduled_for = models.DateTimeField()
+    event_type = models.CharField(max_length=64, default="telecalling.follow_up_due")
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
+    payload = models.JSONField(default=dict)
+    dispatched_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["scheduled_for", "id"]
+        indexes = [
+            models.Index(
+                fields=["organization", "status", "scheduled_for"],
+                name="leads_reminder_due_idx",
+            ),
+        ]
+
+    def clean(self):
+        errors = {}
+        if self.follow_up_id and self.follow_up.organization_id != self.organization_id:
+            errors["organization"] = "Reminder organization must match the follow-up organization."
+        if self.recipient_membership_id and self.recipient_membership.organization_id != self.organization_id:
+            errors["recipient_membership"] = "Reminder recipient must belong to this organization."
+        if errors:
+            raise ValidationError(errors)
+
+    def __str__(self):
+        return f"{self.event_type} @ {self.scheduled_for.isoformat()}"

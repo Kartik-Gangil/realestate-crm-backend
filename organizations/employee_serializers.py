@@ -2,6 +2,7 @@ from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
 from .models import Department, OrganizationMembership
+from .models import Project
 
 
 EMPLOYEE_PROFILE_FIELDS = {
@@ -40,12 +41,21 @@ class EmployeeCreateSerializer(serializers.Serializer):
     access_scope = serializers.ChoiceField(choices=OrganizationMembership.AccessScope.choices, default=OrganizationMembership.AccessScope.ALL)
     custom_scope_memberships = serializers.ListField(child=serializers.IntegerField(min_value=1), required=False, allow_empty=True)
     custom_scope_departments = serializers.ListField(child=serializers.IntegerField(min_value=1), required=False, allow_empty=True)
+    project_ids = serializers.ListField(child=serializers.IntegerField(min_value=1), required=False, allow_empty=True)
 
     def validate_email(self, value):
         return value.lower()
 
     def validate(self, attrs):
         organization = self.context["organization"]
+        department_id = attrs.get("department")
+        if department_id is not None and not organization.departments.filter(pk=department_id).exists():
+            raise serializers.ValidationError({"department": "Use a department in this organization."})
+        project_ids = attrs.get("project_ids", [])
+        if len(project_ids) != len(set(project_ids)):
+            raise serializers.ValidationError({"project_ids": "Project IDs must not contain duplicates."})
+        if len(Project.objects.filter(organization=organization, id__in=project_ids)) != len(project_ids):
+            raise serializers.ValidationError({"project_ids": "Use projects in this organization."})
         user = get_user_model().objects.filter(email__iexact=attrs["email"]).first()
         if user is None and not attrs.get("temporary_password"):
             raise serializers.ValidationError({"temporary_password": "This field is required for a new user account."})
@@ -74,3 +84,18 @@ class EmployeeUpdateSerializer(serializers.Serializer):
     access_scope = serializers.ChoiceField(choices=OrganizationMembership.AccessScope.choices, required=False)
     custom_scope_memberships = serializers.ListField(child=serializers.IntegerField(min_value=1), required=False, allow_empty=True)
     custom_scope_departments = serializers.ListField(child=serializers.IntegerField(min_value=1), required=False, allow_empty=True)
+    project_ids = serializers.ListField(child=serializers.IntegerField(min_value=1), required=False, allow_empty=True)
+
+    def validate_department(self, value):
+        organization = self.context.get("organization")
+        if value is not None and organization and not organization.departments.filter(pk=value).exists():
+            raise serializers.ValidationError("Use a department in this organization.")
+        return value
+
+    def validate_project_ids(self, value):
+        organization = self.context.get("organization")
+        if len(value) != len(set(value)):
+            raise serializers.ValidationError("Project IDs must not contain duplicates.")
+        if len(Project.objects.filter(organization=organization, id__in=value)) != len(value):
+            raise serializers.ValidationError("Use projects in this organization.")
+        return value

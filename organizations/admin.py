@@ -1,7 +1,7 @@
 from django.contrib import admin
 
 from .models import (AttendanceRecord, LeaveRequest, Organization, OrganizationHoliday, OrganizationMembership,
-                     OrganizationRole, Permission, PlatformOrganizationAccess)
+                     OrganizationRole, Permission, PlatformOrganizationAccess, Project)
 
 
 class OrganizationMembershipInline(admin.TabularInline):
@@ -11,9 +11,16 @@ class OrganizationMembershipInline(admin.TabularInline):
 
 @admin.register(Organization)
 class OrganizationAdmin(admin.ModelAdmin):
-    list_display = ("name", "slug", "is_active", "created_by", "created_at")
-    search_fields = ("name", "slug")
+    list_display = ("name", "code", "slug", "status", "created_by", "created_at")
+    search_fields = ("name", "code", "slug")
     inlines = (OrganizationMembershipInline,)
+
+
+@admin.register(Project)
+class ProjectAdmin(admin.ModelAdmin):
+    list_display = ("name", "code", "organization", "status", "created_at")
+    list_filter = ("organization", "status")
+    search_fields = ("name", "code")
 
 
 @admin.register(PlatformOrganizationAccess)

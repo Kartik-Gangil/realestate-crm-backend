@@ -1,4 +1,4 @@
-from .models import FollowUpCall, Lead , Sitevisit , SitevisitReschedule
+from .models import FollowUpCall, FollowUpReminder, Lead , Sitevisit , SitevisitReschedule
 
 
 def membership_to_dict(membership):
@@ -14,6 +14,10 @@ def membership_to_dict(membership):
 
 
 def follow_up_to_dict(follow_up: FollowUpCall) -> dict:
+    try:
+        reminder = follow_up.reminder
+    except FollowUpReminder.DoesNotExist:
+        reminder = None
     return {
         "id": follow_up.id,
         "lead_id": follow_up.lead_id,
@@ -22,8 +26,59 @@ def follow_up_to_dict(follow_up: FollowUpCall) -> dict:
         "outcome": follow_up.outcome,
         "status": follow_up.status,
         "next_follow_up": follow_up.next_follow_up.isoformat() if follow_up.next_follow_up else None,
+        "reminder_sent": follow_up.reminder_sent,
+        "reminder": (
+            {
+                "id": reminder.id,
+                "event_type": reminder.event_type,
+                "status": reminder.status,
+                "scheduled_for": reminder.scheduled_for.isoformat(),
+            }
+            if reminder else None
+        ),
         "called_at": follow_up.called_at.isoformat() if follow_up.called_at else None,
         "created_at": follow_up.created_at.isoformat(),
+    }
+
+
+def manual_call_log_to_dict(call: FollowUpCall, request=None) -> dict:
+    """Serialize the confirmed FR-P6-08 manual call-log contract."""
+    recording_url = None
+    if call.call_recording:
+        recording_url = call.call_recording.url
+        if request is not None:
+            recording_url = request.build_absolute_uri(recording_url)
+    return {
+        "id": call.id,
+        "lead_id": call.lead_id,
+        "caller": membership_to_dict(call.telecaller_membership),
+        "disposition": call.outcome,
+        "notes": call.note,
+        "call_timestamp": call.called_at.isoformat(),
+        "call_recording_url": recording_url,
+        "next_follow_up": call.next_follow_up.isoformat() if call.next_follow_up else None,
+        "created_at": call.created_at.isoformat(),
+    }
+
+
+def call_queue_item_to_dict(call: FollowUpCall) -> dict:
+    """Serialize one current call attempt for the FR-P6-01 queue."""
+    return {
+        "id": call.id,
+        "lead": {
+            "id": call.lead_id,
+            "full_name": call.lead.full_name,
+            "phone": call.lead.phone,
+            "email": call.lead.email,
+            "source": call.lead.source,
+        },
+        "telecaller": membership_to_dict(call.telecaller_membership),
+        "status": call.status,
+        "outcome": call.outcome,
+        "next_follow_up": call.next_follow_up.isoformat() if call.next_follow_up else None,
+        "called_at": call.called_at.isoformat() if call.called_at else None,
+        "is_pending_attempt": call.called_at is None,
+        "created_at": call.created_at.isoformat(),
     }
     
 def site_visit_to_dict(site_visit: Sitevisit, include_history=False) -> dict:
@@ -118,12 +173,24 @@ def lead_to_dict(lead: Lead, include_follow_ups=False , latest_follow_up_status=
         "alt_phone": lead.alt_phone,
         "occupation": lead.occupation,
         "address": lead.address,
-        "status": latest_follow_up_status,
+        "city": lead.city,
+        "score": lead.score,
+        "status": latest_follow_up_status or lead.status,
+        "tags": list(lead.tags.values_list("tag_name", flat=True)),
         # return only the membership name (or None)
         "assigned_membership": (membership_to_dict(lead.assigned_membership) or {}).get("name"),
+        "needs_reassignment": bool(lead.assigned_membership_id and not lead.assigned_membership.is_active),
         "created_at": lead.created_at.isoformat(),
         "updated_at": lead.updated_at.isoformat(),
     }
     if include_follow_ups:
         data["follow_up_calls"] = [follow_up_to_dict(call) for call in lead.follow_up_calls.select_related("telecaller_membership__user").all()]
+        data["status_history"] = [
+            {"old_status": item.old_status, "new_status": item.new_status, "changed_by": item.changed_by_id, "created_at": item.created_at.isoformat()}
+            for item in lead.status_history.select_related("changed_by").all()
+        ]
+        data["assignment_history"] = [
+            {"assigned_from_id": item.assigned_from_id, "assigned_to_id": item.assigned_to_id, "reason": item.reason, "assigned_by": item.assigned_by_id, "created_at": item.created_at.isoformat()}
+            for item in lead.assignment_history.select_related("assigned_from", "assigned_to", "assigned_by").all()
+        ]
     return data

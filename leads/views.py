@@ -1,9 +1,11 @@
-import pandas as pd
+import csv
 import io
+import json
 from datetime import datetime, timedelta
 
 from django.core.exceptions import ValidationError
 from django.db import transaction
+from django.db.models.deletion import ProtectedError
 from django.db.models import Avg, Count, Q, OuterRef, Subquery
 from django.shortcuts import get_object_or_404
 from django.utils.dateparse import parse_date, parse_datetime, parse_time
@@ -14,15 +16,36 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from organizations.models import OrganizationMembership
-from organizations.services import get_organization_access, has_permission
-from .models import FollowUpCall, Lead , Sitevisit , SitevisitReschedule
+from organizations.services import get_organization_access, has_permission, membership_role_code
+from system_settings.master_data import (
+    active_call_dispositions,
+    ensure_lead_sources,
+    validate_lead_source,
+    validate_site_visit_outcome,
+)
+from system_settings.services import get_system_parameter
+from system_settings.audit import log_audit
+from .models import FollowUpCall, Lead, LeadAssignmentHistory, LeadImportBatch, LeadTag, Sitevisit, SitevisitReschedule
+from .duplicates import find_duplicates
+from .imports import enqueue_lead_import
+from .lifecycle import LEAD_STATUS_TRANSITIONS, assign_lead as assign_lead_lifecycle, transition_lead_status
+from .reminders import sync_follow_up_reminder
 from .serializers import (
+    call_queue_item_to_dict,
     follow_up_to_dict,
     lead_to_dict,
+    manual_call_log_to_dict,
+    membership_to_dict,
     reschedule_sitevisit_to_dict,
     site_visit_to_dict,
 )
-from .services import assign_leads_round_robin
+from .services import (
+    assign_leads_round_robin,
+    get_call_queue,
+    get_team_call_analytics,
+    log_manual_call,
+    redistribute_call_queue,
+)
 from django.db.models import OuterRef, Subquery
 from django.utils import timezone
 
@@ -90,15 +113,32 @@ def _parse_time(value, field_name):
 
 
 def _site_visits_for_access(access, leads):
-    return Sitevisit.objects.filter(
+    visits = Sitevisit.objects.filter(
         organization=access.organization,
-        lead__in=leads,
     ).select_related(
         "organization", "lead", "executive_membership__user", "created_by"
     ).prefetch_related("reschedules")
+    role = membership_role_code(access.membership)
+    if role in {"site_visit_exec", "site_visit_executive"}:
+        return visits.filter(executive_membership=access.membership)
+    return visits.filter(lead__in=leads)
 
 
-def _schedule_validation(visit_date, visit_time):
+def _max_site_visit_days(organization, project_id=None):
+    value = get_system_parameter(
+        organization,
+        "site_visit_max_days_ahead",
+        default=90,
+        project=project_id,
+    )
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        value = 90
+    return value if value > 0 else 90
+
+
+def _schedule_validation(visit_date, visit_time, *, organization=None, project_id=None):
     errors = {}
     if visit_date is None:
         errors["visit_date"] = "This field is required."
@@ -108,16 +148,16 @@ def _schedule_validation(visit_date, visit_time):
         today = timezone.localdate()
         if visit_date < today:
             errors["visit_date"] = "A site visit cannot be scheduled in the past."
-        elif visit_date > today + timedelta(days=90):
-            errors["visit_date"] = "A site visit cannot be scheduled more than 90 days ahead."
+        elif organization and visit_date > today + timedelta(days=_max_site_visit_days(organization, project_id)):
+            errors["visit_date"] = "A site visit cannot be scheduled beyond the configured future-day limit."
     if errors:
         raise ValidationError(errors)
 
 
-def _active_executive(organization, user):
+def _active_executive(organization, membership_id):
     executive = OrganizationMembership.objects.filter(
         organization=organization,
-        user=user,
+        pk=membership_id,
         is_active=True
     ).select_related("user").first()
 
@@ -129,12 +169,45 @@ def _active_executive(organization, user):
     return executive
 
 
+def _ensure_executive_available(*, organization, executive, visit_date, visit_time, duration_minutes, ignore_visit_id=None):
+    """FR-P7-01: reject overlapping active visits for the same executive."""
+    start_minutes = visit_time.hour * 60 + visit_time.minute
+    end_minutes = start_minutes + duration_minutes
+    existing = Sitevisit.objects.select_for_update().filter(
+        organization=organization,
+        executive_membership=executive,
+        visit_date=visit_date,
+    ).exclude(status__in={Sitevisit.Status.COMPLETED, Sitevisit.Status.CANCELLED, Sitevisit.Status.NO_SHOW})
+    if ignore_visit_id is not None:
+        existing = existing.exclude(pk=ignore_visit_id)
+    for visit in existing:
+        if not visit.visit_time:
+            continue
+        existing_start = visit.visit_time.hour * 60 + visit.visit_time.minute
+        existing_end = existing_start + (visit.duration_minutes or 60)
+        if start_minutes < existing_end and existing_start < end_minutes:
+            raise ValidationError({"executive": "The executive is already booked for an overlapping visit."})
+
+
 def _reschedule_site_visit(site_visit, new_date, new_time, reason=None):
     if site_visit.status in {
         Sitevisit.Status.COMPLETED, Sitevisit.Status.CANCELLED, Sitevisit.Status.NO_SHOW,
     }:
         raise ValidationError({"status": "Completed, cancelled, and no-show visits cannot be rescheduled."})
-    _schedule_validation(new_date, new_time)
+    _schedule_validation(
+        new_date,
+        new_time,
+        organization=site_visit.organization,
+        project_id=site_visit.project_id,
+    )
+    _ensure_executive_available(
+        organization=site_visit.organization,
+        executive=site_visit.executive_membership,
+        visit_date=new_date,
+        visit_time=new_time,
+        duration_minutes=site_visit.duration_minutes or 60,
+        ignore_visit_id=site_visit.id,
+    )
     reschedule = SitevisitReschedule(
         site_visit=site_visit,
         old_date=site_visit.visit_date,
@@ -151,6 +224,31 @@ def _reschedule_site_visit(site_visit, new_date, new_time, reason=None):
     site_visit.save(update_fields=["visit_date", "visit_time", "status", "updated_at"])
     return reschedule
 
+
+def _complete_lead_for_site_visit(*, lead, actor, organization):
+    """Advance a valid lead through Phase 5 before marking visit completion."""
+    if lead.status == "site_visit_completed":
+        return lead
+    paths = {
+        "new": ["contacted", "interested", "site_visit_scheduled", "site_visit_completed"],
+        "contacted": ["interested", "site_visit_scheduled", "site_visit_completed"],
+        "interested": ["site_visit_scheduled", "site_visit_completed"],
+        "site_visit_scheduled": ["site_visit_completed"],
+    }
+    path = paths.get(lead.status)
+    if path is None:
+        raise ValidationError({"lead": "The lead is not eligible for site-visit completion."})
+    for next_status in path:
+        if next_status not in LEAD_STATUS_TRANSITIONS.get(lead.status, set()):
+            raise ValidationError({"lead": "The lead cannot follow the required lifecycle path."})
+        lead = transition_lead_status(
+            lead_id=lead.id,
+            new_status=next_status,
+            actor=actor,
+            organization=organization,
+        )
+    return lead
+
 def _leads_for_access(access):
     leads = Lead.objects.filter(organization=access.organization).select_related("organization", "assigned_membership__user")
     return leads if access.can_view_all_leads else leads.filter(assigned_membership=access.membership)
@@ -161,8 +259,41 @@ def _require_lead_management(access):
         raise PermissionDenied("Only managers, organization admins, and authorized platform users can manage leads.")
 
 
+def _require_manual_lead_creation(access):
+    if access.is_platform:
+        return
+    if not any(has_permission(access.membership.user, access.organization, code) for code in ("leads.add", "leads.create", "leads.edit")):
+        raise PermissionDenied("This role cannot create manual leads.")
+
+
+def _require_ad_or_import_management(access):
+    if access.is_platform:
+        return
+    if membership_role_code(access.membership) not in {OrganizationMembership.Role.ADMIN, OrganizationMembership.Role.MANAGER}:
+        raise PermissionDenied("Only Admins and Managers may trigger ad sync or CSV import.")
+
+
+def _duplicate_response(matches):
+    return [
+        {
+            "lead": lead_to_dict(lead),
+            "confidence": confidence,
+        }
+        for confidence, lead in matches
+    ]
+
+
+def _lead_duplicate_matches(access, payload, *, project=None):
+    return find_duplicates(
+        organization=access.organization,
+        payload=payload,
+        queryset=Lead.all_objects.filter(organization=access.organization, project=project),
+        project=project,
+    )
+
+
 def _apply_payload(lead, payload, organization, partial=False, save=True):
-    allowed = {"first_name", "last_name", "email", "phone", "source", "assigned_membership" , "alt_phone", "address" , "occupation"}
+    allowed = {"first_name", "last_name", "email", "phone", "source", "assigned_membership", "alt_phone", "address", "city", "occupation", "score"}
     if not partial:
         missing = [field for field in ("first_name", "phone", "source") if field not in payload]
         if missing:
@@ -175,6 +306,8 @@ def _apply_payload(lead, payload, organization, partial=False, save=True):
                 raise ValidationError({"assigned_membership": "Use an active membership in this organization."})
             field = "assigned_membership"
         setattr(lead, field, value)
+    if "source" in payload:
+        validate_lead_source(organization, lead.source)
     lead.organization = organization
     lead.full_clean()
     if save:
@@ -195,26 +328,34 @@ def _create_pending_follow_up(lead, telecaller):
     return FollowUpCall.objects.create(organization=lead.organization, lead=lead, telecaller_membership=telecaller, note="", outcome="", called_at=None)
 
 
-def _update_follow_up_result(call, payload):
-    allowed = {"note", "outcome", "status", "next_follow_up", "called_at"}
+@transaction.atomic
+def _schedule_follow_up(call, payload):
+    """API-P6-04 schedules work; API-P6-06 is the sole call-log writer."""
+    allowed = {"note", "notes", "reason", "status", "next_follow_up", "follow_up_date"}
     unknown = set(payload) - allowed
     if unknown:
-        raise ValidationError({field: "This field cannot be updated." for field in unknown})
-    if "note" in payload:
-        call.note = str(payload["note"]).strip()
-    if "outcome" in payload:
-        call.outcome = payload["outcome"]
+        raise ValidationError({
+            field: "Call activity must be submitted through API-P6-06 /telecalling/calls/log/."
+            for field in unknown
+        })
+    note = str(payload.get("note", payload.get("notes", payload.get("reason", ""))) or "").strip()
+    if not note:
+        raise ValidationError({"note": "This field is required."})
+    raw_follow_up = payload.get("next_follow_up", payload.get("follow_up_date"))
+    if raw_follow_up in (None, ""):
+        raise ValidationError({"next_follow_up": "A follow-up date and time is required."})
+    call.note = note
     if "status" in payload:
         call.status = payload["status"]
-    if "next_follow_up" in payload:
-        call.next_follow_up = _parse_datetime(payload["next_follow_up"], "next_follow_up")
-    if "called_at" in payload:
-        call.called_at = _parse_datetime(payload["called_at"], "called_at")
+    call.next_follow_up = _parse_datetime(raw_follow_up, "next_follow_up")
+    call.outcome = ""
+    call.called_at = None
     call.full_clean()
     if call.pk:
         call.save(update_fields=["note", "outcome", "status", "next_follow_up", "called_at"])
     else:
         call.save()
+    sync_follow_up_reminder(call)
     return call
 
 @api_view(["PATCH"])
@@ -241,13 +382,14 @@ def remove_assignment_of_lead(request ,organization_slug):
 
 
 
-@api_view(["PATCH"])
+@api_view(["POST", "PATCH"])
 @permission_classes([IsAuthenticated])
 def assign_lead(request, organization_slug, lead_id):
-    """Assign or reassign one organization lead to an active telecaller."""
+    """FR-P5-03/API-P5-04: assign with a mandatory reason and append history."""
     access = get_organization_access(request.user, organization_slug)
-    _require_lead_management(access)
-    lead = get_object_or_404(Lead.objects.filter(organization=access.organization), pk=lead_id)
+    if not access.is_platform and membership_role_code(access.membership) not in {OrganizationMembership.Role.ADMIN, OrganizationMembership.Role.MANAGER}:
+        raise PermissionDenied("Only Managers and Admins may reassign leads.")
+    lead = get_object_or_404(Lead.all_objects.filter(organization=access.organization), pk=lead_id)
     membership_id = request.data.get("telecaller_membership")
     if not membership_id:
         return Response({"telecaller_membership": ["This field is required."]}, status=status.HTTP_400_BAD_REQUEST)
@@ -259,9 +401,12 @@ def assign_lead(request, organization_slug, lead_id):
     ).select_related("user").first()
     if telecaller is None:
         return Response({"telecaller_membership": ["Use an active telecaller membership in this organization."]}, status=status.HTTP_400_BAD_REQUEST)
-    lead.assigned_membership = telecaller
-    lead.full_clean()
-    lead.save(update_fields=["assigned_membership", "updated_at"])
+    try:
+        lead = assign_lead_lifecycle(
+            lead_id=lead.id, membership=telecaller, reason=request.data.get("reason"), actor=request.user, organization=access.organization
+        )
+    except (ValidationError, ProtectedError) as error:
+        return _validation_response(error)
     _create_pending_follow_up(lead, telecaller)
     return Response(lead_to_dict(lead))
 
@@ -282,10 +427,9 @@ def assigned_leads(request, organization_slug):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def import_leads_csv(request, organization_slug):
-    """Atomically import leads from CSV/XLS/XLSX upload."""
-
+    """FR-P4-03/API-P4-04: enqueue a 5MB CSV for 500-row background processing."""
     access = get_organization_access(request.user, organization_slug)
-    _require_lead_management(access)
+    _require_ad_or_import_management(access)
 
     upload = request.FILES.get("file")
     if upload is None:
@@ -294,106 +438,158 @@ def import_leads_csv(request, organization_slug):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
+    if upload.size > 5 * 1024 * 1024:
+        return Response({"file": ["The CSV file must not exceed 5 MB."]}, status=status.HTTP_400_BAD_REQUEST)
+    if not upload.name.lower().endswith(".csv"):
+        return Response({"file": ["Only .csv files are supported."]}, status=status.HTTP_400_BAD_REQUEST)
     try:
-        filename = upload.name.lower()
-
-        if filename.endswith(".csv"):
-            df = pd.read_csv(upload, dtype=str)
-        elif filename.endswith(".xlsx"):
-            df = pd.read_excel(upload, dtype=str, engine="openpyxl")
-        elif filename.endswith(".xls"):
-            df = pd.read_excel(upload, dtype=str, engine="xlrd")
-        else:
-            return Response(
-                {"file": ["Only .csv, .xlsx and .xls files are supported."]},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        df = df.fillna("")
-        rows = df.to_dict(orient="records")
-
-    except Exception as error:
-        return Response(
-            {"file": [f"Could not read file: {error}"]},
-            status=status.HTTP_400_BAD_REQUEST,
-        )
-
-    if len(df.columns) == 0:
+        raw_content = upload.read().decode("utf-8-sig")
+        reader = csv.DictReader(io.StringIO(raw_content))
+        headers = reader.fieldnames or []
+    except (UnicodeDecodeError, csv.Error) as error:
+        return Response({"file": [f"Could not read CSV: {error}"]}, status=status.HTTP_400_BAD_REQUEST)
+    if not headers:
         return Response(
             {"file": ["The file must include a header row."]},
             status=status.HTTP_400_BAD_REQUEST,
         )
-
-    mapped_headers = {
-        CSV_HEADER_ALIASES.get(_normalise_csv_header(header))
-        for header in df.columns
-        if header
-    }
-
-    if "phone" not in mapped_headers or (
-        "first_name" not in mapped_headers
-        and "full_name" not in mapped_headers
-    ):
+    from .imports import CSV_HEADER_ALIASES, normalize_header
+    mapped_headers = {CSV_HEADER_ALIASES.get(normalize_header(header)) for header in headers if header}
+    if "phone" not in mapped_headers or ("first_name" not in mapped_headers and "full_name" not in mapped_headers):
         return Response(
-            {
-                "file": [
-                    "Required columns: first_name (or full_name/name) and phone."
-                ]
-            },
+            {"file": ["Required columns: first_name (or full_name/name) and phone."]},
             status=status.HTTP_400_BAD_REQUEST,
         )
-
-    leads = []
-    errors = []
-
-    for row_number, row in enumerate(rows, start=2):
-        if not any(str(value).strip() for value in row.values()):
-            continue
-
+    mapping = request.data.get("mapping", {})
+    if isinstance(mapping, str):
         try:
-            leads.append(
-                _apply_payload(
-                    Lead(),
-                    _csv_row_payload(row),
-                    access.organization,
-                    save=False,
-                )
-            )
-        except (ValidationError, ValueError, TypeError) as error:
-            details = (
-                error.message_dict
-                if hasattr(error, "message_dict")
-                else {"detail": getattr(error, "messages", [str(error)])}
-            )
-            errors.append(
-                {
-                    "row": row_number,
-                    "errors": details,
-                }
-            )
-
-    if errors:
-        return Response(
-            {"imported": 0, "errors": errors},
-            status=status.HTTP_400_BAD_REQUEST,
-        )
-
-    if not leads:
-        return Response(
-            {"file": ["The file contains no lead rows."]},
-            status=status.HTTP_400_BAD_REQUEST,
-        )
-
-    with transaction.atomic():
-        Lead.objects.bulk_create(leads)
-
-    return Response(
-        {
-            "imported": len(leads),
-            "results": [lead_to_dict(lead) for lead in leads],
-        },
-        status=status.HTTP_201_CREATED,
+            mapping = json.loads(mapping)
+        except json.JSONDecodeError:
+            return Response({"mapping": ["Mapping must be valid JSON."]}, status=status.HTTP_400_BAD_REQUEST)
+    if not isinstance(mapping, dict):
+        return Response({"mapping": ["Mapping must be an object."]}, status=status.HTTP_400_BAD_REQUEST)
+    batch = LeadImportBatch.all_objects.create(
+        organization=access.organization,
+        project=getattr(request, "project", None),
+        file_name=upload.name,
+        raw_content=raw_content,
+        field_mapping=mapping,
+        total_rows=max(sum(1 for _ in csv.DictReader(io.StringIO(raw_content))), 0),
+        created_by=request.user,
     )
+    enqueue_lead_import(batch.id)
+    return Response(
+        {"batch_id": batch.id, "status": batch.status, "total_rows": batch.total_rows, "imported_rows": 0, "skipped_rows": 0},
+        status=status.HTTP_202_ACCEPTED,
+    )
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def lead_import_batch_detail(request, organization_slug, batch_id):
+    access = get_organization_access(request.user, organization_slug)
+    batch = get_object_or_404(LeadImportBatch.all_objects, pk=batch_id, organization=access.organization)
+    if request.query_params.get("download") in {"1", "true"}:
+        from django.http import HttpResponse
+        response = HttpResponse("row,errors\n", content_type="text/csv")
+        for item in batch.error_report:
+            response.write(f'{item.get("row")},"{json.dumps(item.get("errors", {})).replace(chr(34), chr(34) * 2)}"\n')
+        response["Content-Disposition"] = f'attachment; filename="{batch.file_name}.errors.csv"'
+        return response
+    return Response({
+        "id": batch.id, "file_name": batch.file_name, "status": batch.status,
+        "total_rows": batch.total_rows, "imported_rows": batch.imported_rows,
+        "skipped_rows": batch.skipped_rows, "error_report": batch.error_report,
+    })
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def check_duplicate(request, organization_slug):
+    access = get_organization_access(request.user, organization_slug)
+    _require_manual_lead_creation(access)
+    matches = _lead_duplicate_matches(access, request.data, project=getattr(request, "project", None))
+    return Response({"matches": _duplicate_response(matches)})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def manual_lead(request, organization_slug):
+    """FR-P4-02/05: save a manual lead only after duplicate warning/resolution."""
+    access = get_organization_access(request.user, organization_slug)
+    _require_manual_lead_creation(access)
+    payload = request.data.copy()
+    duplicate_action = payload.pop("duplicate_action", None)
+    matches = _lead_duplicate_matches(access, payload, project=getattr(request, "project", None))
+    if matches and duplicate_action not in {"create_anyway", "merge"}:
+        return Response({"code": "duplicate_warning", "duplicates": _duplicate_response(matches)}, status=409)
+    try:
+        if matches and duplicate_action == "merge":
+            lead = _apply_payload(matches[0][1], payload, access.organization, partial=True)
+            return Response(lead_to_dict(lead), status=200)
+        lead = _apply_payload(Lead(project=getattr(request, "project", None)), payload, access.organization)
+    except (ValidationError, ValueError, TypeError) as error:
+        return _validation_response(error)
+    return Response(lead_to_dict(lead), status=status.HTTP_201_CREATED)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def merge_lead(request, organization_slug):
+    access = get_organization_access(request.user, organization_slug)
+    _require_manual_lead_creation(access)
+    lead_id = request.data.get("existing_lead_id")
+    if not lead_id:
+        return Response({"existing_lead_id": ["This field is required."]}, status=400)
+    lead = get_object_or_404(_leads_for_access(access), pk=lead_id)
+    payload = request.data.copy()
+    payload.pop("existing_lead_id", None)
+    try:
+        lead = _apply_payload(lead, payload, access.organization, partial=True)
+    except (ValidationError, ValueError, TypeError) as error:
+        return _validation_response(error)
+    return Response(lead_to_dict(lead))
+
+
+def _provider_sync(request, organization_slug, provider):
+    access = get_organization_access(request.user, organization_slug)
+    _require_ad_or_import_management(access)
+    incoming = request.data.get("leads") if isinstance(request.data.get("leads"), list) else [request.data]
+    synced = []
+    created = 0
+    for item in incoming:
+        payload = dict(item)
+        external_id = payload.pop("external_lead_id", None) or payload.pop("lead_id", None) or payload.pop("id", None)
+        if not external_id:
+            return Response({"external_lead_id": ["This field is required for provider sync."]}, status=400)
+        payload.setdefault("source", "fb" if provider == "meta" else "website")
+        lead = Lead.all_objects.filter(
+            organization=access.organization, external_source=provider, external_lead_id=str(external_id)
+        ).first()
+        was_created = lead is None
+        try:
+            lead = _apply_payload(lead or Lead(project=getattr(request, "project", None)), payload, access.organization, partial=not was_created, save=False)
+            lead.external_source = provider
+            lead.external_lead_id = str(external_id)
+            lead.project = getattr(request, "project", None)
+            lead.save()
+        except (ValidationError, ValueError, TypeError) as error:
+            return _validation_response(error)
+        created += int(was_created)
+        synced.append(lead_to_dict(lead))
+    return Response({"provider": provider, "created": created, "updated": len(synced) - created, "results": synced}, status=201 if created else 200)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def sync_meta(request, organization_slug):
+    return _provider_sync(request, organization_slug, "meta")
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def sync_google(request, organization_slug):
+    return _provider_sync(request, organization_slug, "google")
 
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
@@ -421,12 +617,23 @@ def lead_list(request, organization_slug):
         )
     )
     if status_filter := request.query_params.get("status"):
-        leads = leads.filter(
-            latest_follow_up_status=status_filter,
-            latest_follow_up_id__isnull=False
-        )
+        leads = leads.filter(status=status_filter)
     if source := request.query_params.get("source"):
         leads = leads.filter(source=source)
+    if owner := request.query_params.get("owner") or request.query_params.get("owner_id"):
+        leads = leads.filter(assigned_membership_id=owner)
+    if city := request.query_params.get("city"):
+        leads = leads.filter(city__icontains=city)
+    if date_from := request.query_params.get("date_from"):
+        leads = leads.filter(created_at__date__gte=date_from)
+    if date_to := request.query_params.get("date_to"):
+        leads = leads.filter(created_at__date__lte=date_to)
+    if score_min := request.query_params.get("score_min"):
+        leads = leads.filter(score__gte=score_min)
+    if score_max := request.query_params.get("score_max"):
+        leads = leads.filter(score__lte=score_max)
+    if tag := request.query_params.get("tag"):
+        leads = leads.filter(tags__tag_name=tag)
     if search := request.query_params.get("search"):
         leads = leads.filter(
             Q(first_name__icontains=search) |
@@ -434,15 +641,26 @@ def lead_list(request, organization_slug):
             Q(email__icontains=search) |
             Q(phone__icontains=search)
         )
+    ordering = request.query_params.get("ordering", "-created_at")
+    allowed_ordering = {"created_at", "score", "first_name", "city", "status", "updated_at"}
+    if ordering.lstrip("-") not in allowed_ordering:
+        return Response({"ordering": ["Use created_at, score, first_name, city, status, or updated_at."]}, status=400)
+    leads = leads.order_by(ordering, "id")
+    try:
+        page = max(int(request.query_params.get("page", 1)), 1)
+        page_size = min(max(int(request.query_params.get("page_size", 25)), 1), 100)
+    except (TypeError, ValueError):
+        return Response({"page": ["Page and page_size must be integers."]}, status=400)
+    count = leads.count()
+    start = (page - 1) * page_size
+    rows = leads[start:start + page_size]
     return Response({
-        "count": leads.count(),
-        "results": [
-            lead_to_dict(
-                lead,
-                latest_follow_up_status=lead.latest_follow_up_status
-            )
-            for lead in leads
-        ]
+        "count": count,
+        "page": page,
+        "page_size": page_size,
+        "next": page + 1 if start + page_size < count else None,
+        "previous": page - 1 if page > 1 else None,
+        "results": [lead_to_dict(lead) for lead in rows],
     })
 
 
@@ -475,6 +693,14 @@ def lead_detail(request, organization_slug, lead_id):
                 "You can only edit your assigned leads."
             )
 
+    if "status" in request.data:
+        return Response({"status": ["Use the lead status transition endpoint."]}, status=status.HTTP_400_BAD_REQUEST)
+    if "assigned_membership" in request.data and str(request.data.get("assigned_membership")) != str(lead.assigned_membership_id):
+        return Response({"assigned_membership": ["Use the assignment endpoint with a reason."]}, status=status.HTTP_400_BAD_REQUEST)
+    converted_core_fields = {"first_name", "last_name", "email", "phone", "alt_phone", "address", "city", "occupation", "source", "score"}
+    if lead.status == "converted" and converted_core_fields.intersection(request.data):
+        return Response({"status": ["Converted lead core fields are immutable."]}, status=409)
+
     try:
         previous_assignee_id = lead.assigned_membership_id
 
@@ -497,6 +723,73 @@ def lead_detail(request, organization_slug, lead_id):
     return Response(lead_to_dict(lead))
 
 
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def lead_status(request, organization_slug, lead_id):
+    """FR-P5-02/API-P5-05: guarded lifecycle transition with immutable history."""
+    access = get_organization_access(request.user, organization_slug)
+    lead = get_object_or_404(_leads_for_access(access), pk=lead_id)
+    try:
+        updated = transition_lead_status(
+            lead_id=lead.id, new_status=str(request.data.get("status", "")).strip(), actor=request.user, organization=access.organization
+        )
+    except (ValidationError, ProtectedError) as error:
+        return _validation_response(error)
+    return Response(lead_to_dict(updated, include_follow_ups=True))
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+@transaction.atomic
+def bulk_action(request, organization_slug):
+    """FR-P5-04/API-P5-06: execute one transactional action over selected leads."""
+    access = get_organization_access(request.user, organization_slug)
+    lead_ids = request.data.get("lead_ids")
+    action = request.data.get("action")
+    if not isinstance(lead_ids, list) or not lead_ids or len(set(lead_ids)) != len(lead_ids):
+        return Response({"lead_ids": ["Provide a non-empty list of unique lead IDs."]}, status=400)
+    allowed_actions = {"assign", "change_status", "add_tag", "export", "delete"}
+    if action not in allowed_actions:
+        return Response({"action": [f"Use one of: {', '.join(sorted(allowed_actions))}."]}, status=400)
+    if action in {"assign", "delete"} and not access.is_platform and membership_role_code(access.membership) not in {OrganizationMembership.Role.ADMIN, OrganizationMembership.Role.MANAGER}:
+        raise PermissionDenied("Only Managers and Admins may perform this bulk action.")
+    leads = list(_leads_for_access(access).filter(pk__in=lead_ids).select_for_update())
+    if len(leads) != len(lead_ids):
+        raise PermissionDenied("One or more selected leads are outside your permitted scope.")
+    if action == "export":
+        from django.http import HttpResponse
+        response = HttpResponse("id,full_name,phone,status,owner\n", content_type="text/csv")
+        for lead in leads:
+            response.write(f'{lead.id},"{lead.full_name.replace(chr(34), chr(34) * 2)}",{lead.phone},{lead.status},{lead.assigned_membership_id or ""}\n')
+        response["Content-Disposition"] = 'attachment; filename="leads.csv"'
+        return response
+    try:
+        if action == "assign":
+            target = OrganizationMembership.objects.filter(
+                pk=request.data.get("telecaller_membership"), organization=access.organization,
+                role=OrganizationMembership.Role.TELECALLER, is_active=True,
+            ).first()
+            if target is None:
+                raise ValidationError({"telecaller_membership": "Use an active telecaller in this organization."})
+            for lead in leads:
+                assign_lead_lifecycle(lead_id=lead.id, membership=target, reason=request.data.get("reason"), actor=request.user, organization=access.organization)
+        elif action == "change_status":
+            for lead in leads:
+                transition_lead_status(lead_id=lead.id, new_status=str(request.data.get("status", "")).strip(), actor=request.user, organization=access.organization)
+        elif action == "add_tag":
+            tag_name = str(request.data.get("tag", "")).strip()
+            if not tag_name:
+                raise ValidationError({"tag": "This field is required."})
+            for lead in leads:
+                LeadTag.objects.get_or_create(lead=lead, tag_name=tag_name)
+        elif action == "delete":
+            Lead.all_objects.filter(pk__in=lead_ids, organization=access.organization).delete()
+    except (ValidationError, ProtectedError) as error:
+        transaction.set_rollback(True)
+        return _validation_response(error)
+    return Response({"action": action, "affected": len(leads)})
+
+
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def follow_up_list(request, organization_slug, lead_id):
@@ -507,24 +800,199 @@ def follow_up_list(request, organization_slug, lead_id):
         if status_filter := request.query_params.get("status"):
             calls = calls.filter(status=status_filter)
         return Response({"count": calls.count(), "results": [follow_up_to_dict(call) for call in calls]})
+    return _record_follow_up(access, lead, request.data)
+
+
+@transaction.atomic
+def _record_follow_up(access, lead, payload):
+    """API-P6-04: create or update one scheduled caller-owned follow-up."""
     if access.membership is None:
-        raise PermissionDenied("A membership in this organization is required to log a follow-up call.")
-    note = request.data.get("note", "").strip()
-    if not note:
-        return Response({"note": ["This field is required."]}, status=status.HTTP_400_BAD_REQUEST)
+        raise PermissionDenied("A membership in this organization is required to schedule a follow-up.")
     try:
-        result = {"note": note, "outcome": request.data.get("outcome", FollowUpCall.Outcome.CONNECTED), "status": request.data.get("status", FollowUpCall.Status.NEW), "next_follow_up": request.data.get("next_follow_up"), "called_at": request.data.get("called_at")}
-        call = FollowUpCall.objects.filter(organization=access.organization, lead=lead, telecaller_membership=access.membership, called_at__isnull=True).order_by("created_at", "id").first()
+        call = FollowUpCall.objects.select_for_update().filter(organization=access.organization, lead=lead, telecaller_membership=access.membership, called_at__isnull=True).order_by("created_at", "id").first()
         if call:
-            _update_follow_up_result(call, result)
+            _schedule_follow_up(call, payload)
             response_status = status.HTTP_200_OK
         else:
             call = FollowUpCall(organization=access.organization, lead=lead, telecaller_membership=access.membership)
-            _update_follow_up_result(call, result)
+            _schedule_follow_up(call, payload)
             response_status = status.HTTP_201_CREATED
     except (ValidationError, ValueError, TypeError) as error:
         return _validation_response(error)
     return Response(follow_up_to_dict(call), status=response_status)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def telecalling_follow_ups(request, organization_slug):
+    """API-P6-04: create or update a scheduled follow-up for an assigned lead."""
+    access = get_organization_access(request.user, organization_slug)
+    try:
+        lead_id = int(request.data.get("lead_id"))
+        if lead_id <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return Response({"lead_id": ["A positive integer is required."]}, status=status.HTTP_400_BAD_REQUEST)
+    lead = get_object_or_404(_leads_for_access(access), pk=lead_id)
+    payload = request.data.copy()
+    payload.pop("lead_id", None)
+    return _record_follow_up(access, lead, payload)
+
+
+def _queue_page_url(request, page, page_size):
+    query = request.query_params.copy()
+    query["page"] = page
+    query["page_size"] = page_size
+    return request.build_absolute_uri(f"{request.path}?{query.urlencode()}")
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def telecalling_queue(request, organization_slug):
+    """FR-P6-01: return the current dynamically ordered calling queue."""
+    access = get_organization_access(request.user, organization_slug)
+    tab = request.query_params.get("tab", "assigned")
+    try:
+        page = max(int(request.query_params.get("page", 1)), 1)
+        page_size = min(max(int(request.query_params.get("page_size", 25)), 1), 100)
+        queue = get_call_queue(access, tab=tab)
+    except (ValidationError, ValueError, TypeError) as error:
+        return _validation_response(error)
+
+    count = queue.count()
+    start = (page - 1) * page_size
+    results = queue[start:start + page_size]
+    return Response({
+        "count": count,
+        "next": _queue_page_url(request, page + 1, page_size) if start + page_size < count else None,
+        "previous": _queue_page_url(request, page - 1, page_size) if page > 1 else None,
+        "page": page,
+        "page_size": page_size,
+        "tab": tab,
+        "results": [call_queue_item_to_dict(call) for call in results],
+    })
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def telecalling_analytics(request, organization_slug):
+    """FR-P6-07 / API-P6-05: return organization team call analytics."""
+    access = get_organization_access(request.user, organization_slug)
+    if not access.can_view_all_leads:
+        raise PermissionDenied("Only managers, organization admins, and authorized platform users can view team analytics.")
+    return Response(get_team_call_analytics(access))
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def telecalling_redistribute(request, organization_slug):
+    """FR-P6-07: atomically redistribute idle current queue items."""
+    access = get_organization_access(request.user, organization_slug)
+    if not access.can_manage_leads:
+        raise PermissionDenied("Only managers, organization admins, and authorized platform users can redistribute queues.")
+
+    raw_call_ids = request.data.get("call_ids")
+    if not isinstance(raw_call_ids, list) or not raw_call_ids:
+        return Response({"call_ids": ["Provide a non-empty list of call IDs."]}, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        call_ids = [int(call_id) for call_id in raw_call_ids]
+        target_id = int(request.data.get("telecaller_membership_id"))
+        if any(call_id <= 0 for call_id in call_ids) or target_id <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return Response({"detail": "Call IDs and telecaller_membership_id must be positive integers."}, status=status.HTTP_400_BAD_REQUEST)
+    if len(set(call_ids)) != len(call_ids):
+        return Response({"call_ids": ["Duplicate call IDs are not allowed."]}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        target, calls = redistribute_call_queue(
+            access=access,
+            call_ids=call_ids,
+            telecaller_membership_id=target_id,
+        )
+    except ValidationError as error:
+        return _validation_response(error)
+    return Response({
+        "redistributed": len(calls),
+        "call_ids": [call.id for call in calls],
+        "telecaller": membership_to_dict(target),
+    })
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def telecalling_dispositions(request, organization_slug):
+    """FR-P6-03: list the active fixed disposition catalogue for this organization."""
+    access = get_organization_access(request.user, organization_slug)
+    dispositions = active_call_dispositions(access.organization)
+    return Response({
+        "count": dispositions.count(),
+        "results": [
+            {
+                "id": item.id,
+                "code": item.code,
+                "name": item.name,
+                "color": item.color,
+                "description": item.description,
+                "sort_order": item.sort_order,
+            }
+            for item in dispositions
+        ],
+    })
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+@transaction.atomic
+def telecalling_call_log(request, organization_slug):
+    """FR-P6-02/04/05/06/08 and API-P6-06: submit one manual call log."""
+    access = get_organization_access(request.user, organization_slug)
+    try:
+        lead_id = int(request.data.get("lead_id"))
+        if lead_id <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return Response({"lead_id": ["A positive integer is required."]}, status=status.HTTP_400_BAD_REQUEST)
+    lead = get_object_or_404(_leads_for_access(access), pk=lead_id)
+    try:
+        raw_call_timestamp = request.data.get("call_timestamp")
+        call_timestamp = (
+            _parse_datetime(raw_call_timestamp, "call_timestamp")
+            if raw_call_timestamp not in (None, "") else None
+        )
+        raw_next_follow_up = request.data.get("next_follow_up")
+        next_follow_up = (
+            _parse_datetime(raw_next_follow_up, "next_follow_up")
+            if raw_next_follow_up not in (None, "") else None
+        )
+        call, created = log_manual_call(
+            access=access,
+            lead=lead,
+            disposition=request.data.get("disposition"),
+            notes=request.data.get("notes"),
+            call_timestamp=call_timestamp,
+            next_follow_up=next_follow_up,
+            call_recording=request.FILES.get("call_recording"),
+        )
+    except ValidationError as error:
+        return _validation_response(error)
+    log_audit(
+        request=request,
+        organization=access.organization,
+        module="telecalling",
+        action="manual_call_logged",
+        details={
+            "lead_id": lead.id,
+            "disposition": call.outcome,
+            "call_timestamp": call.called_at.isoformat(),
+            "has_recording": bool(call.call_recording),
+        },
+        target=call,
+    )
+    return Response(
+        manual_call_log_to_dict(call, request=request),
+        status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+    )
 
 
 @api_view(["GET"])
@@ -582,27 +1050,43 @@ def sitevisit_dashboard(request, organization_slug):
         lead = leads.get(pk=lead_id)
     except (Lead.DoesNotExist, ValueError, TypeError):
         return Response({"error": "Lead not found or you don't have access to this lead."}, status=status.HTTP_404_NOT_FOUND)
+    if lead.status in {"lost", "converted"}:
+        return Response({"lead": "Only active leads can have a site visit scheduled."}, status=status.HTTP_400_BAD_REQUEST)
     try:
         visit_date = _parse_date(request.data.get("visit_date"), "visit_date")
         visit_time = _parse_time(request.data.get("visit_time"), "visit_time")
-        _schedule_validation(visit_date, visit_time)
-        executive = _active_executive(access.organization, request.user)
+        _schedule_validation(visit_date, visit_time, organization=access.organization, project_id=lead.project_id)
+        executive = _active_executive(access.organization, request.data.get("executive"))
+        role = membership_role_code(access.membership)
+        if role in {"site_visit_exec", "site_visit_executive"} and executive.id != access.membership.id:
+            raise PermissionDenied("Site Visit Executives may schedule only their own visits.")
         if not str(request.data.get("site", "")).strip():
             raise ValidationError({"site": "This field is required."})
-        # if request.data.get("duration_minutes") is None:
-        #     raise ValidationError({"duration_minutes": "This field is required."})
-        # duration = int(request.data["duration_minutes"])
+        duration = request.data.get("duration_minutes", 60)
+        try:
+            duration = int(duration)
+        except (TypeError, ValueError) as error:
+            raise ValidationError({"duration_minutes": "Use a whole number of minutes."}) from error
+        if duration <= 0:
+            raise ValidationError({"duration_minutes": "Duration must be greater than zero."})
         with transaction.atomic():
+            _ensure_executive_available(
+                organization=access.organization,
+                executive=executive,
+                visit_date=visit_date,
+                visit_time=visit_time,
+                duration_minutes=duration,
+            )
             site_visit = Sitevisit(
                 organization=access.organization, lead=lead, executive_membership=executive,
-                visit_date=visit_date, visit_time=visit_time, duration_minutes=1,
+                visit_date=visit_date, visit_time=visit_time, duration_minutes=duration,
                 site=request.data.get("site"), location=request.data.get("location"),
                 customer_preference=request.data.get("customer_preference"), notes=request.data.get("notes"),
                 created_by=request.user, status=Sitevisit.Status.UPCOMING,
             )
             site_visit.full_clean()
             site_visit.save()
-    except (ValidationError, ValueError, TypeError) as exc:
+    except (ValidationError, PermissionDenied, ValueError, TypeError) as exc:
         return _validation_response(exc)
     return Response(site_visit_to_dict(site_visit), status=status.HTTP_201_CREATED)
 
@@ -764,6 +1248,7 @@ def sitevisit_reschedule(request, organization_slug, site_visit_id):
         try:
             history = _reschedule_site_visit(visit, new_date, new_time, request.data.get("reason"))
         except ValidationError as exc:
+            transaction.set_rollback(True)
             return _validation_response(exc)
     return Response(reschedule_sitevisit_to_dict(history), status=status.HTTP_201_CREATED)
 
@@ -828,8 +1313,10 @@ def sitevisit_outcome(request, organization_slug, site_visit_id):
     access = get_organization_access(request.user, organization_slug)
     leads = _leads_for_access(access)
     outcome = request.data.get("outcome")
-    if outcome not in Sitevisit.Outcome.values:
-        return Response({"outcome": "Use a valid outcome."}, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        validate_site_visit_outcome(access.organization, outcome)
+    except ValidationError as exc:
+        return _validation_response(exc)
     try:
         interest_level = int(request.data.get("interest_level"))
     except (TypeError, ValueError):
@@ -843,7 +1330,19 @@ def sitevisit_outcome(request, organization_slug, site_visit_id):
             visit.remarks = request.data.get("remarks")
             visit.full_clean()
             visit.save(update_fields=["status", "outcome", "interest_level", "remarks", "updated_at"])
+            lead = Lead.all_objects.select_for_update().get(
+                pk=visit.lead_id,
+                organization=access.organization,
+            )
+            lead = _complete_lead_for_site_visit(
+                lead=lead,
+                actor=request.user,
+                organization=access.organization,
+            )
+            lead.score = (lead.score or 0) + 20
+            lead.save(update_fields=["score", "updated_at"])
         except ValidationError as exc:
+            transaction.set_rollback(True)
             return _validation_response(exc)
     return Response(site_visit_to_dict(visit))
 

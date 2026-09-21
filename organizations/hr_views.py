@@ -10,10 +10,11 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from .employee_views import _employees_for_access, _page_url, _paginate, _validation_response
-from .hr_services import check_in, check_out, decide_leave, leave_days, log_activity
+from .hr_services import apply_leave, check_in, check_out, decide_leave, leave_days, log_activity
 from .models import (AttendanceRecord, LeaveRequest, OrganizationHoliday, OrganizationMembership,
-                     OrganizationRole, Permission)
+                     OrganizationRole, Permission, PerformanceReview)
 from .services import get_organization_access, has_permission
+from system_settings.audit import log_audit
 
 
 def _manage(access):
@@ -53,6 +54,10 @@ def roles(request, organization_slug):
             if employee: log_activity(organization=access.organization, employee=employee, action="role_created", actor=request.user, module="roles", details={"role": code})
     except IntegrityError:
         return Response({"name": "Role name and code must be unique within this organization."}, status=400)
+    log_audit(
+        request=request, organization=access.organization, module="roles", action="role_created",
+        details={"payload_before": None, "payload_after": _role(role)}, target=role,
+    )
     return Response(_role(role), status=201)
 
 
@@ -63,7 +68,10 @@ def role_detail(request, organization_slug, role_id):
     role = get_object_or_404(OrganizationRole.objects.filter(organization=access.organization).prefetch_related("permissions"), pk=role_id)
     if request.method == "GET": return Response(_role(role))
     _manage(access)
+    before = _role(role)
     if request.method == "DELETE":
+        if role.is_system:
+            return Response({"role": "System roles cannot be deleted."}, status=409)
         if access.organization.memberships.filter(organization_role=role).exists():
             return Response({"role": "Reassign employees before deleting this role."}, status=409)
         if not request.data.get("confirmation"):
@@ -75,11 +83,17 @@ def role_detail(request, organization_slug, role_id):
     if "permission_ids" in request.data:
         selected = list(Permission.objects.filter(pk__in=request.data["permission_ids"]))
         if len(selected) != len(set(request.data["permission_ids"])): return Response({"permission_ids": "Use valid unique permission IDs."}, status=400)
+        if role.is_system and not set(role.permissions.values_list("id", flat=True)).issubset({item.id for item in selected}):
+            return Response({"role": "System role base permissions cannot be stripped."}, status=409)
         role.permissions.set(selected)
     try: role.save()
     except IntegrityError: return Response({"name": "Role name and code must be unique within this organization."}, status=400)
     employee = access.membership or access.organization.memberships.first()
     if employee: log_activity(organization=access.organization, employee=employee, action="role_updated", actor=request.user, module="roles", details={"role": role.code})
+    log_audit(
+        request=request, organization=access.organization, module="roles", action="role_updated",
+        details={"payload_before": before, "payload_after": _role(role)}, target=role,
+    )
     return Response(_role(role))
 
 
@@ -177,11 +191,33 @@ def leaves(request, organization_slug):
     try:
         from_date, to_date = parse_date(str(request.data["from_date"])), parse_date(str(request.data["to_date"]))
         if not from_date or not to_date: raise ValidationError({"from_date": "Use ISO dates (YYYY-MM-DD)."})
-        days = leave_days(access.organization, from_date, to_date)
-        leave = LeaveRequest.objects.create(organization=access.organization, employee=employee, leave_type=request.data["leave_type"], from_date=from_date, to_date=to_date, days=days, reason=request.data["reason"])
-        log_activity(organization=access.organization, employee=employee, action="leave_applied", actor=request.user, module="leave", details={"leave_id": leave.id, "days": days})
+        leave = apply_leave(organization=access.organization, employee=employee, leave_type=request.data["leave_type"], from_date=from_date, to_date=to_date, reason=request.data["reason"], actor=request.user)
     except (KeyError, ValidationError) as error: return _validation_response(error)
     return Response(_leave(LeaveRequest.objects.select_related("employee__user").get(pk=leave.pk)), status=201)
+
+
+def _review(review):
+    return {"id": review.id, "employee": _dict_employee(review.employee), "quarter": review.quarter, "rating": review.rating, "comments": review.comments, "reviewer": review.reviewer_id, "reviewed_at": review.reviewed_at}
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def performance_review_list(request, organization_slug):
+    access = get_organization_access(request.user, organization_slug)
+    query = PerformanceReview.objects.filter(organization=access.organization).select_related("employee__user", "reviewer")
+    if request.method == "GET":
+        if not access.is_platform and access.membership.role not in {OrganizationMembership.Role.ADMIN, OrganizationMembership.Role.MANAGER}:
+            query = query.filter(employee=access.membership)
+        return Response([_review(item) for item in query])
+    if not access.is_platform and access.membership.role not in {OrganizationMembership.Role.ADMIN, OrganizationMembership.Role.MANAGER}:
+        raise PermissionDenied("Only managers and admins can submit performance reviews.")
+    employee = get_object_or_404(_employees_for_access(access), pk=request.data.get("employee"))
+    review = PerformanceReview(organization=access.organization, employee=employee, reviewer=request.user, quarter=str(request.data.get("quarter", "")), rating=request.data.get("rating"), comments=str(request.data.get("comments", "")))
+    try:
+        review.full_clean(); review.save()
+    except ValidationError as error:
+        return _validation_response(error)
+    return Response(_review(PerformanceReview.objects.select_related("employee__user", "reviewer").get(pk=review.pk)), status=201)
 
 
 @api_view(["GET", "PATCH"])

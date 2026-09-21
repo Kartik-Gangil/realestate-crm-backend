@@ -1,4 +1,5 @@
 import json
+import math
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from rest_framework import serializers
@@ -23,10 +24,33 @@ class OrganizationSettingsSerializer(serializers.ModelSerializer):
 
 
 class MasterDataSerializer(serializers.ModelSerializer):
+    category = serializers.SerializerMethodField()
+
     class Meta:
         model = MasterData
-        fields = ("id", "master_type", "code", "name", "color", "description", "is_active", "sort_order", "created_at", "updated_at")
-        read_only_fields = ("id", "master_type", "created_at", "updated_at")
+        fields = ("id", "category", "master_type", "code", "name", "color", "description", "is_active", "is_system", "sort_order", "created_at", "updated_at")
+        read_only_fields = ("id", "category", "master_type", "is_system", "created_at", "updated_at")
+
+    def get_category(self, obj):
+        return {"id": obj.category_id, "code": obj.category.code, "name": obj.category.name}
+
+    def validate_code(self, value):
+        organization = self.context.get("organization")
+        project = self.context.get("project")
+        master_type = self.context.get("master_type")
+        if organization and master_type:
+            query = MasterData.objects.filter(
+                organization=organization,
+                project=project,
+                master_type=master_type,
+                code=value,
+            )
+            if self.instance:
+                query = query.exclude(pk=self.instance.pk)
+            if query.exists():
+                raise serializers.ValidationError("An item with this code already exists in the category.")
+        return value
+
     def validate_color(self, value):
         if value and (len(value) != 7 or not value.startswith("#") or any(c not in "0123456789abcdefABCDEF" for c in value[1:])):
             raise serializers.ValidationError("Use a #RRGGBB color.")
@@ -53,15 +77,58 @@ class SystemParameterSerializer(serializers.ModelSerializer):
         fields = ("id", "category", "parameter_key", "parameter_name", "value", "data_type", "description", "is_active", "is_critical", "confirmation", "created_at", "updated_at")
         read_only_fields = ("id", "created_at", "updated_at")
     def validate(self, attrs):
-        dtype = attrs.get("data_type", getattr(self.instance, "data_type", None)); value = attrs.get("value", getattr(self.instance, "value", None))
-        if value is None: return attrs
-        valid = ((dtype == "string" and isinstance(value, str)) or (dtype == "integer" and isinstance(value, int) and not isinstance(value, bool)) or
-                 (dtype == "decimal" and isinstance(value, (str, int, float))) or (dtype == "boolean" and isinstance(value, bool)) or (dtype == "json"))
-        if not valid: raise serializers.ValidationError({"value": f"Value must match {dtype}."})
-        if dtype == "decimal":
-            try: Decimal(str(value))
-            except InvalidOperation: raise serializers.ValidationError({"value": "Use a valid decimal."})
+        dtype = attrs.get("data_type", getattr(self.instance, "data_type", None))
+        value_supplied = "value" in attrs
+        type_changed = "data_type" in attrs
+        value = attrs.get("value", getattr(self.instance, "value", None))
+        if value is None:
+            return attrs
+        if value_supplied or type_changed:
+            attrs["value"] = self._coerce_value(dtype, value)
         return attrs
+
+    @staticmethod
+    def _coerce_value(dtype, value):
+        message = f"Value cannot be converted to {dtype}."
+        try:
+            if dtype == SystemParameter.DataType.STRING:
+                if isinstance(value, (dict, list)):
+                    raise ValueError
+                return str(value)
+            if dtype == SystemParameter.DataType.INTEGER:
+                if isinstance(value, bool):
+                    raise ValueError
+                if isinstance(value, int):
+                    return value
+                if isinstance(value, str):
+                    stripped = value.strip()
+                    if not stripped or stripped.lstrip("+-").isdigit() is False:
+                        raise ValueError
+                    return int(stripped)
+                raise ValueError
+            if dtype == SystemParameter.DataType.FLOAT:
+                if isinstance(value, bool):
+                    raise ValueError
+                converted = float(value)
+                if not math.isfinite(converted):
+                    raise ValueError
+                return converted
+            if dtype == SystemParameter.DataType.DECIMAL:
+                if isinstance(value, bool):
+                    raise ValueError
+                converted = Decimal(str(value))
+                if not converted.is_finite():
+                    raise ValueError
+                return format(converted, "f")
+            if dtype == SystemParameter.DataType.BOOLEAN:
+                if not isinstance(value, bool):
+                    raise ValueError
+                return value
+            if dtype == SystemParameter.DataType.JSON:
+                return value
+        except (InvalidOperation, TypeError, ValueError, OverflowError):
+            raise serializers.ValidationError({"value": message})
+        raise serializers.ValidationError({"value": message})
 
 
 class AuditLogSerializer(serializers.ModelSerializer):

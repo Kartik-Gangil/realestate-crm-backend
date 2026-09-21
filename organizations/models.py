@@ -2,6 +2,7 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models import Q, F
+from .project_scope import ProjectScopedManager, get_current_project_id
 TAB_PERMISSIONS = ("dashboard", "leads", "assigned_leads", "follow_ups", "members")
 
 
@@ -11,8 +12,14 @@ def default_tab_permissions():
 
 
 class Organization(models.Model):
+    class Status(models.TextChoices):
+        ACTIVE = "active", "Active"
+        INACTIVE = "inactive", "Inactive"
+
     name = models.CharField(max_length=150)
     slug = models.SlugField(max_length=150, unique=True)
+    code = models.CharField(max_length=50, unique=True, blank=True)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.ACTIVE)
     is_active = models.BooleanField(default=True)
     # Last telecaller used by the organization round-robin allocator.
     round_robin_cursor = models.PositiveBigIntegerField(null=True, blank=True)
@@ -25,6 +32,72 @@ class Organization(models.Model):
 
     def __str__(self):
         return self.name
+
+    def save(self, *args, **kwargs):
+        if not self.code:
+            self.code = self.slug.upper().replace("-", "_")
+        self.is_active = self.status == self.Status.ACTIVE
+        return super().save(*args, **kwargs)
+
+
+class Project(models.Model):
+    """PHASE 0 / DM-P0-02: an organization-scoped CRM project."""
+
+    class Status(models.TextChoices):
+        ACTIVE = "active", "Active"
+        INACTIVE = "inactive", "Inactive"
+
+    organization = models.ForeignKey(
+        Organization, on_delete=models.CASCADE, related_name="projects"
+    )
+    name = models.CharField(max_length=150)
+    code = models.CharField(max_length=50)
+    description = models.TextField(blank=True)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.ACTIVE)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["organization__name", "name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["organization", "code"], name="unique_organization_project_code"
+            )
+        ]
+        indexes = [models.Index(fields=["organization", "status"])]
+
+    def __str__(self):
+        return f"{self.organization}: {self.name}"
+
+
+class ProjectScopedModel(models.Model):
+    """Abstract FR-P0-02/GNFR-06 row-level project boundary."""
+
+    project = models.ForeignKey(
+        Project,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="%(app_label)s_%(class)s_records",
+    )
+    objects = ProjectScopedManager()
+    all_objects = models.Manager()
+
+    class Meta:
+        abstract = True
+
+    def save(self, *args, **kwargs):
+        if not self.project_id:
+            current_project_id = get_current_project_id()
+            if current_project_id is not None:
+                self.project_id = current_project_id
+        if self.project_id and hasattr(self, "organization_id"):
+            project_organization_id = Project.objects.only("organization_id").get(
+                pk=self.project_id
+            ).organization_id
+            if self.organization_id != project_organization_id:
+                raise ValidationError({"project": "Project must belong to this organization."})
+        return super().save(*args, **kwargs)
 
 
 class OrganizationMembership(models.Model):
@@ -39,6 +112,12 @@ class OrganizationMembership(models.Model):
     # Deprecated compatibility display value. Authorization uses organization_role.
     organization_role = models.ForeignKey("OrganizationRole", null=True, blank=True,
                                           on_delete=models.PROTECT, related_name="memberships")
+    projects = models.ManyToManyField(
+        "Project",
+        blank=True,
+        related_name="assigned_memberships",
+        help_text="Phase 3 project-scope assignment for this organization user.",
+    )
     is_active = models.BooleanField(default=True)
 
     # Employee data is organization-specific, so it belongs on the membership
@@ -166,7 +245,7 @@ class OrganizationRole(models.Model):
         return f"{self.organization}: {self.name}"
 
 
-class OrganizationHoliday(models.Model):
+class OrganizationHoliday(ProjectScopedModel):
     organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name="holidays")
     name = models.CharField(max_length=150)
     holiday_date = models.DateField()
@@ -175,10 +254,13 @@ class OrganizationHoliday(models.Model):
 
     class Meta:
         ordering = ["holiday_date", "name"]
-        constraints = [models.UniqueConstraint(fields=["organization", "holiday_date"], name="organization_holiday_date_unique")]
+        constraints = [
+            models.UniqueConstraint(fields=["organization", "project", "holiday_date"], name="organization_holiday_date_unique"),
+            models.UniqueConstraint(fields=["organization", "holiday_date"], condition=Q(project__isnull=True), name="organization_holiday_date_legacy"),
+        ]
 
 
-class AttendanceRecord(models.Model):
+class AttendanceRecord(ProjectScopedModel):
     class Status(models.TextChoices):
         PRESENT = "present", "Present"
         LATE = "late", "Late"
@@ -196,7 +278,10 @@ class AttendanceRecord(models.Model):
 
     class Meta:
         ordering = ["-attendance_date", "-id"]
-        constraints = [models.UniqueConstraint(fields=["employee", "attendance_date"], name="employee_daily_attendance_unique")]
+        constraints = [
+            models.UniqueConstraint(fields=["project", "employee", "attendance_date"], name="employee_daily_attendance_unique"),
+            models.UniqueConstraint(fields=["employee", "attendance_date"], condition=Q(project__isnull=True), name="employee_daily_attendance_legacy"),
+        ]
         indexes = [models.Index(fields=["organization", "attendance_date", "status"])]
 
     def clean(self):
@@ -209,10 +294,11 @@ class AttendanceRecord(models.Model):
             raise ValidationError(errors)
 
 
-class LeaveRequest(models.Model):
+class LeaveRequest(ProjectScopedModel):
     class LeaveType(models.TextChoices):
         CASUAL = "casual", "Casual Leave"
         SICK = "sick", "Sick Leave"
+        PAID = "paid", "Paid Leave"
         EARNED = "earned", "Earned Leave"
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
@@ -248,7 +334,54 @@ class LeaveRequest(models.Model):
             raise ValidationError(errors)
 
 
-class OrganizationActivity(models.Model):
+class EmployeeLeaveBalance(ProjectScopedModel):
+    class LeaveType(models.TextChoices):
+        CASUAL = "casual", "Casual Leave"
+        SICK = "sick", "Sick Leave"
+        PAID = "paid", "Paid Leave"
+        EARNED = "earned", "Earned Leave"
+
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name="employee_leave_balances")
+    employee = models.ForeignKey(OrganizationMembership, on_delete=models.CASCADE, related_name="leave_balances")
+    leave_type = models.CharField(max_length=16, choices=LeaveType.choices)
+    allocated_days = models.PositiveIntegerField(default=0)
+    used_days = models.PositiveIntegerField(default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["organization", "project", "employee", "leave_type"], name="employee_leave_balance_unique"), models.UniqueConstraint(fields=["organization", "employee", "leave_type"], condition=Q(project__isnull=True), name="employee_leave_balance_legacy")]
+
+    @property
+    def remaining_days(self):
+        return self.allocated_days - self.used_days
+
+
+class PerformanceReview(ProjectScopedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name="performance_reviews")
+    employee = models.ForeignKey(OrganizationMembership, on_delete=models.CASCADE, related_name="performance_reviews")
+    reviewer = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="submitted_performance_reviews")
+    quarter = models.CharField(max_length=7)
+    rating = models.PositiveSmallIntegerField()
+    comments = models.TextField(blank=True)
+    reviewed_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["organization", "project", "employee", "quarter"], name="employee_performance_quarter_unique"), models.UniqueConstraint(fields=["organization", "employee", "quarter"], condition=Q(project__isnull=True), name="employee_performance_quarter_legacy")]
+        ordering = ["-reviewed_at", "-id"]
+
+    def clean(self):
+        errors = {}
+        if not self.quarter or len(self.quarter) != 7 or self.quarter[4] != "-" or self.quarter[5] != "Q" or self.quarter[6] not in "1234":
+            errors["quarter"] = "Use quarter format YYYY-Q1 through YYYY-Q4."
+        if not 1 <= self.rating <= 5:
+            errors["rating"] = "Rating must be between 1 and 5."
+        if self.employee_id and self.employee.organization_id != self.organization_id:
+            errors["employee"] = "Employee must belong to this organization."
+        if errors:
+            raise ValidationError(errors)
+
+
+class OrganizationActivity(ProjectScopedModel):
     """Append-only audit records for organization-scoped employee mutations."""
 
     organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name="activities")

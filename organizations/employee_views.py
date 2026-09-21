@@ -12,6 +12,7 @@ from rest_framework.response import Response
 from .employee_serializers import DepartmentSerializer, EmployeeCreateSerializer, EmployeeUpdateSerializer
 from .models import Department, Organization, OrganizationActivity, OrganizationMembership, OrganizationRole
 from .services import ensure_default_roles, get_organization_access, has_permission
+from system_settings.audit import log_audit
 
 
 def _validation_response(error):
@@ -74,6 +75,7 @@ def _employee_to_dict(employee, request=None, detailed=False):
             if employee.reporting_manager_id else None
         ),
         "role": employee.role,
+        "project_ids": list(employee.projects.values_list("id", flat=True)),
         "access_scope": employee.access_scope,
         "status": "active" if employee.is_active else "inactive",
         "is_active": employee.is_active,
@@ -276,8 +278,14 @@ def employee_list(request, organization_slug):
                 employee.custom_scope_memberships.set(relations["custom_scope_memberships"])
             if "custom_scope_departments" in relations:
                 employee.custom_scope_departments.set(relations["custom_scope_departments"])
+            if "project_ids" in data:
+                employee.projects.set(data["project_ids"])
             _activity(employee=employee, action="employee_created", actor=request.user, details={"employee_id": employee.employee_id})
             _activity(employee=employee, action="role_assigned", actor=request.user, details={"role": employee.role})
+            log_audit(
+                request=request, organization=organization, module="users", action="user_created",
+                details={"payload_before": None, "payload_after": _employee_to_dict(employee, detailed=True)}, target=employee,
+            )
     except (ValidationError, IntegrityError) as error:
         return _validation_response(error)
     employee = _employees_for_access(access).get(pk=employee.pk)
@@ -292,7 +300,7 @@ def employee_detail(request, organization_slug, employee_id):
     if request.method == "GET":
         return Response(_employee_to_dict(employee, request, detailed=True))
     _require_employee_management(access)
-    serializer = EmployeeUpdateSerializer(data=request.data)
+    serializer = EmployeeUpdateSerializer(data=request.data, context={"organization": access.organization})
     serializer.is_valid(raise_exception=True)
     data = serializer.validated_data
     protected = set(request.data) - set(serializer.fields)
@@ -306,10 +314,11 @@ def employee_detail(request, organization_slug, employee_id):
             employee = OrganizationMembership.objects.select_for_update().select_related("user").get(
                 pk=employee.pk, organization=access.organization
             )
+            before = _employee_to_dict(employee, detailed=True)
             relations = _resolve_relations(data, access.organization, employee)
             changed = []
             for field, value in data.items():
-                if field in {"department", "reporting_manager", "custom_scope_memberships", "custom_scope_departments"}:
+                if field in {"department", "reporting_manager", "custom_scope_memberships", "custom_scope_departments", "project_ids"}:
                     continue
                 if getattr(employee, field) != value:
                     setattr(employee, field, value)
@@ -329,6 +338,9 @@ def employee_detail(request, organization_slug, employee_id):
             if "custom_scope_departments" in relations:
                 employee.custom_scope_departments.set(relations["custom_scope_departments"])
                 changed.append("custom_scope_departments")
+            if "project_ids" in data:
+                employee.projects.set(data["project_ids"])
+                changed.append("project_ids")
             if changed:
                 _activity(employee=employee, action="employee_updated", actor=request.user, details={"fields": changed})
                 if "role" in changed:
@@ -336,6 +348,10 @@ def employee_detail(request, organization_slug, employee_id):
                 if {"access_scope", "custom_scope_memberships", "custom_scope_departments"} & set(changed):
                     _activity(employee=employee, action="access_scope_changed", actor=request.user,
                               details={"access_scope": employee.access_scope})
+                log_audit(
+                    request=request, organization=access.organization, module="users", action="user_updated",
+                    details={"payload_before": before, "payload_after": _employee_to_dict(employee, detailed=True)}, target=employee,
+                )
     except ValidationError as error:
         return _validation_response(error)
     employee = _employees_for_access(access).get(pk=employee.pk)
@@ -350,7 +366,20 @@ def _set_employee_active(request, organization_slug, employee_id, active):
         return Response({"status": ["Employee is already active." if active else "Employee is already inactive."]}, status=status.HTTP_400_BAD_REQUEST)
     employee.is_active = active
     employee.save(update_fields=["is_active"])
+    if active:
+        employee.user.is_active = True
+        employee.user.save(update_fields=["is_active"])
+    elif not employee.user.organization_memberships.filter(is_active=True).exists():
+        employee.user.is_active = False
+        employee.user.save(update_fields=["is_active"])
+    before = {"is_active": not active}
+    after = {"is_active": active}
     _activity(employee=employee, action="employee_activated" if active else "employee_deactivated", actor=request.user)
+    log_audit(
+        request=request, organization=access.organization, module="users",
+        action="user_activated" if active else "user_deactivated",
+        details={"payload_before": before, "payload_after": after}, target=employee,
+    )
     return Response(_employee_to_dict(employee, request, detailed=True))
 
 

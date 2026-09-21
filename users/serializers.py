@@ -3,6 +3,8 @@ from rest_framework import serializers
 
 from organizations.services import membership_permission_codes
 
+from .security import AccountLocked, clear_failed_logins, locked_account_remaining, record_failed_login
+
 
 class UserSerializer(serializers.ModelSerializer):
     organization_memberships = serializers.SerializerMethodField()
@@ -10,6 +12,7 @@ class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = get_user_model()
         fields = ("id", "email", "first_name", "last_name", "last_login", "is_active", "is_staff", "is_superuser", "date_joined", "organization_memberships")
+        read_only_fields = ("id", "email", "last_login", "is_active", "is_staff", "is_superuser", "date_joined", "organization_memberships")
 
 
     def get_organization_memberships(self, user):
@@ -47,8 +50,15 @@ class LoginSerializer(serializers.Serializer):
     password = serializers.CharField(write_only=True, trim_whitespace=False)
 
     def validate(self, attrs):
+        remaining = locked_account_remaining(attrs["email"])
+        if remaining:
+            raise AccountLocked(remaining)
         user = authenticate(request=self.context.get("request"), email=attrs["email"], password=attrs["password"])
         if user is None:
+            remaining = record_failed_login(attrs["email"])
+            if remaining:
+                raise AccountLocked(remaining)
             raise serializers.ValidationError({"detail": "Invalid email or password."})
+        clear_failed_logins(attrs["email"])
         attrs["user"] = user
         return attrs

@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
 import os
+import sys
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -36,12 +37,16 @@ _load_local_env_file(BASE_DIR / ".env")
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-0^yiec98qw!l1_q@j7=k%tltsln8z0&407eboh^(f$9saz-)2r'
+SECRET_KEY = os.getenv("DJANGO_SECRET_KEY")
+if not SECRET_KEY:
+    if os.getenv("ENVIRONMENT_NAME", "development").lower() in {"production", "prod"}:
+        raise RuntimeError("DJANGO_SECRET_KEY must be configured in production.")
+    SECRET_KEY = "development-only-change-me"
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.getenv("DJANGO_DEBUG", "false").lower() in {"1", "true", "yes"}
 
-ALLOWED_HOSTS = ['localhost' , '127.0.0.1']
+ALLOWED_HOSTS = [host.strip() for host in os.getenv("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",") if host.strip()]
 
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",
@@ -61,24 +66,27 @@ INSTALLED_APPS = [
     'rest_framework',
     'rest_framework.authtoken',
     'users',
+    'customers',
     'organizations',
     'leads',
     'inventory',
     'documents',
     'system_settings',
+    'expenses',
     'corsheaders',
 ]
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    "corsheaders.middleware.CorsMiddleware",
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
+    'config.metrics.MetricsMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'organizations.middleware.ProjectContextMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
-    "corsheaders.middleware.CorsMiddleware",
-    "django.middleware.common.CommonMiddleware",
 ]
 
 ROOT_URLCONF = 'config.urls'
@@ -106,14 +114,23 @@ WSGI_APPLICATION = 'config.wsgi.application'
 
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'ENGINE': os.getenv("DB_ENGINE", "django.db.backends.sqlite3"),
+        'NAME': os.getenv("DB_NAME", str(BASE_DIR / 'db.sqlite3')),
+        'USER': os.getenv("DB_USER", ""),
+        'PASSWORD': os.getenv("DB_PASSWORD", ""),
+        'HOST': os.getenv("DB_HOST", ""),
+        'PORT': os.getenv("DB_PORT", ""),
     }
 }
 
 
 # Password validation
 # https://docs.djangoproject.com/en/6.0/ref/settings/#auth-password-validators
+
+PASSWORD_HASHERS = [
+    'django.contrib.auth.hashers.Argon2PasswordHasher',
+    'django.contrib.auth.hashers.PBKDF2PasswordHasher',
+]
 
 AUTH_PASSWORD_VALIDATORS = [
     {
@@ -151,6 +168,11 @@ MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 DOCUMENT_MAX_UPLOAD_SIZE = 10 * 1024 * 1024
 DOCUMENT_EXPIRY_WARNING_DAYS = 30
+# Optional urlsafe-base64 encoded 32-byte AES-256-GCM key. In development the
+# key is deterministically derived from SECRET_KEY; production should configure
+# a dedicated secret through the environment.
+DOCUMENT_ENCRYPTION_KEY = os.getenv("DOCUMENT_ENCRYPTION_KEY", "")
+EXPENSE_RECEIPT_THRESHOLD = os.getenv("EXPENSE_RECEIPT_THRESHOLD", "5000")
 
 # SMTP credentials live in the ignored .env file.  See .env.example.
 EMAIL_BACKEND = os.getenv("EMAIL_BACKEND", "django.core.mail.backends.smtp.EmailBackend")
@@ -161,6 +183,24 @@ EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "")
 EMAIL_USE_TLS = os.getenv("EMAIL_USE_TLS", "true").lower() in {"1", "true", "yes"}
 DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", EMAIL_HOST_USER or "noreply@example.com")
 PASSWORD_RESET_FRONTEND_URL = os.getenv("PASSWORD_RESET_FRONTEND_URL", "http://localhost:5173/reset-password")
+TESTING = "test" in sys.argv
+REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/1")
+CACHES = (
+    {
+        "default": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+            "LOCATION": "crm-test-cache",
+        }
+    }
+    if TESTING
+    else {
+        "default": {
+            "BACKEND": "django.core.cache.backends.redis.RedisCache",
+            "LOCATION": REDIS_URL,
+        }
+    }
+)
+SYSTEM_PARAMETER_CACHE_TTL = int(os.getenv("SYSTEM_PARAMETER_CACHE_TTL", "300"))
 INTEGRATION_ENCRYPTION_KEY = os.getenv("INTEGRATION_ENCRYPTION_KEY", "")
 ENVIRONMENT_NAME = os.getenv("ENVIRONMENT_NAME", "development")
 
@@ -169,10 +209,27 @@ AUTHENTICATION_BACKENDS = [
 ]
 
 REST_FRAMEWORK = {
+    # Expense report exports intentionally use the documented `format` query
+    # parameter (xlsx|pdf), so DRF must not interpret it as a renderer format.
+    "URL_FORMAT_OVERRIDE": None,
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework.authentication.TokenAuthentication",
+        "rest_framework.authentication.SessionAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",
     ],
+    # Request throttling is intentionally disabled for Django's test runner.
+    # Tests make many authenticated requests using the same user/IP and should
+    # validate business behavior rather than share a process-wide throttle cache.
+    "DEFAULT_THROTTLE_CLASSES": [] if TESTING else [
+        "rest_framework.throttling.AnonRateThrottle",
+        "rest_framework.throttling.UserRateThrottle",
+    ],
+    "DEFAULT_THROTTLE_RATES": {
+        "anon": os.getenv("DRF_ANON_RATE", "20/minute"),
+        "user": os.getenv("DRF_USER_RATE", "120/minute"),
+    },
 }
+if os.getenv("ENVIRONMENT_NAME", "development").lower() in {"production", "prod"} and DATABASES["default"]["ENGINE"].endswith("sqlite3"):
+    raise RuntimeError("Configure a production database with DB_ENGINE; SQLite is development-only.")

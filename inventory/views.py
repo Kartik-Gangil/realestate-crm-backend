@@ -1,7 +1,11 @@
 from datetime import date
 from decimal import Decimal, InvalidOperation
+import hashlib
+import json
 
 from django.core.exceptions import ValidationError
+from django.core.cache import cache
+from django.db import OperationalError
 from django.db.models import Prefetch, Q, Sum
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -12,23 +16,32 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from organizations.services import get_organization_access, has_permission
+from system_settings.master_data import validate_plot_status
+
+from organizations.services import get_organization_access, has_permission, membership_role_code
 
 from leads.models import Lead, Sitevisit
 
+from django.http import FileResponse
+
 from .models import (Agreement, Block, Installment, InstallmentPayment, Payment, PaymentAdjustment,
     PaymentAllocation, PaymentReceipt, PaymentRefund, Plot, PlotBooking, PlotHold, PlotSelection,
-    Possession, RecentlyViewedPlot, Registry, RegistryCharge)
+    Possession, RecentlyViewedPlot, Registry, RegistryCharge, RegistryDocument)
 from .serializers import PlotWriteSerializer , BlockWriteSerializer
 from .services import (
     block_plot, bulk_change_plot_status, cancel_plot_booking, change_plot_status,
     confirm_plot_booking, create_plot_booking, hold_plot, release_plot,
 )
+from .booking_receipt_services import booking_receipt_pdf
 from .phase5_services import (
     allocate_payment, confirm_payment, create_agreement, create_installment, create_payment,
     adjust_payment, approve_refund, create_allocated_payment, create_possession, create_registry, fail_payment,
     payment_totals, refund_payment,
     transition_agreement, transition_possession, transition_registry,
+)
+from .registry_services import attach_document_to_registry, remove_registry_document
+from .agreement_services import (
+    generate_agreement_pdf, upload_signed_agreement, download_agreement_pdf, download_signed_agreement,
 )
 from system_settings.audit import log_audit
 from .selection_services import confirm_selection, create_selection, is_plot_selectable, release_selection
@@ -42,6 +55,18 @@ def _validation_response(error):
     else:
         details = {"detail": [str(error)]}
     return Response(details, status=status.HTTP_400_BAD_REQUEST)
+
+
+def _booking_validation_response(error):
+    if hasattr(error, "message_dict") and "idempotency_key" in error.message_dict:
+        return Response(error.message_dict, status=status.HTTP_409_CONFLICT)
+    return _validation_response(error)
+
+
+def _payment_validation_response(error):
+    if hasattr(error, "message_dict") and "idempotency_key" in error.message_dict:
+        return Response(error.message_dict, status=status.HTTP_409_CONFLICT)
+    return _validation_response(error)
 
 
 def _plots_for_access(access, include_active_hold=False):
@@ -180,8 +205,7 @@ def _filter_plots(queryset, params, organization):
             raise ValidationError({"block": "Use a block in this organization."})
         queryset = queryset.filter(block=block)
     if status_value := params.get("status"):
-        if status_value not in Plot.Status.values:
-            raise ValidationError({"status": "Use a valid plot status."})
+        validate_plot_status(organization, status_value)
         queryset = queryset.filter(status=status_value)
     if plot_type := params.get("plot_type"):
         if plot_type not in Plot.PlotType.values:
@@ -222,7 +246,9 @@ def _reject_protected_payload_fields(payload):
         raise ValidationError({field: "This field cannot be updated." for field in protected})
 
 
-def _require_inventory_management(access):
+def _require_inventory_management(access, operation=None):
+    if operation == "hold" and membership_role_code(access.membership) in {"site_visit_exec", "site_visit_executive"}:
+        return
     if not access.is_platform and not has_permission(access.membership.user, access.organization, "plots.edit"):
         raise PermissionDenied("Only organization admins, managers, and authorized platform users can change plot status.")
 
@@ -241,6 +267,9 @@ def booking_to_dict(booking, detailed=False):
     plot, lead = booking.plot, booking.lead
     data = {
         "id": booking.id, "status": booking.status, "notes": booking.notes, "plot_status": plot.status,
+        "idempotency_key": booking.idempotency_key or None,
+        "hold_expires_at": booking.hold_expires_at.isoformat() if booking.hold_expires_at else None,
+        "minimum_payment_amount": str(booking.minimum_payment_amount),
         "lead": {"id": lead.id, "first_name": lead.first_name, "last_name": lead.last_name,
                  "full_name": lead.full_name, "phone": lead.phone, "email": lead.email},
         "plot": {"id": plot.id, "plot_number": plot.plot_number, "size": str(plot.size),
@@ -285,7 +314,13 @@ def _booking_payload(request, organization, *, plot_id=None):
     lead = get_object_or_404(Lead.objects.filter(organization=organization), pk=lead_id)
     plot = get_object_or_404(Plot.objects.filter(organization=organization), pk=selected_plot_id)
     site_visit = get_object_or_404(Sitevisit.objects.filter(organization=organization), pk=site_visit_id) if site_visit_id else None
-    return lead, plot, site_visit, str(request.data.get("notes", "")).strip()
+    initial_payment_amount = request.data.get("initial_payment_amount")
+    if initial_payment_amount in (None, ""):
+        initial_payment_amount = None
+    return (
+        lead, plot, site_visit, str(request.data.get("notes", "")).strip(),
+        initial_payment_amount, request.headers.get("Idempotency-Key", "").strip(),
+    )
 
 
 def _filter_bookings(queryset, params, organization):
@@ -442,8 +477,19 @@ def plot_detail(request, organization_slug, plot_id):
 
 def _status_operation(request, organization_slug, plot_id, operation):
     access = get_organization_access(request.user, organization_slug)
-    _require_inventory_management(access)
+    _require_inventory_management(access, operation)
     plot = get_object_or_404(_plots_for_access(access), pk=plot_id)
+    idempotency_key = request.headers.get("X-Idempotency-Key", "").strip()
+    request_hash = hashlib.sha256(json.dumps(request.data, sort_keys=True, default=str).encode()).hexdigest()
+    cache_key = f"plot-hold-idempotency:{access.organization.id}:{plot_id}:{idempotency_key}" if operation == "hold" and idempotency_key else ""
+    if operation == "hold" and not idempotency_key:
+        return Response({"idempotency_key": "X-Idempotency-Key is required for plot holds."}, status=status.HTTP_400_BAD_REQUEST)
+    if cache_key:
+        cached = cache.get(cache_key)
+        if cached:
+            if cached["request_hash"] != request_hash:
+                return Response({"idempotency_key": "This key was already used with a different payload."}, status=status.HTTP_409_CONFLICT)
+            return Response(cached["data"], status=cached["status"])
     try:
         payload = _parse_operation_payload(request.data)
         if operation == "status":
@@ -454,9 +500,14 @@ def _status_operation(request, organization_slug, plot_id, operation):
             plot = hold_plot(plot=plot, user=request.user, **payload)
         else:
             plot = release_plot(plot=plot, reason=payload["reason"], user=request.user)
+    except OperationalError:
+        return Response({"code": "PLOT_LOCK_CONFLICT", "detail": "The plot is busy; retry the request."}, status=status.HTTP_409_CONFLICT)
     except (ValidationError, ValueError, TypeError) as error:
         return _validation_response(error)
-    return _plot_response(access, plot)
+    response = _plot_response(access, plot)
+    if cache_key:
+        cache.set(cache_key, {"request_hash": request_hash, "data": response.data, "status": response.status_code}, timeout=86400)
+    return response
 
 
 @api_view(["POST"])
@@ -527,7 +578,7 @@ def plot_bulk_status(request, organization_slug):
             plots=plots, new_status=request.data.get("status"), reason=str(request.data.get("reason", "")).strip(), user=request.user
         )
     except (ValidationError, ValueError, TypeError) as error:
-        return _validation_response(error)
+        return _booking_validation_response(error)
     updated_by_id = {plot.id: plot for plot in updated}
     response_plots = [
         _plots_for_access(access, include_active_hold=True).get(pk=plot_id)
@@ -549,10 +600,10 @@ def plot_select(request, organization_slug, plot_id):
     access = get_organization_access(request.user, organization_slug)
     _require_inventory_management(access)
     try:
-        lead, plot, site_visit, notes = _booking_payload(request, access.organization, plot_id=plot_id)
-        booking = create_plot_booking(organization=access.organization, lead=lead, plot=plot, site_visit=site_visit, notes=notes, user=request.user)
+        lead, plot, site_visit, notes, initial_payment_amount, idempotency_key = _booking_payload(request, access.organization, plot_id=plot_id)
+        booking = create_plot_booking(organization=access.organization, lead=lead, plot=plot, site_visit=site_visit, notes=notes, user=request.user, initial_payment_amount=initial_payment_amount, idempotency_key=idempotency_key)
     except (ValidationError, ValueError, TypeError) as error:
-        return _validation_response(error)
+        return _booking_validation_response(error)
     return Response(booking_to_dict(_bookings_for_access(access).get(pk=booking.pk), detailed=True), status=status.HTTP_201_CREATED)
 
 
@@ -563,11 +614,16 @@ def booking_list(request, organization_slug):
     if request.method == "POST":
         _require_inventory_management(access)
         try:
-            lead, plot, site_visit, notes = _booking_payload(request, access.organization)
-            booking = create_plot_booking(organization=access.organization, lead=lead, plot=plot, site_visit=site_visit, notes=notes, user=request.user)
+            incoming_idempotency_key = request.headers.get("Idempotency-Key", "").strip()
+            existing_booking = PlotBooking.objects.filter(
+                organization=access.organization, idempotency_key=incoming_idempotency_key,
+            ).first() if incoming_idempotency_key else None
+            lead, plot, site_visit, notes, initial_payment_amount, idempotency_key = _booking_payload(request, access.organization)
+            booking = create_plot_booking(organization=access.organization, lead=lead, plot=plot, site_visit=site_visit, notes=notes, user=request.user, initial_payment_amount=initial_payment_amount, idempotency_key=idempotency_key)
         except (ValidationError, ValueError, TypeError) as error:
-            return _validation_response(error)
-        return Response(booking_to_dict(_bookings_for_access(access).get(pk=booking.pk), detailed=True), status=status.HTTP_201_CREATED)
+            return _booking_validation_response(error)
+        response_status = status.HTTP_200_OK if existing_booking else status.HTTP_201_CREATED
+        return Response(booking_to_dict(_bookings_for_access(access).get(pk=booking.pk), detailed=True), status=response_status)
     try:
         return _booking_page_response(request, _filter_bookings(_bookings_for_access(access), request.query_params, access.organization))
     except ValidationError as error:
@@ -607,6 +663,14 @@ def booking_cancel(request, organization_slug, booking_id):
     except (ValidationError, ValueError, TypeError) as error:
         return _validation_response(error)
     return Response(booking_to_dict(_bookings_for_access(access).get(pk=booking.pk), detailed=True))
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def booking_receipt(request, organization_slug, booking_id):
+    access = get_organization_access(request.user, organization_slug)
+    booking = get_object_or_404(_bookings_for_access(access), pk=booking_id)
+    return booking_receipt_pdf(booking=booking)
 
 
 @api_view(["GET"])
@@ -681,7 +745,6 @@ def plot_inventory(request, organization_slug):
 @permission_classes([IsAuthenticated])
 def plot_inventory_detail(request, organization_slug, plot_id):
     access = get_organization_access(request.user, organization_slug); plot = get_object_or_404(_plots_for_access(access, include_active_hold=True), pk=plot_id)
-    RecentlyViewedPlot.objects.update_or_create(organization=access.organization, user=request.user, plot=plot)
     data = plot_to_dict(plot, detailed=True); data["available"] = is_plot_selectable(plot)
     if plot.status != Plot.Status.AVAILABLE:
         hold = getattr(plot, "active_hold_records", [])
@@ -773,8 +836,16 @@ def _sales_queryset(model, access):
 
 
 def _require_permission(access, code):
+    if membership_role_code(access.membership) in {"admin", "manager"} and code in {"payments.view", "payments.add", "payments.refund", "payments.adjust"}:
+        return
     if not access.is_platform and not has_permission(access.membership.user, access.organization, code):
         raise PermissionDenied("This role does not have the required permission.")
+
+
+def _require_finance_approval(access):
+    if access.is_platform or membership_role_code(access.membership) == "admin":
+        return
+    raise PermissionDenied("Only organization admins or finance approvers can approve refunds.")
 
 
 def _payment_queryset(access):
@@ -795,25 +866,62 @@ def _simple_page(request, queryset, serializer):
 def payment_to_dict(payment, detailed=False):
     allocations = getattr(payment, "payment_allocations", None)
     allocation_rows = list(allocations.all()) if allocations is not None else list(PaymentAllocation.objects.filter(payment=payment).select_related("booking__lead", "booking__plot", "installment", "registry_charge"))
-    data = {"id": payment.id, "payment_id": payment.payment_id or f"PAY-{payment.id}", "booking_id": payment.booking_id, "amount": str(payment.amount), "status": payment.status,
-            "payment_method": payment.payment_method, "transaction_reference": payment.transaction_reference,
-            "payment_date": payment.payment_date.isoformat(), "notes": payment.notes,
-            "received_by": _actor_to_dict(payment.received_by), "created_at": payment.created_at.isoformat(), "updated_at": payment.updated_at.isoformat()}
+    data = {
+        "id": payment.id,
+        "payment_id": payment.payment_id or f"PAY-{payment.id}",
+        "booking_id": payment.booking_id,
+        "amount": str(payment.amount),
+        "status": payment.status,
+        "payment_method": payment.payment_method,
+        "transaction_reference": payment.transaction_reference,
+        "payment_date": payment.payment_date.isoformat(),
+        "notes": payment.notes,
+        "advance_amount": str(payment.advance_amount),
+        "idempotency_key": payment.idempotency_key or None,
+        "received_by": _actor_to_dict(payment.received_by),
+        "created_at": payment.created_at.isoformat(),
+        "updated_at": payment.updated_at.isoformat()
+        }
     if detailed:
-        data.update({"allocations": [{"booking_id": a.booking_id, "amount": str(a.amount), "installment_id": a.installment_id, "registry_charge_id": a.registry_charge_id, "customer": {"id": a.booking.lead_id, "name": a.booking.lead.full_name}, "plot": {"id": a.booking.plot_id, "plot_number": a.booking.plot.plot_number}} for a in allocation_rows],
-                     "receipt": ({"receipt_number": payment.receipt.receipt_number, "generated_at": payment.receipt.generated_at.isoformat()} if hasattr(payment, "receipt") else None),
+        data.update({
+            "allocations": [{"booking_id": a.booking_id, 
+                             "amount": str(a.amount),
+                             "installment_id": a.installment_id,
+                             "registry_charge_id": a.registry_charge_id,
+                             "customer": {
+                                 "id": a.booking.lead_id,
+                                 "name": a.booking.lead.full_name
+                                 },
+                             "plot": {
+                                 "id": a.booking.plot_id,
+                                 "plot_number": a.booking.plot.plot_number
+                                 }
+                             } for a in allocation_rows],
+                     "receipt": ({"receipt_number": payment.receipt.receipt_number,
+                                  "generated_at": payment.receipt.generated_at.isoformat()} 
+                                 if hasattr(payment, "receipt") else None),
                      "refunds": [{"id": r.id, "amount": str(r.amount), "reason": r.reason, "status": r.status, "refund_date": r.refund_date.isoformat()} for r in payment.refunds.all()]})
     return data
 
 
 def installment_to_dict(item):
-    paid = item.allocations.aggregate(total=__import__("django.db.models", fromlist=["Sum"]).Sum("amount"))["total"] or Decimal("0.00")
+    paid = item.allocations.aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
     return {"id": item.id, "booking_id": item.booking_id, "installment_number": item.installment_number, "title": item.title,
             "due_date": item.due_date.isoformat(), "amount": str(item.amount), "paid_amount": str(paid), "status": item.status,
             "notes": item.notes, "created_at": item.created_at.isoformat(), "updated_at": item.updated_at.isoformat()}
 
 
-def agreement_to_dict(item): return {"id": item.id, "booking_id": item.booking_id, "agreement_number": item.agreement_number, "agreement_date": item.agreement_date.isoformat() if item.agreement_date else None, "status": item.status, "document_reference": item.document_reference, "notes": item.notes}
+def agreement_to_dict(item):
+    return {
+        "id": item.id, "booking_id": item.booking_id,
+        "agreement_number": item.agreement_number,
+        "agreement_date": item.agreement_date.isoformat() if item.agreement_date else None,
+        "status": item.status, "document_reference": item.document_reference,
+        "notes": item.notes,
+        "has_generated_pdf": bool(item.generated_pdf),
+        "has_signed_file": bool(item.signed_file),
+        "signed_file_name": item.signed_file_name or None,
+    }
 def registry_to_dict(item): return {"id": item.id, "booking_id": item.booking_id, "registry_number": item.registry_number, "registry_date": item.registry_date.isoformat() if item.registry_date else None, "status": item.status, "notes": item.notes}
 def possession_to_dict(item): return {"id": item.id, "booking_id": item.booking_id, "possession_date": item.possession_date.isoformat() if item.possession_date else None, "status": item.status, "notes": item.notes, "handed_over_by": _actor_to_dict(item.handed_over_by)}
 
@@ -893,7 +1001,7 @@ def installment_detail(request, organization_slug, installment_id):
             if field in request.data: setattr(item, field, str(request.data[field]))
         if "due_date" in request.data: item.due_date = _date(request.data, "due_date")
         if "amount" in request.data:
-            amount = _decimal(request.data, "amount"); paid = item.allocations.aggregate(total=__import__("django.db.models", fromlist=["Sum"]).Sum("amount"))["total"] or Decimal("0")
+            amount = _decimal(request.data, "amount"); paid = item.allocations.aggregate(total=Sum("amount"))["total"] or Decimal("0")
             if amount <= 0 or amount < paid: raise ValidationError({"amount": "Cannot be less than paid amount."})
             item.amount = amount
         item.full_clean(); item.save()
@@ -1024,11 +1132,12 @@ def possession_list(request, organization_slug): return _simple_page(request, _s
 
 # Organization-level payment API.  The older inventory/payment routes above
 # remain available to existing clients.
-def _new_payment_payload(request, organization):
-    rows = request.data.get("booking_allocations") or request.data.get("allocations")
+def _new_payment_payload(request, organization, data=None):
+    data = data or request.data
+    rows = data.get("booking_allocations") or data.get("allocations")
     # Backward-compatible single-booking shape used by older clients.
-    if not rows and request.data.get("booking_id"):
-        rows = [{"booking_id": request.data.get("booking_id"), "amount": request.data.get("amount"), "installment_id": request.data.get("installment_id"), "registry_charge_id": request.data.get("registry_charge_id")}]
+    if not rows and data.get("booking_id"):
+        rows = [{"booking_id": data.get("booking_id"), "amount": data.get("amount"), "installment_id": data.get("installment_id"), "registry_charge_id": data.get("registry_charge_id")}]
     if not isinstance(rows, list) or not rows: raise ValidationError({"booking_allocations": "Provide at least one allocation."})
     parsed = []
     for row in rows:
@@ -1050,15 +1159,20 @@ def managed_payments(request, organization_slug):
     if request.method == "POST":
         _require_permission(access, "payments.add")
         try:
+            idempotency_key = request.headers.get("X-Idempotency-Key", "").strip()
+            if not idempotency_key:
+                raise ValidationError({"idempotency_key": "X-Idempotency-Key header is required."})
+            existing_payment = Payment.objects.filter(organization=access.organization, idempotency_key=idempotency_key).first()
             payload = request.data.copy()
             if "amount" not in payload and "payment_amount" in payload: payload["amount"] = payload["payment_amount"]
             if "payment_date" not in payload and "paymentDate" in payload: payload["payment_date"] = payload["paymentDate"]
             if "payment_mode" not in payload and "mode" in payload: payload["payment_mode"] = payload["mode"]
-            request._full_data = payload
-            payment = create_allocated_payment(organization=access.organization, amount=_decimal(payload, "amount"), payment_method=payload.get("payment_mode") or payload.get("payment_method"), payment_date=_date(payload, "payment_date"), transaction_reference=payload.get("transaction_reference") or payload.get("reference_id"), notes=payload.get("remarks") or payload.get("notes"), user=request.user, allocations=_new_payment_payload(request, access.organization))
-        except (ValidationError, ValueError, TypeError) as error: return _validation_response(error)
+            payment = create_allocated_payment(organization=access.organization, amount=_decimal(payload, "amount"), payment_method=payload.get("payment_mode") or payload.get("payment_method"), payment_date=_date(payload, "payment_date"), transaction_reference=payload.get("transaction_reference") or payload.get("reference_id"), notes=payload.get("remarks") or payload.get("notes"), user=request.user, allocations=_new_payment_payload(request, access.organization, payload), idempotency_key=idempotency_key)
+        except (ValidationError, ValueError, TypeError) as error: return _payment_validation_response(error)
         log_audit(request=request, organization=access.organization, module="payments", action="payment_created", target=payment)
-        return Response(payment_to_dict(_payment_queryset(access).get(pk=payment.pk), True), status=status.HTTP_201_CREATED)
+        if existing_payment and existing_payment.id != payment.id:
+            return Response({"idempotency_key": ["This key was already used for another payment."]}, status=status.HTTP_409_CONFLICT)
+        return Response(payment_to_dict(_payment_queryset(access).get(pk=payment.pk), True), status=status.HTTP_200_OK if existing_payment else status.HTTP_201_CREATED)
     _require_permission(access, "payments.view")
     queryset = _payment_queryset(access)
     if value := request.query_params.get("status"): queryset = queryset.filter(status=value)
@@ -1070,7 +1184,11 @@ def managed_payments(request, organization_slug):
     if value := request.query_params.get("plot"): queryset = queryset.filter(payment_allocations__booking__plot_id=value)
     if value := request.query_params.get("search"): queryset = queryset.filter(Q(payment_id__icontains=value) | Q(transaction_reference__icontains=value) | Q(payment_allocations__booking__lead__first_name__icontains=value) | Q(payment_allocations__booking__lead__last_name__icontains=value) | Q(payment_allocations__booking__plot__plot_number__icontains=value) | Q(receipt__receipt_number__icontains=value)).distinct()
     count, page, page_size, results = _paginate(queryset, request.query_params)
-    return Response({"count": count, "next": _page_url(request, page + 1, page_size) if page * page_size < count else None, "previous": _page_url(request, page - 1, page_size) if page > 1 else None, "results": [payment_to_dict(item) for item in results]})
+    return Response({
+        "count": count,
+        "next": _page_url(request, page + 1, page_size) if page * page_size < count else None,
+        "previous": _page_url(request, page - 1, page_size) if page > 1 else None,
+        "results": [payment_to_dict(item , detailed=True) for item in results]})
 
 
 @api_view(["GET"])
@@ -1126,7 +1244,7 @@ def managed_payment_refund(request, organization_slug, payment_id):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def payment_refund_approve(request, organization_slug, payment_id, refund_id):
-    access = get_organization_access(request.user, organization_slug); _require_permission(access, "payments.refund")
+    access = get_organization_access(request.user, organization_slug); _require_finance_approval(access)
     refund = get_object_or_404(PaymentRefund.objects.filter(organization=access.organization, payment_id=payment_id), pk=refund_id)
     try: refund = approve_refund(refund=refund, user=request.user)
     except ValidationError as error: return _validation_response(error)
@@ -1256,3 +1374,122 @@ def managed_registry_history(request, organization_slug, registry_id):
     access = get_organization_access(request.user, organization_slug); _require_permission(access, "registry.view")
     item = get_object_or_404(_registry_queryset(access), pk=registry_id)
     return Response({"results": [{"action": h.new_status, "old_status": h.old_status, "remarks": h.remarks, "performed_by": _actor_to_dict(h.changed_by), "timestamp": h.changed_at.isoformat()} for h in item.status_history.all()]})
+
+
+def _registry_document_to_dict(doc):
+    data = {
+        "id": doc.id,
+        "registry_id": doc.registry_id,
+        "document_label": doc.document_label,
+        "document_type": doc.document_type,
+        "source": "reference" if doc.customer_document_id else "upload",
+        "uploaded_by": _actor_to_dict(doc.uploaded_by),
+        "created_at": doc.created_at.isoformat(),
+    }
+    if doc.customer_document_id:
+        data["customer_document"] = {
+            "id": doc.customer_document_id,
+            "document_name": doc.customer_document.document_name,
+            "file_name": doc.customer_document.file_name,
+            "content_type": doc.customer_document.content_type,
+        }
+    else:
+        data["file"] = {
+            "file_name": doc.file_name,
+            "file_size": doc.file_size,
+            "content_type": doc.content_type,
+        }
+    return data
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def registry_documents(request, organization_slug, registry_id):
+    access = get_organization_access(request.user, organization_slug)
+    item = get_object_or_404(_registry_queryset(access), pk=registry_id)
+    if request.method == "GET":
+        docs = RegistryDocument.objects.filter(registry=item, organization=access.organization).select_related("customer_document", "uploaded_by")
+        return Response([_registry_document_to_dict(d) for d in docs])
+    _require_permission(access, "registry.documents")
+    try:
+        doc = attach_document_to_registry(
+            registry=item,
+            customer_document_id=_parse_positive_id(request.data, "customer_document_id"),
+            uploaded_file=request.data.get("file"),
+            document_label=str(request.data.get("document_label", "")),
+            document_type=str(request.data.get("document_type", "")),
+            user=request.user,
+        )
+    except (ValidationError, ValueError, TypeError) as error:
+        return _validation_response(error)
+    return Response(_registry_document_to_dict(doc), status=status.HTTP_201_CREATED)
+
+
+@api_view(["DELETE"])
+@permission_classes([IsAuthenticated])
+def registry_document_remove(request, organization_slug, registry_id, document_id):
+    access = get_organization_access(request.user, organization_slug)
+    _require_permission(access, "registry.documents")
+    item = get_object_or_404(_registry_queryset(access), pk=registry_id)
+    doc = get_object_or_404(RegistryDocument.objects.filter(registry=item, organization=access.organization), pk=document_id)
+    try:
+        remove_registry_document(registry_document=doc, user=request.user)
+    except ValidationError as error:
+        return _validation_response(error)
+    return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def agreement_generate_pdf(request, organization_slug, agreement_id):
+    access = get_organization_access(request.user, organization_slug)
+    _require_inventory_management(access)
+    item = get_object_or_404(_sales_queryset(Agreement, access), pk=agreement_id)
+    try:
+        item = generate_agreement_pdf(agreement=item)
+    except (ValidationError, ValueError, TypeError) as error:
+        return _validation_response(error)
+    return Response(agreement_to_dict(item))
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def agreement_download_pdf(request, organization_slug, agreement_id):
+    access = get_organization_access(request.user, organization_slug)
+    item = get_object_or_404(_sales_queryset(Agreement, access), pk=agreement_id)
+    try:
+        pdf_file = download_agreement_pdf(agreement=item)
+    except ValidationError as error:
+        return _validation_response(error)
+    return FileResponse(pdf_file.open("rb"), as_attachment=True,
+                        filename=f"agreement_{item.id}.pdf", content_type="application/pdf")
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def agreement_upload_signed(request, organization_slug, agreement_id):
+    access = get_organization_access(request.user, organization_slug)
+    _require_inventory_management(access)
+    item = get_object_or_404(_sales_queryset(Agreement, access), pk=agreement_id)
+    uploaded_file = request.data.get("file")
+    if not uploaded_file:
+        return Response({"file": "This field is required."}, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        item = upload_signed_agreement(agreement=item, uploaded_file=uploaded_file, user=request.user)
+    except (ValidationError, ValueError, TypeError) as error:
+        return _validation_response(error)
+    return Response(agreement_to_dict(item))
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def agreement_download_signed(request, organization_slug, agreement_id):
+    access = get_organization_access(request.user, organization_slug)
+    item = get_object_or_404(_sales_queryset(Agreement, access), pk=agreement_id)
+    try:
+        signed_file = download_signed_agreement(agreement=item)
+    except ValidationError as error:
+        return _validation_response(error)
+    return FileResponse(signed_file.open("rb"), as_attachment=True,
+                        filename=item.signed_file_name or f"signed_agreement_{item.id}.pdf",
+                        content_type="application/pdf")

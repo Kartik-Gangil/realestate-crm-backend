@@ -3,6 +3,9 @@ from django.urls import path
 from . import employee_views, hr_views, views
 
 urlpatterns = [
+    path("organizations/", views.organization_list, name="phase0-organization-list"),
+    path("projects/", views.project_list, name="phase0-project-list"),
+    path("projects/<int:project_id>/", views.project_detail, name="phase0-project-detail"),
     path("platform/admins/", views.platform_admins, name="platform-admins"),
     path("platform/organizations/", views.platform_organizations, name="platform-organizations"),
     path("platform/organizations/<slug:slug>/access/", views.platform_organization_access, name="platform-organization-access"),
@@ -28,4 +31,5 @@ urlpatterns = [
     path("organizations/<slug:organization_slug>/leaves/<int:leave_id>/approve/", hr_views.leave_approve, name="leave-approve"),
     path("organizations/<slug:organization_slug>/leaves/<int:leave_id>/reject/", hr_views.leave_reject, name="leave-reject"),
     path("organizations/<slug:organization_slug>/leaves/<int:leave_id>/cancel/", hr_views.leave_cancel, name="leave-cancel"),
+    path("organizations/<slug:organization_slug>/performance-reviews/", hr_views.performance_review_list, name="performance-review-list"),
 ]

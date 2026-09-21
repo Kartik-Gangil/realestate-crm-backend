@@ -5,9 +5,14 @@ from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.db.models import Count, Q
 from django.utils import timezone
+from django.core.files.base import ContentFile
+from django.utils.dateparse import parse_datetime
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
 
 from .models import (CustomerDocument, CustomerDocumentRequirement, CustomerDocumentVerificationHistory,
-                     EmployeeDocument)
+                     DocumentExpiryNotification, EmployeeDocument, EkycVerification)
+from .security import encrypt_bytes, encrypt_text
 
 
 def _validate_file(uploaded_file):
@@ -30,11 +35,13 @@ def upload_customer_document(*, organization, customer, document_category, uploa
     if not document_category.is_active:
         raise ValidationError({"document_category": "This document category is inactive."})
     _validate_file(uploaded_file)
+    original_size = uploaded_file.size
+    encrypted_file = ContentFile(encrypt_bytes(uploaded_file.read()), name=uploaded_file.name + ".enc")
     with transaction.atomic():
         active = CustomerDocument.objects.select_for_update().filter(organization=organization, customer=customer, document_category=document_category, is_active=True)
         active.update(is_active=False, archived_at=timezone.now())
         latest = CustomerDocument.objects.select_for_update().filter(organization=organization, customer=customer, document_category=document_category).order_by("-version").first()
-        document = CustomerDocument.objects.create(organization=organization, customer=customer, document_category=document_category, document_name=document_name.strip(), file=uploaded_file, file_name=uploaded_file.name, file_size=uploaded_file.size, content_type=uploaded_file.content_type, version=(latest.version + 1 if latest else 1), expiry_date=expiry_date, notes=notes or "", uploaded_by=user)
+        document = CustomerDocument.objects.create(organization=organization, customer=customer, document_category=document_category, document_name=document_name.strip(), file=encrypted_file, file_name=uploaded_file.name, file_size=original_size, content_type=uploaded_file.content_type, version=(latest.version + 1 if latest else 1), expiry_date=expiry_date, notes=notes or "", uploaded_by=user)
         CustomerDocumentVerificationHistory.objects.create(document=document, old_status=CustomerDocument.Status.UPLOADED, new_status=CustomerDocument.Status.UPLOADED, reason="Document uploaded", changed_by=user)
         return document
 
@@ -100,6 +107,65 @@ def validate_customer_documents_for_booking(customer):
         elif doc.status != CustomerDocument.Status.VERIFIED or (doc.expiry_date and doc.expiry_date < today): result["expired"].append(label)
     result["allowed"] = not any(result[key] for key in ("missing", "pending", "rejected", "expired"))
     return result
+
+
+def _mock_ekyc_result(checks):
+    if checks.get("simulate_outage"):
+        return "pending", {}, "Provider unavailable"
+    try:
+        face = Decimal(str(checks.get("face_match", 0)))
+    except (InvalidOperation, TypeError):
+        face = Decimal("0")
+    passed = bool(checks.get("aadhaar")) and bool(checks.get("pan")) and face >= Decimal("0.80")
+    return ("verified", {"provider": "mock", "checks": {"aadhaar": bool(checks.get("aadhaar")), "pan": bool(checks.get("pan")), "face_match": str(face)}}, "") if passed else ("failed", {"provider": "mock"}, "Identity checks did not pass")
+
+
+def _run_ekyc(verification, checks):
+    result, payload, error = _mock_ekyc_result(checks)
+    verification.verification_status = result
+    verification.response_payload = payload
+    verification.last_error = error
+    verification.next_retry_at = timezone.now() + timedelta(minutes=5) if result == EkycVerification.Status.PENDING else None
+    if result == EkycVerification.Status.VERIFIED:
+        verification.verified_at = timezone.now()
+        verification.customer.ekyc_status = verification.customer.EkycStatus.VERIFIED
+        verification.customer.save(update_fields=["ekyc_status", "updated_at"])
+    verification.save(update_fields=["verification_status", "response_payload", "last_error", "next_retry_at", "verified_at", "updated_at"])
+    return verification
+
+
+def verify_ekyc(*, customer, provider="mock", id_number="", checks=None, actor=None):
+    checks = checks or {}
+    if customer.ekyc_verifications.filter(verification_status=EkycVerification.Status.PENDING).exists():
+        raise ValidationError({"ekyc": "An eKYC verification is already pending."})
+    verification = EkycVerification.objects.create(organization=customer.organization, customer=customer, provider=provider, id_number_encrypted=encrypt_text(id_number) if id_number else "", attempts=1, requested_by=actor)
+    return _run_ekyc(verification, checks)
+
+
+def process_ekyc_retry(*, verification, actor=None, checks=None):
+    verification.attempts += 1
+    verification.requested_by = actor or verification.requested_by
+    verification.save(update_fields=["attempts", "requested_by", "updated_at"])
+    return _run_ekyc(verification, checks or {})
+
+
+def is_customer_ekyc_verified(customer):
+    return customer.ekyc_status == customer.EkycStatus.VERIFIED or customer.ekyc_verifications.filter(verification_status=EkycVerification.Status.VERIFIED).exists()
+
+
+def create_expiry_notifications(*, now=None):
+    today = now or timezone.localdate()
+    warning = today + timedelta(days=getattr(settings, "DOCUMENT_EXPIRY_WARNING_DAYS", 30))
+    documents = CustomerDocument.objects.filter(is_active=True, expiry_date__gte=today, expiry_date__lte=warning).select_related("customer", "organization")
+    created = 0
+    for document in documents:
+        recipient = document.customer.email or document.customer.phone
+        if not recipient:
+            continue
+        channel = DocumentExpiryNotification.Channel.EMAIL if document.customer.email else DocumentExpiryNotification.Channel.SMS
+        _, was_created = DocumentExpiryNotification.objects.get_or_create(document=document, channel=channel, alert_date=today, defaults={"organization": document.organization, "recipient": recipient, "scheduled_for": timezone.now()})
+        created += int(was_created)
+    return created
 
 
 def upload_employee_document(*, organization, employee, document_category, uploaded_file, document_name, expiry_date=None, user=None):

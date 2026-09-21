@@ -5,7 +5,7 @@ from django.test import TestCase
 from django.urls import reverse
 from rest_framework.test import APIClient
 
-from .models import Department, Organization, OrganizationActivity, OrganizationMembership
+from .models import Department, Organization, OrganizationActivity, OrganizationMembership, Project
 
 
 class EmployeeApiTests(TestCase):
@@ -17,6 +17,7 @@ class EmployeeApiTests(TestCase):
         self.other_user = user_model.objects.create_user(username="other@example.com", email="other@example.com", password="password123")
         self.org = Organization.objects.create(name="Acme", slug="acme")
         self.other_org = Organization.objects.create(name="Other", slug="other")
+        self.project = Project.objects.create(organization=self.org, name="Acme Project", code="PRJ-ACME")
         self.admin_membership = OrganizationMembership.objects.create(organization=self.org, user=self.admin, role="admin", employee_id="EMP0001")
         self.manager_membership = OrganizationMembership.objects.create(organization=self.org, user=self.manager, role="manager", employee_id="EMP0002")
         self.viewer_membership = OrganizationMembership.objects.create(organization=self.org, user=self.viewer, role="telecaller", employee_id="EMP0003")
@@ -24,6 +25,7 @@ class EmployeeApiTests(TestCase):
         self.department = Department.objects.create(organization=self.org, name="Sales")
         self.other_department = Department.objects.create(organization=self.other_org, name="Other Sales")
         self.client = APIClient()
+        self.client.credentials(HTTP_X_PROJECT_ID=self.project.code)
         self.client.force_authenticate(self.admin)
 
     def employees_url(self):
@@ -75,15 +77,15 @@ class EmployeeApiTests(TestCase):
         self.assertEqual(self.client.post(reverse("employee-activate", args=[self.org.slug, employee.id])).status_code, 200)
         self.assertTrue(OrganizationActivity.objects.filter(employee=employee, action="employee_deactivated", performed_by=self.admin).exists())
 
-        manager_client = APIClient(); manager_client.force_authenticate(self.manager)
+        manager_client = APIClient(); manager_client.credentials(HTTP_X_PROJECT_ID=self.project.code); manager_client.force_authenticate(self.manager)
         self.assertEqual(manager_client.patch(self.detail_url(employee), {"role": "manager"}, format="json").status_code, 403)
-        viewer_client = APIClient(); viewer_client.force_authenticate(self.viewer)
+        viewer_client = APIClient(); viewer_client.credentials(HTTP_X_PROJECT_ID=self.project.code); viewer_client.force_authenticate(self.viewer)
         self.assertEqual(viewer_client.post(self.employees_url(), self.create_payload(email="no@example.com"), format="json").status_code, 403)
 
     def test_access_scope_limits_employee_visibility(self):
         self.viewer_membership.access_scope = OrganizationMembership.AccessScope.OWN
         self.viewer_membership.save(update_fields=["access_scope"])
-        client = APIClient(); client.force_authenticate(self.viewer)
+        client = APIClient(); client.credentials(HTTP_X_PROJECT_ID=self.project.code); client.force_authenticate(self.viewer)
         response = client.get(self.employees_url())
         self.assertEqual(response.status_code, 200)
         self.assertEqual([item["id"] for item in response.data["results"]], [self.viewer_membership.id])

@@ -1,8 +1,9 @@
 from datetime import timedelta
+import tempfile
 
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from leads.models import Lead
@@ -12,6 +13,7 @@ from .services import (put_document_under_verification, upload_customer_document
                        validate_customer_documents_for_booking, verify_customer_document)
 
 
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp())
 class DocumentServiceTests(TestCase):
     def setUp(self):
         self.user = get_user_model().objects.create_user(username="reviewer", email="reviewer@example.com", password="pw")

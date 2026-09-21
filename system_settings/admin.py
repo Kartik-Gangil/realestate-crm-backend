@@ -1,7 +1,7 @@
 from django.contrib import admin
-from .models import AuditLog, BackupRecord, IntegrationConfiguration, MasterData, OrganizationSettings, SystemParameter
+from .models import AuditLog, BackupRecord, IntegrationConfiguration, MasterData, MasterDataCategory, OrganizationSettings, SystemParameter
 
-admin.site.register((OrganizationSettings, MasterData, IntegrationConfiguration, SystemParameter, BackupRecord))
+admin.site.register((OrganizationSettings, MasterDataCategory, MasterData, IntegrationConfiguration, SystemParameter, BackupRecord))
 @admin.register(AuditLog)
 class AuditLogAdmin(admin.ModelAdmin):
     readonly_fields = ("organization", "actor", "module", "action", "timestamp", "ip_address", "details", "target_type", "target_id")

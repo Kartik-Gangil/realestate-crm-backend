@@ -10,7 +10,7 @@ from rest_framework.test import APIClient
 from leads.models import Lead, Sitevisit
 from organizations.models import Organization, OrganizationMembership
 
-from .models import Block, Plot, PlotSelection, Project
+from .models import Block, Plot, PlotSelection
 
 
 class PlotSelectionApiTests(TestCase):
@@ -19,8 +19,8 @@ class PlotSelectionApiTests(TestCase):
         self.org = Organization.objects.create(name="Acme", slug="acme"); self.other = Organization.objects.create(name="Other", slug="other")
         OrganizationMembership.objects.create(organization=self.org, user=self.manager, role=OrganizationMembership.Role.MANAGER)
         OrganizationMembership.objects.create(organization=self.org, user=self.viewer, role=OrganizationMembership.Role.TELECALLER)
-        self.project = Project.objects.create(organization=self.org, name="Green", code="G"); self.block = Block.objects.create(organization=self.org, project=self.project, name="A", code="A")
-        self.plot = Plot.objects.create(organization=self.org, project=self.project, block=self.block, plot_number="A-101", size=Decimal("100"), facing="North")
+        self.block = Block.objects.create(organization=self.org, name="A", code="A")
+        self.plot = Plot.objects.create(organization=self.org, block=self.block, plot_number="A-101", size=Decimal("100"), facing="North")
         self.lead = Lead.objects.create(organization=self.org, first_name="Ada", phone="1"); self.visit = Sitevisit.objects.create(organization=self.org, lead=self.lead)
         self.client = APIClient(); self.client.force_authenticate(self.manager)
 
@@ -43,12 +43,12 @@ class PlotSelectionApiTests(TestCase):
         self.assertEqual(self.client.post(confirm_url, {}, format="json").status_code, 200)
         self.assertEqual(self.client.post(confirm_url, {}, format="json").status_code, 200)
         self.plot.refresh_from_db(); self.assertEqual(self.plot.status, Plot.Status.AVAILABLE)
-        second = Plot.objects.create(organization=self.org, project=self.project, block=self.block, plot_number="A-102", size=Decimal("100"))
+        second = Plot.objects.create(organization=self.org, block=self.block, plot_number="A-102", size=Decimal("100"))
         active = self.client.post(self.select_url(second), payload, format="json"); self.assertEqual(active.status_code, 201)
         active_selection = PlotSelection.objects.get(plot=second); release = reverse("inventory:plot-selection-release", args=[self.org.slug, active_selection.id])
         self.assertEqual(self.client.post(release, {"reason": "Alternative"}, format="json").status_code, 200)
         self.assertEqual(self.client.post(reverse("inventory:plot-selection-confirm", args=[self.org.slug, active_selection.id]), {}, format="json").status_code, 409)
-        expired = Plot.objects.create(organization=self.org, project=self.project, block=self.block, plot_number="A-103", size=Decimal("100"))
+        expired = Plot.objects.create(organization=self.org, block=self.block, plot_number="A-103", size=Decimal("100"))
         old = PlotSelection.objects.create(organization=self.org, plot=expired, selected_by=self.manager, expires_at=timezone.now() - timedelta(minutes=1))
         self.assertEqual(self.client.post(self.select_url(expired), payload, format="json").status_code, 201); old.refresh_from_db(); self.assertEqual(old.status, PlotSelection.Status.EXPIRED)
 

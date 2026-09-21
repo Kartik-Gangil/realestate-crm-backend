@@ -7,7 +7,7 @@ from rest_framework.test import APIClient
 
 from organizations.models import Organization, OrganizationMembership
 
-from .models import Block, Plot, Project
+from .models import Block, Plot
 
 
 class PlotApiTests(TestCase):
@@ -19,15 +19,12 @@ class PlotApiTests(TestCase):
         self.other_organization = Organization.objects.create(name="Other", slug="other")
         OrganizationMembership.objects.create(organization=self.organization, user=self.user, role=OrganizationMembership.Role.ADMIN)
         OrganizationMembership.objects.create(organization=self.other_organization, user=self.other_user, role=OrganizationMembership.Role.ADMIN)
-        self.project = Project.objects.create(organization=self.organization, name="Green Acres", code="GA")
-        self.other_project = Project.objects.create(organization=self.organization, name="Lake View", code="LV")
-        self.block = Block.objects.create(organization=self.organization, project=self.project, name="A Block", code="A")
-        self.other_block = Block.objects.create(organization=self.organization, project=self.other_project, name="B Block", code="B")
-        self.foreign_project = Project.objects.create(organization=self.other_organization, name="Foreign", code="F")
-        self.foreign_block = Block.objects.create(organization=self.other_organization, project=self.foreign_project, name="Foreign Block", code="F")
+        self.block = Block.objects.create(organization=self.organization, name="A Block", code="A")
+        self.other_block = Block.objects.create(organization=self.organization, name="B Block", code="B")
+        self.foreign_block = Block.objects.create(organization=self.other_organization, name="Foreign Block", code="F")
         self.plot = self.make_plot("A-101")
         self.foreign_plot = Plot.objects.create(
-            organization=self.other_organization, project=self.foreign_project, block=self.foreign_block,
+            organization=self.other_organization, block=self.foreign_block,
             plot_number="F-101", size=Decimal("100"),
         )
         self.client = APIClient()
@@ -42,7 +39,6 @@ class PlotApiTests(TestCase):
     def make_plot(self, number, **overrides):
         values = {
             "organization": self.organization,
-            "project": self.project,
             "block": self.block,
             "plot_number": number,
             "size": Decimal("120.00"),
@@ -55,7 +51,6 @@ class PlotApiTests(TestCase):
 
     def payload(self, **overrides):
         values = {
-            "project": self.project.id,
             "block": self.block.id,
             "plot_number": "A-102",
             "size": "125.50",
@@ -79,21 +74,21 @@ class PlotApiTests(TestCase):
 
     def test_list_search_and_filters(self):
         commercial = self.make_plot("A-COM", plot_type=Plot.PlotType.COMMERCIAL, status=Plot.Status.BLOCKED)
-        self.make_plot("B-101", project=self.other_project, block=self.other_block)
+        self.make_plot("B-101", block=self.other_block)
         self.assertEqual(self.client.get(self.list_url(), {"search": "COM"}).data["results"][0]["id"], commercial.id)
         self.assertEqual(self.client.get(self.list_url(), {"search": "A Block"}).data["count"], 2)
-        self.assertEqual(self.client.get(self.list_url(), {"search": "Lake View"}).data["count"], 1)
-        self.assertEqual(self.client.get(self.list_url(), {"project": self.other_project.id}).data["count"], 1)
+        self.assertEqual(self.client.get(self.list_url(), {"search": "B Block"}).data["count"], 1)
+        self.assertEqual(self.client.get(self.list_url(), {"block": self.other_block.id}).data["count"], 1)
         self.assertEqual(self.client.get(self.list_url(), {"block": self.block.id, "status": "blocked"}).data["count"], 1)
-        response = self.client.get(self.list_url(), {"project": self.project.id, "block": self.block.id, "status": "blocked", "plot_type": "commercial"})
+        response = self.client.get(self.list_url(), {"block": self.block.id, "status": "blocked", "plot_type": "commercial"})
         self.assertEqual(response.data["count"], 1)
         self.assertEqual(response.data["results"][0]["id"], commercial.id)
 
     def test_invalid_filters_and_inconsistent_filter_combination_are_rejected(self):
         self.assertEqual(self.client.get(self.list_url(), {"status": "invalid"}).status_code, 400)
         self.assertEqual(self.client.get(self.list_url(), {"plot_type": "invalid"}).status_code, 400)
-        self.assertEqual(self.client.get(self.list_url(), {"project": self.project.id, "block": self.other_block.id}).status_code, 400)
-        self.assertEqual(self.client.get(self.list_url(), {"project": self.foreign_project.id}).status_code, 400)
+        self.assertEqual(self.client.get(self.list_url(), {"block": self.other_block.id, "status": "invalid"}).status_code, 400)
+        self.assertEqual(self.client.get(self.list_url(), {"block": self.foreign_block.id}).status_code, 400)
 
     def test_create_assigns_organization_creator_and_default_status(self):
         response = self.client.post(self.list_url(), self.payload(), format="json")
@@ -104,9 +99,8 @@ class PlotApiTests(TestCase):
         self.assertEqual(plot.status, Plot.Status.AVAILABLE)
 
     def test_create_rejects_invalid_relationships_duplicate_and_numbers(self):
-        self.assertEqual(self.client.post(self.list_url(), self.payload(project=self.foreign_project.id), format="json").status_code, 400)
         self.assertEqual(self.client.post(self.list_url(), self.payload(block=self.foreign_block.id), format="json").status_code, 400)
-        self.assertEqual(self.client.post(self.list_url(), self.payload(block=self.other_block.id), format="json").status_code, 400)
+        self.assertEqual(self.client.post(self.list_url(), self.payload(block=self.other_block.id), format="json").status_code, 201)
         self.assertEqual(self.client.post(self.list_url(), self.payload(plot_number=self.plot.plot_number), format="json").status_code, 400)
         self.assertEqual(self.client.post(self.list_url(), self.payload(plot_number="A-103", size="0"), format="json").status_code, 400)
         self.assertEqual(self.client.post(self.list_url(), self.payload(plot_number="A-104", rate_per_sq_unit="-1"), format="json").status_code, 400)
@@ -138,6 +132,5 @@ class PlotApiTests(TestCase):
     def test_patch_rejects_duplicate_mismatched_relationship_and_cross_tenant_access(self):
         duplicate = self.make_plot("A-102")
         self.assertEqual(self.client.patch(self.detail_url(duplicate), {"plot_number": self.plot.plot_number}, format="json").status_code, 400)
-        self.assertEqual(self.client.patch(self.detail_url(self.plot), {"project": self.other_project.id}, format="json").status_code, 400)
         self.assertEqual(self.client.patch(self.detail_url(self.plot), {"block": self.foreign_block.id}, format="json").status_code, 400)
         self.assertEqual(self.client.patch(self.detail_url(self.foreign_plot), {"facing": "South"}, format="json").status_code, 404)

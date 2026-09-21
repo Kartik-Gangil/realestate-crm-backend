@@ -6,6 +6,8 @@ from django.core.mail import send_mail
 from django.core.exceptions import ValidationError
 from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
+from django.utils import timezone
+from datetime import timedelta
 from rest_framework import status
 from rest_framework.authtoken.models import Token
 from rest_framework.decorators import api_view, permission_classes
@@ -13,15 +15,25 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
 from .serializers import LoginSerializer, RegisterSerializer, UserSerializer
+from .models import UserSession, hash_auth_token
 
 
 def _auth_response(user, created=False):
     token, _ = Token.objects.get_or_create(user=user)
+    UserSession.objects.update_or_create(
+        token_hash=hash_auth_token(token.key),
+        defaults={
+            "user": user,
+            "ip_address": None,
+            "user_agent": "",
+            "expires_at": timezone.now() + timedelta(seconds=getattr(settings, "SESSION_COOKIE_AGE", 1209600)),
+        },
+    )
     return Response({"token": token.key, "user": UserSerializer(user).data}, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
 
 
 @api_view(["POST"])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def register(request):
     serializer = RegisterSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
@@ -33,13 +45,20 @@ def register(request):
 def login(request):
     serializer = LoginSerializer(data=request.data, context={"request": request})
     serializer.is_valid(raise_exception=True)
-    return _auth_response(serializer.validated_data["user"])
+    response = _auth_response(serializer.validated_data["user"])
+    token = response.data["token"]
+    UserSession.objects.filter(token_hash=hash_auth_token(token)).update(
+        ip_address=request.META.get("REMOTE_ADDR"),
+        user_agent=request.META.get("HTTP_USER_AGENT", ""),
+    )
+    return response
 
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def logout(request):
     if request.auth:
+        UserSession.objects.filter(token_hash=hash_auth_token(request.auth.key)).delete()
         request.auth.delete()
     return Response(status=status.HTTP_204_NO_CONTENT)
 

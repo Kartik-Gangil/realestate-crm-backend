@@ -10,7 +10,7 @@ from rest_framework.test import APIClient
 
 from organizations.models import Organization, OrganizationMembership
 
-from .models import Block, Plot, PlotHold, PlotStatusHistory, Project
+from .models import Block, Plot, PlotHold, PlotStatusHistory
 
 
 class PlotStatusLifecycleTests(TestCase):
@@ -24,22 +24,20 @@ class PlotStatusLifecycleTests(TestCase):
         OrganizationMembership.objects.create(organization=self.organization, user=self.user, role=OrganizationMembership.Role.MANAGER)
         OrganizationMembership.objects.create(organization=self.organization, user=self.telecaller, role=OrganizationMembership.Role.TELECALLER)
         OrganizationMembership.objects.create(organization=self.other_organization, user=self.other_user, role=OrganizationMembership.Role.MANAGER)
-        self.project = Project.objects.create(organization=self.organization, name="Green Acres", code="GA")
-        self.block = Block.objects.create(organization=self.organization, project=self.project, name="A Block", code="A")
-        self.other_project = Project.objects.create(organization=self.other_organization, name="Foreign", code="F")
-        self.other_block = Block.objects.create(organization=self.other_organization, project=self.other_project, name="Foreign Block", code="F")
+        self.block = Block.objects.create(organization=self.organization, name="A Block", code="A")
+        self.other_block = Block.objects.create(organization=self.other_organization, name="Foreign Block", code="F")
         self.client = APIClient()
         self.client.force_authenticate(self.user)
 
     def plot(self, status=Plot.Status.AVAILABLE, number="A-101"):
         return Plot.objects.create(
-            organization=self.organization, project=self.project, block=self.block,
+            organization=self.organization, block=self.block,
             plot_number=number, size=Decimal("120.00"), status=status,
         )
 
     def other_plot(self):
         return Plot.objects.create(
-            organization=self.other_organization, project=self.other_project, block=self.other_block,
+            organization=self.other_organization, block=self.other_block,
             plot_number="F-101", size=Decimal("120.00"),
         )
 
@@ -120,7 +118,7 @@ class PlotStatusLifecycleTests(TestCase):
         self.assertIsNotNone(record.released_at)
         self.assertEqual(PlotHold.objects.filter(plot=plot).count(), 1)
 
-        response = self.client.post(self.operation_url(plot, "hold"), {"reason": "Customer hold"}, format="json")
+        response = self.client.post(self.operation_url(plot, "hold"), {"reason": "Customer hold"}, format="json", HTTP_X_IDEMPOTENCY_KEY="p3-hold-1")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(PlotHold.objects.filter(plot=plot, action_type=PlotHold.ActionType.HOLD).count(), 1)
 
@@ -141,11 +139,11 @@ class PlotStatusLifecycleTests(TestCase):
             "reason": "New", "from_datetime": (now + timedelta(hours=1)).isoformat(),
             "to_datetime": (now + timedelta(hours=3)).isoformat(),
         }
-        self.assertEqual(self.client.post(self.operation_url(plot, "hold"), payload, format="json").status_code, 400)
+        self.assertEqual(self.client.post(self.operation_url(plot, "hold"), payload, format="json", HTTP_X_IDEMPOTENCY_KEY="p3-overlap-1").status_code, 400)
         PlotHold.objects.filter(plot=plot).update(released_at=timezone.now())
         payload["from_datetime"] = (now + timedelta(hours=3)).isoformat()
         payload["to_datetime"] = (now + timedelta(hours=4)).isoformat()
-        self.assertEqual(self.client.post(self.operation_url(plot, "hold"), payload, format="json").status_code, 200)
+        self.assertEqual(self.client.post(self.operation_url(plot, "hold"), payload, format="json", HTTP_X_IDEMPOTENCY_KEY="p3-overlap-2").status_code, 200)
         invalid_range = {"reason": "Invalid", "from_datetime": (now + timedelta(hours=5)).isoformat(), "to_datetime": (now + timedelta(hours=4)).isoformat()}
         released_plot = self.plot(number="A-range")
         self.assertEqual(self.client.post(self.operation_url(released_plot, "hold"), invalid_range, format="json").status_code, 400)
