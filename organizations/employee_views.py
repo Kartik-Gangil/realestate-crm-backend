@@ -1,3 +1,4 @@
+import os
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
@@ -8,6 +9,7 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from core.files import private_file_response
 
 from .employee_serializers import DepartmentSerializer, EmployeeCreateSerializer, EmployeeUpdateSerializer
 from .models import Department, Organization, OrganizationActivity, OrganizationMembership, OrganizationRole
@@ -36,7 +38,7 @@ def _require_role_management(access):
 
 def _employees_for_access(access):
     queryset = OrganizationMembership.objects.filter(organization=access.organization).select_related(
-        "user", "department", "reporting_manager__user"
+        "user", "department", "reporting_manager__user", "organization"
     )
     if access.is_platform or access.membership.access_scope == OrganizationMembership.AccessScope.ALL:
         return queryset
@@ -52,9 +54,7 @@ def _employees_for_access(access):
 
 
 def _employee_to_dict(employee, request=None, detailed=False):
-    photo = employee.profile_photo.url if employee.profile_photo else None
-    if photo and request:
-        photo = request.build_absolute_uri(photo)
+    photo = f"/api/organizations/{employee.organization.slug}/employees/{employee.id}/photo/" if employee.profile_photo else None
     name_first = employee.first_name or employee.user.first_name
     name_last = employee.last_name or employee.user.last_name
     data = {
@@ -340,6 +340,14 @@ def employee_detail(request, organization_slug, employee_id):
         return _validation_response(error)
     employee = _employees_for_access(access).get(pk=employee.pk)
     return Response(_employee_to_dict(employee, request, detailed=True))
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def employee_photo(request, organization_slug, employee_id):
+    access = get_organization_access(request.user, organization_slug)
+    employee = get_object_or_404(_employees_for_access(access), pk=employee_id)
+    return private_file_response(employee.profile_photo, filename=os.path.basename(employee.profile_photo.name or "") or "photo")
 
 
 def _set_employee_active(request, organization_slug, employee_id, active):

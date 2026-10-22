@@ -10,44 +10,54 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
-import os
+import secrets
+import warnings
 from pathlib import Path
+from corsheaders.defaults import default_headers
+from django.core.exceptions import ImproperlyConfigured
+
+from .env import env_bool, env_list, env_str, load_env_file
+from core.crypto import decode_file_key
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
-def _load_local_env_file(path):
-    """Load simple KEY=VALUE settings without requiring another runtime package."""
-    if not path.exists():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-
-
-_load_local_env_file(BASE_DIR / ".env")
+load_env_file(BASE_DIR / ".env")
 
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-0^yiec98qw!l1_q@j7=k%tltsln8z0&407eboh^(f$9saz-)2r'
+DEBUG = env_bool("DJANGO_DEBUG", False)
+SECRET_KEY = env_str("DJANGO_SECRET_KEY")
+if not SECRET_KEY:
+    if not DEBUG:
+        raise ImproperlyConfigured("DJANGO_SECRET_KEY must be set when DJANGO_DEBUG is off.")
+    SECRET_KEY = secrets.token_urlsafe(50)
+    warnings.warn("DJANGO_SECRET_KEY is not set; using a temporary development key.")
 
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+LOCAL_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
+ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", ["localhost", "127.0.0.1"] if DEBUG else [])
+CORS_ALLOWED_ORIGINS = env_list("CORS_ALLOWED_ORIGINS", LOCAL_ORIGINS if DEBUG else [])
+CSRF_TRUSTED_ORIGINS = env_list("CSRF_TRUSTED_ORIGINS", LOCAL_ORIGINS if DEBUG else [])
 
-ALLOWED_HOSTS = ['localhost' , '127.0.0.1']
+CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOW_HEADERS = (*default_headers, "x-project-id")
 
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5173",
-]
+if not DEBUG:
+    SECURE_SSL_REDIRECT = True
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_HSTS_SECONDS = 31536000
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    SECURE_REFERRER_POLICY = "same-origin"
+    X_FRAME_OPTIONS = "DENY"
 
-CORS_ALLOWED_CREDENTIALS= True
+if env_bool("DJANGO_TRUST_PROXY", False):
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 # Application definition
 
@@ -60,25 +70,26 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'rest_framework',
     'rest_framework.authtoken',
+    'core',
     'users',
     'organizations',
     'leads',
     'inventory',
     'documents',
+    'expenses',
     'system_settings',
     'corsheaders',
 ]
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    "corsheaders.middleware.CorsMiddleware",
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
-    "corsheaders.middleware.CorsMiddleware",
-    "django.middleware.common.CommonMiddleware",
 ]
 
 ROOT_URLCONF = 'config.urls'
@@ -147,22 +158,51 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = 'static/'
-MEDIA_URL = '/media/'
-MEDIA_ROOT = BASE_DIR / 'media'
+# Uploaded files: AES-256-GCM encrypted, in a private folder that is never served (Appendix G-4).
+PRIVATE_MEDIA_ROOT = Path(env_str("PRIVATE_MEDIA_ROOT", str(BASE_DIR / "private_media")))
+MEDIA_ROOT = PRIVATE_MEDIA_ROOT
+LEGACY_MEDIA_ROOT = BASE_DIR / "media"
+STORAGES = {
+    "default": {"BACKEND": "core.storage.EncryptedFileSystemStorage"},
+    "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+}
+FILE_ENCRYPTION_KEY = env_str("FILE_ENCRYPTION_KEY")
+if FILE_ENCRYPTION_KEY:
+    decode_file_key(FILE_ENCRYPTION_KEY)
+elif not DEBUG:
+    raise ImproperlyConfigured("FILE_ENCRYPTION_KEY must be set when DJANGO_DEBUG is off.")
 DOCUMENT_MAX_UPLOAD_SIZE = 10 * 1024 * 1024
 DOCUMENT_EXPIRY_WARNING_DAYS = 30
+TEST_RUNNER = "core.test_runner.CrmTestRunner"
 
 # SMTP credentials live in the ignored .env file.  See .env.example.
-EMAIL_BACKEND = os.getenv("EMAIL_BACKEND", "django.core.mail.backends.smtp.EmailBackend")
-EMAIL_HOST = os.getenv("EMAIL_HOST", "")
-EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
-EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "")
-EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "")
-EMAIL_USE_TLS = os.getenv("EMAIL_USE_TLS", "true").lower() in {"1", "true", "yes"}
-DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", EMAIL_HOST_USER or "noreply@example.com")
-PASSWORD_RESET_FRONTEND_URL = os.getenv("PASSWORD_RESET_FRONTEND_URL", "http://localhost:5173/reset-password")
-INTEGRATION_ENCRYPTION_KEY = os.getenv("INTEGRATION_ENCRYPTION_KEY", "")
-ENVIRONMENT_NAME = os.getenv("ENVIRONMENT_NAME", "development")
+EMAIL_BACKEND = env_str("EMAIL_BACKEND", "django.core.mail.backends.smtp.EmailBackend")
+EMAIL_HOST = env_str("EMAIL_HOST", "")
+EMAIL_PORT = int(env_str("EMAIL_PORT", "587"))
+EMAIL_HOST_USER = env_str("EMAIL_HOST_USER", "")
+EMAIL_HOST_PASSWORD = env_str("EMAIL_HOST_PASSWORD", "")
+EMAIL_USE_TLS = env_bool("EMAIL_USE_TLS", True)
+DEFAULT_FROM_EMAIL = env_str("DEFAULT_FROM_EMAIL", EMAIL_HOST_USER or "noreply@example.com")
+PASSWORD_RESET_FRONTEND_URL = env_str("PASSWORD_RESET_FRONTEND_URL", "http://localhost:5173/reset-password")
+INTEGRATION_ENCRYPTION_KEY = env_str("INTEGRATION_ENCRYPTION_KEY", "")
+ENVIRONMENT_NAME = env_str("ENVIRONMENT_NAME", "development")
+
+LOG_LEVEL = env_str("DJANGO_LOG_LEVEL", "INFO").upper()
+if LOG_LEVEL not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+    raise ImproperlyConfigured("DJANGO_LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR or CRITICAL.")
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {"simple": {"format": "%(asctime)s %(levelname)s %(name)s %(message)s"}},
+    "handlers": {"console": {"class": "logging.StreamHandler", "formatter": "simple"}},
+    "root": {"handlers": ["console"], "level": LOG_LEVEL},
+    "loggers": {
+        "django": {"handlers": ["console"], "level": LOG_LEVEL, "propagate": False},
+        "django.server": {"handlers": ["console"], "level": LOG_LEVEL, "propagate": False},
+        "django.db.backends": {"level": "INFO" if LOG_LEVEL == "DEBUG" else LOG_LEVEL},
+    },
+}
 
 AUTHENTICATION_BACKENDS = [
     "users.backends.EmailBackend",

@@ -9,3 +9,7 @@ wheels/
 # Virtual environments
 .venv
 .env
+media
+private_media/
+*.sqlite3*
+backups/

@@ -6,6 +6,7 @@ app_name = "leads"
 
 urlpatterns = [
     path("leads/", views.lead_list, name="list"),
+    path("leads/check-duplicate/", views.check_duplicate_lead, name="check-duplicate"),
     path("leads/import/", views.import_leads_csv, name="import-csv"),
     path("leads/assigned/", views.assigned_leads, name="assigned-leads"),
     path("leads/bulk_reset/", views.remove_assignment_of_lead, name="reset-assigned-leads"),

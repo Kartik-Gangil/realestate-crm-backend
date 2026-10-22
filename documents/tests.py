@@ -1,15 +1,17 @@
 from datetime import timedelta
 
 from django.contrib.auth import get_user_model
+from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from django.utils import timezone
 
 from leads.models import Lead
-from organizations.models import Organization
-from .models import CustomerDocument, CustomerDocumentRequirement, DocumentCategory
+from organizations.models import Organization, OrganizationMembership
+from core.tests.samples import FORGED_EXE, FORGED_HTML, SAMPLE_JPEG, SAMPLE_PNG
+from .models import CustomerDocument, CustomerDocumentRequirement, DocumentCategory, EmployeeDocumentCategory
 from .services import (put_document_under_verification, upload_customer_document,
-                       validate_customer_documents_for_booking, verify_customer_document)
+                       upload_employee_document, validate_customer_documents_for_booking, verify_customer_document)
 
 
 class DocumentServiceTests(TestCase):
@@ -48,3 +50,21 @@ class DocumentServiceTests(TestCase):
         with self.assertRaises(ValidationError) as raised:
             confirm_plot_booking(booking=booking, user=self.user)
         self.assertTrue(hasattr(raised.exception, "document_validation"))
+
+    def test_forged_customer_document_is_rejected_task_sec_001(self):
+        for name, content in (("pan.pdf", FORGED_HTML), ("pan.png", FORGED_EXE)):
+            with self.subTest(name=name):
+                with self.assertRaises(ValidationError) as raised:
+                    upload_customer_document(organization=self.org, customer=self.customer, document_category=self.category, document_name="PAN", user=self.user, uploaded_file=SimpleUploadedFile(name, content, content_type="application/pdf"))
+                self.assertIn("file", raised.exception.message_dict)
+        self.assertFalse(CustomerDocument.objects.exists())
+
+    def test_customer_document_stores_the_detected_type_task_sec_001(self):
+        document = upload_customer_document(organization=self.org, customer=self.customer, document_category=self.category, document_name="PAN", user=self.user, uploaded_file=SimpleUploadedFile("pan.png", SAMPLE_PNG, content_type="application/octet-stream"))
+        self.assertEqual(document.content_type, "image/png")
+
+    def test_employee_document_stores_the_detected_type_task_sec_001(self):
+        employee = OrganizationMembership.objects.create(organization=self.org, user=self.user, role=OrganizationMembership.Role.ADMIN)
+        category = EmployeeDocumentCategory.objects.create(organization=self.org, name="Offer letter", code="offer")
+        document = upload_employee_document(organization=self.org, employee=employee, document_category=category, document_name="Offer", user=self.user, uploaded_file=SimpleUploadedFile("offer.jpg", SAMPLE_JPEG, content_type="application/pdf"))
+        self.assertEqual(document.content_type, "image/jpeg")

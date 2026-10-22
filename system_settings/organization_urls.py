@@ -3,6 +3,7 @@ from . import views
 
 urlpatterns = [
     path("settings/general/", views.general_settings),
+    path("settings/general/logo/", views.general_settings_logo),
     path("settings/integrations/", views.integrations),
     path("settings/integrations/<int:integration_id>/", views.integration_detail),
     path("settings/system-parameters/", views.system_parameters),

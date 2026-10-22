@@ -2,7 +2,7 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models import Q, F
-TAB_PERMISSIONS = ("dashboard", "leads", "assigned_leads", "follow_ups", "members")
+TAB_PERMISSIONS = ("dashboard", "leads", "assigned_leads", "follow_ups", "telecalling", "members")
 
 
 def default_tab_permissions():

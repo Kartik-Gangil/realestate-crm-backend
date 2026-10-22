@@ -32,6 +32,7 @@ class PlotApiTests(TestCase):
         )
         self.client = APIClient()
         self.client.force_authenticate(self.user)
+        self.client.defaults["HTTP_X_PROJECT_ID"] = str(self.project.id)
 
     def list_url(self):
         return reverse("inventory:plots", args=[self.organization.slug])
@@ -82,8 +83,8 @@ class PlotApiTests(TestCase):
         self.make_plot("B-101", project=self.other_project, block=self.other_block)
         self.assertEqual(self.client.get(self.list_url(), {"search": "COM"}).data["results"][0]["id"], commercial.id)
         self.assertEqual(self.client.get(self.list_url(), {"search": "A Block"}).data["count"], 2)
-        self.assertEqual(self.client.get(self.list_url(), {"search": "Lake View"}).data["count"], 1)
-        self.assertEqual(self.client.get(self.list_url(), {"project": self.other_project.id}).data["count"], 1)
+        self.assertEqual(self.client.get(self.list_url(), {"search": "Lake View"}).data["count"], 0)
+        self.assertEqual(self.client.get(self.list_url(), {"project": self.other_project.id}).status_code, 400)
         self.assertEqual(self.client.get(self.list_url(), {"block": self.block.id, "status": "blocked"}).data["count"], 1)
         response = self.client.get(self.list_url(), {"project": self.project.id, "block": self.block.id, "status": "blocked", "plot_type": "commercial"})
         self.assertEqual(response.data["count"], 1)

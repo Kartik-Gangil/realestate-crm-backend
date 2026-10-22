@@ -5,6 +5,7 @@ from . import views
 app_name = "inventory"
 
 urlpatterns = [
+    path("inventory/projects/", views.project_list, name="projects"),
     path("payments/", views.managed_payments, name="managed-payments"),
     path("payments/summary/", views.managed_payment_summary, name="managed-payment-summary"),
     path("payments/<int:payment_id>/", views.managed_payment_detail, name="managed-payment-detail"),
@@ -21,6 +22,9 @@ urlpatterns = [
     path("registries/<int:registry_id>/", views.managed_registry_detail, name="managed-registry-detail"),
     path("registries/<int:registry_id>/status/", views.managed_registry_status, name="managed-registry-status"),
     path("registries/<int:registry_id>/history/", views.managed_registry_history, name="managed-registry-history"),
+    path("registries/<int:registry_id>/documents/", views.managed_registry_documents, name="managed-registry-documents"),
+    path("registries/<int:registry_id>/documents/<int:document_id>/", views.managed_registry_document_delete, name="managed-registry-document-delete"),
+    path("registries/<int:registry_id>/documents/<int:document_id>/download/", views.managed_registry_document_download, name="managed-registry-document-download"),
     path("inventory/blocks/", views.block_list, name="blocks"),
     path("inventory/blocks/<int:block_id>/", views.block_detail, name="block-detail"),
     path("inventory/plot-inventory/", views.plot_inventory, name="plot-inventory"),
@@ -61,6 +65,9 @@ urlpatterns = [
     path("inventory/agreements/<int:agreement_id>/", views.agreement_detail, name="agreement-detail"),
     path("inventory/agreements/<int:agreement_id>/ready/", views.agreement_ready, name="agreement-ready"),
     path("inventory/agreements/<int:agreement_id>/sign/", views.agreement_sign, name="agreement-sign"),
+    path("inventory/agreements/<int:agreement_id>/upload-signed/", views.agreement_signed_copy, name="agreement-upload-signed"),
+    path("inventory/agreements/<int:agreement_id>/signed-copy/", views.agreement_signed_copy, name="agreement-signed-copy"),
+    path("inventory/agreements/<int:agreement_id>/download-signed/", views.agreement_download_signed, name="agreement-download-signed"),
     path("inventory/agreements/<int:agreement_id>/cancel/", views.agreement_cancel, name="agreement-cancel"),
     path("inventory/bookings/<int:booking_id>/registry/", views.booking_registry, name="booking-registry"),
     path("inventory/registries/", views.registry_list, name="registries"),

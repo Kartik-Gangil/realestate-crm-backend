@@ -16,14 +16,24 @@ Including another URLconf
 """
 from django.contrib import admin
 from django.urls import include, path
+from leads import views as lead_views
+
+from .health import healthz, readyz
 
 urlpatterns = [
+    path('healthz', healthz, name='healthz'),
+    path('readyz', readyz, name='readyz'),
     path('admin/', admin.site.urls),
     path('api/auth/', include('users.urls')),
     path('api/', include('organizations.urls')),
+    path('api/', include('expenses.urls')),
     path('api/settings/', include('system_settings.urls')),
     path('api/organizations/<slug:organization_slug>/', include('system_settings.organization_urls')),
     path('api/organizations/<slug:organization_slug>/', include('leads.urls')),
+    path('api/v1/organizations/<slug:organization_slug>/leads/', lead_views.lead_list, name='v1-lead-list'),
+    path('api/v1/organizations/<slug:organization_slug>/leads/check-duplicate/', lead_views.check_duplicate_lead, name='v1-check-duplicate-lead'),
+    path('api/v1/organizations/<slug:organization_slug>/', include('leads.telecalling_urls')),
     path('api/organizations/<slug:organization_slug>/', include('inventory.urls')),
     path('api/organizations/<slug:organization_slug>/', include('documents.urls')),
 ]
+

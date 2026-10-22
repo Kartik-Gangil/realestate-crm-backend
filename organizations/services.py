@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from rest_framework.exceptions import NotFound, PermissionDenied
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 
 from .models import Organization, OrganizationMembership, OrganizationRole, Permission, PlatformOrganizationAccess, TAB_PERMISSIONS
 
@@ -12,7 +12,8 @@ TAB_PERMISSION_REQUIREMENTS = {
     "dashboard": ("dashboard.view",),
     "leads": ("leads.view",),
     "assigned_leads": ("leads.view",),
-    "follow_ups": ("leads.view",),
+    "follow_ups": ("leads.view", "follow_ups.view", "telecalling.view"),
+    "telecalling": ("telecalling.view",),
     "members": ("employees.view",),
 }
 
@@ -57,8 +58,15 @@ def ensure_default_roles(organization):
     roles["admin"].permissions.set(Permission.objects.all())
     if not roles["manager"].permissions.exists():
         roles["manager"].permissions.set(Permission.objects.filter(module__in=["dashboard", "leads", "customers", "plots", "documents", "employees", "attendance", "leave"]).exclude(action__in=["delete", "export"]))
+    telecaller_permissions = Permission.objects.filter(
+        module__in=["dashboard", "customers", "follow_ups", "telecalling"],
+        action__in=["view", "add", "edit"],
+    )
+    roles["telecaller"].permissions.remove(*Permission.objects.filter(module="documents"))
     if not roles["telecaller"].permissions.exists():
-        roles["telecaller"].permissions.set(Permission.objects.filter(module__in=["dashboard", "leads", "customers", "documents"], action__in=["view", "add", "edit"]))
+        roles["telecaller"].permissions.set(telecaller_permissions)
+    else:
+        roles["telecaller"].permissions.add(*telecaller_permissions)
     return roles
 
 
@@ -122,3 +130,22 @@ def get_organization_access(user, slug):
     if membership:
         return OrganizationAccess(organization, membership, False)
     raise PermissionDenied("You do not have access to this organization.")
+
+
+def get_project_context(request, access):
+    """Resolve and authorize the project carried by X-Project-ID."""
+    from inventory.models import Project
+
+    raw_project_id = request.headers.get("X-Project-ID")
+    if not raw_project_id:
+        raise ValidationError({"project": "X-Project-ID is required."})
+    try:
+        project_id = int(raw_project_id)
+    except (TypeError, ValueError) as error:
+        raise ValidationError({"project": "X-Project-ID must be a valid project id."}) from error
+    project = Project.objects.filter(pk=project_id).first()
+    if project is None:
+        raise NotFound("Project not found.")
+    if project.organization_id != access.organization.id:
+        raise PermissionDenied("You do not have access to this project.")
+    return project

@@ -1,13 +1,36 @@
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from django.core.validators import FileExtensionValidator
 from django.db import models
 from django.db.models import Q
 from django.utils import timezone
 from datetime import timedelta
+import os
+import uuid
+from django.utils.text import get_valid_filename
 
 
 def default_selection_expiry():
     return timezone.now() + timedelta(minutes=30)
+
+
+class Project(models.Model):
+    """Organization-scoped project context used by the application shell."""
+
+    organization = models.ForeignKey(
+        "organizations.Organization", on_delete=models.CASCADE, related_name="inventory_projects"
+    )
+    name = models.CharField(max_length=150)
+    code = models.CharField(max_length=50)
+    description = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name", "id"]
+
+    def __str__(self):
+        return f"{self.organization} - {self.name}"
 
 
 class Block(models.Model):
@@ -15,6 +38,9 @@ class Block(models.Model):
 
     organization = models.ForeignKey(
         "organizations.Organization", on_delete=models.CASCADE, related_name="inventory_blocks"
+    )
+    project = models.ForeignKey(
+        Project, null=True, blank=True, on_delete=models.CASCADE, related_name="blocks"
     )
     name = models.CharField(max_length=100)
     code = models.CharField(max_length=50)
@@ -31,6 +57,11 @@ class Block(models.Model):
 
     def __str__(self):
         return f"{self.organization} - {self.name}"
+
+    def clean(self):
+        super().clean()
+        if self.project_id and self.project.organization_id != self.organization_id:
+            raise ValidationError({"project": "Project must belong to this organization."})
 
 
 class Plot(models.Model):
@@ -50,6 +81,9 @@ class Plot(models.Model):
 
     organization = models.ForeignKey(
         "organizations.Organization", on_delete=models.CASCADE, related_name="plots"
+    )
+    project = models.ForeignKey(
+        Project, null=True, blank=True, on_delete=models.CASCADE, related_name="plots"
     )
     block = models.ForeignKey(Block, on_delete=models.CASCADE, related_name="plots")
     plot_number = models.CharField(max_length=50)
@@ -95,6 +129,10 @@ class Plot(models.Model):
         errors = {}
         if self.block_id and self.organization_id != self.block.organization_id:
             errors["block"] = "Block must belong to this organization."
+        if self.project_id and self.organization_id != self.project.organization_id:
+            errors["project"] = "Project must belong to this organization."
+        if self.project_id and self.block_id and self.block.project_id and self.project_id != self.block.project_id:
+            errors["project"] = "Project must match the block project."
         if errors:
             raise ValidationError(errors)
 
@@ -320,6 +358,22 @@ class PaymentAllocation(models.Model):
             raise ValidationError(errors)
 
 
+class PaymentAdvance(models.Model):
+    """The portion of a payment that is not applied to a current due."""
+    payment = models.ForeignKey(Payment, on_delete=models.CASCADE, related_name="payment_advances")
+    booking = models.ForeignKey(PlotBooking, on_delete=models.PROTECT, related_name="payment_advances")
+    amount = models.DecimalField(max_digits=15, decimal_places=2)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [models.CheckConstraint(condition=Q(amount__gt=0), name="inventory_payment_advance_positive")]
+        indexes = [models.Index(fields=["booking", "payment"])]
+
+    def clean(self):
+        if self.payment_id and self.booking_id and self.payment.organization_id != self.booking.organization_id:
+            raise ValidationError({"booking": "Booking must belong to the payment organization."})
+
+
 class PaymentReceipt(models.Model):
     payment = models.OneToOneField(Payment, on_delete=models.CASCADE, related_name="receipt")
     organization = models.ForeignKey("organizations.Organization", on_delete=models.CASCADE, related_name="payment_receipts")
@@ -422,6 +476,26 @@ class Agreement(models.Model):
             raise ValidationError({"booking": "Booking must belong to this organization."})
 
 
+def agreement_signed_upload_path(instance, filename):
+    safe_name = get_valid_filename(os.path.basename(filename)) or "signed-agreement"
+    return f"agreements/{instance.agreement.organization.slug}/{instance.agreement_id}/{uuid.uuid4().hex}_{safe_name}"
+
+
+class AgreementSignedDocument(models.Model):
+    agreement = models.ForeignKey(Agreement, on_delete=models.PROTECT, related_name="signed_documents")
+    file = models.FileField(upload_to=agreement_signed_upload_path, validators=[FileExtensionValidator(["pdf", "jpg", "jpeg", "png"])])
+    original_filename = models.CharField(max_length=255)
+    content_type = models.CharField(max_length=100)
+    file_size_bytes = models.PositiveBigIntegerField()
+    uploaded_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL, related_name="uploaded_agreement_signed_documents")
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+    superseded_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-uploaded_at", "-id"]
+        indexes = [models.Index(fields=["agreement", "superseded_at"])]
+
+
 class Registry(models.Model):
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
@@ -454,6 +528,51 @@ class Registry(models.Model):
     def clean(self):
         if self.booking_id and self.organization_id != self.booking.organization_id:
             raise ValidationError({"booking": "Booking must belong to this organization."})
+
+
+def registry_document_upload_path(instance, filename):
+    safe_name = get_valid_filename(os.path.basename(filename)) or "registry-document"
+    return f"registry_documents/{instance.registry.organization.slug}/{instance.registry_id}/{uuid.uuid4().hex}_{safe_name}"
+
+
+class RegistryDocument(models.Model):
+    registry = models.ForeignKey(Registry, on_delete=models.CASCADE, related_name="documents")
+    customer_document = models.ForeignKey(
+        "documents.CustomerDocument",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="registry_attachments",
+    )
+    file = models.FileField(
+        upload_to=registry_document_upload_path,
+        null=True,
+        blank=True,
+        validators=[FileExtensionValidator(["pdf", "jpg", "jpeg", "png"])],
+    )
+    document_label = models.CharField(max_length=200)
+    document_type = models.CharField(max_length=100, default="other")
+    original_filename = models.CharField(max_length=255, blank=True)
+    content_type = models.CharField(max_length=100, blank=True)
+    file_size_bytes = models.PositiveBigIntegerField(default=0)
+    uploaded_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL, related_name="uploaded_registry_documents")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+    @property
+    def source(self):
+        return "reference" if self.customer_document_id else "upload"
+
+    def clean(self):
+        if self.customer_document_id:
+            if self.customer_document.organization_id != self.registry.organization_id:
+                raise ValidationError({"customer_document": "Document must belong to this organization."})
+            if self.customer_document.customer_id != self.registry.booking.lead_id:
+                raise ValidationError({"customer_document": "Document must belong to the registry buyer."})
+        if not self.file and not self.customer_document_id:
+            raise ValidationError({"file": "Attach a file or an existing customer document."})
 
 
 class RegistryCharge(models.Model):

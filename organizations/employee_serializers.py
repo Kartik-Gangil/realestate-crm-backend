@@ -2,6 +2,7 @@ from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
 from .models import Department, OrganizationMembership
+from core.files import validate_image_upload
 
 
 EMPLOYEE_PROFILE_FIELDS = {
@@ -25,7 +26,7 @@ class EmployeeCreateSerializer(serializers.Serializer):
     first_name = serializers.CharField(max_length=150)
     last_name = serializers.CharField(max_length=150, required=False, allow_blank=True)
     role = serializers.ChoiceField(choices=OrganizationMembership.Role.choices, default=OrganizationMembership.Role.TELECALLER)
-    profile_photo = serializers.FileField(required=False, allow_null=True)
+    profile_photo = serializers.FileField(required=False, allow_null=True, validators=[validate_image_upload])
     mobile_number = serializers.CharField(max_length=32, required=False, allow_blank=True)
     address = serializers.CharField(required=False, allow_blank=True)
     date_of_birth = serializers.DateField(required=False, allow_null=True)
@@ -58,7 +59,7 @@ class EmployeeCreateSerializer(serializers.Serializer):
 class EmployeeUpdateSerializer(serializers.Serializer):
     first_name = serializers.CharField(max_length=150, required=False)
     last_name = serializers.CharField(max_length=150, required=False, allow_blank=True)
-    profile_photo = serializers.FileField(required=False, allow_null=True)
+    profile_photo = serializers.FileField(required=False, allow_null=True, validators=[validate_image_upload])
     mobile_number = serializers.CharField(max_length=32, required=False, allow_blank=True)
     address = serializers.CharField(required=False, allow_blank=True)
     date_of_birth = serializers.DateField(required=False, allow_null=True)

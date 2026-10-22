@@ -1,3 +1,4 @@
+import os
 import platform
 from django.conf import settings
 from django.contrib.auth import get_user_model
@@ -5,6 +6,7 @@ from django.db import transaction
 from django.db.models import Count
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from core.files import private_file_response
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
@@ -66,6 +68,14 @@ def general_settings(request, organization_slug):
             access.organization.name = obj.company_name; access.organization.save(update_fields=["name"])
         log_audit(request=request, organization=access.organization, module="settings", action="settings_updated", details={"fields": list(serializer.validated_data)}, target=obj)
     return Response(OrganizationSettingsSerializer(obj, context={"request": request}).data)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def general_settings_logo(request, organization_slug):
+    access = _org_access(request, organization_slug, False)
+    row = get_object_or_404(OrganizationSettings, organization=access.organization)
+    return private_file_response(row.company_logo, filename=os.path.basename(row.company_logo.name or "") or "logo")
 
 
 @api_view(["GET"])

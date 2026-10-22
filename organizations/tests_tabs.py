@@ -3,6 +3,7 @@ from rest_framework.authtoken.models import Token
 from rest_framework.test import APITestCase
 
 from .models import Organization, OrganizationMembership, OrganizationRole, Permission
+from .services import effective_tab_permissions, ensure_default_roles
 
 
 class RoleDerivedTabPermissionsTests(APITestCase):
@@ -38,3 +39,30 @@ class RoleDerivedTabPermissionsTests(APITestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["permissions"], ["leads.view"])
+
+    def test_telecaller_role_permissions_expose_telecalling_and_follow_up_tabs(self):
+        telecalling, _ = Permission.objects.get_or_create(
+            module="telecalling", action="view", defaults={"name": "View telecalling"}
+        )
+        follow_ups, _ = Permission.objects.get_or_create(
+            module="follow_ups", action="view", defaults={"name": "View follow-ups"}
+        )
+        self.role.permissions.set([telecalling, follow_ups])
+
+        self.assertEqual(
+            effective_tab_permissions(self.role.memberships.first()),
+            ["follow_ups", "telecalling"],
+        )
+
+    def test_default_telecaller_role_does_not_receive_lead_management_permission(self):
+        roles = ensure_default_roles(self.organization)
+
+        telecaller_codes = set(roles["telecaller"].permissions.values_list("module", "action"))
+        admin_codes = set(roles["admin"].permissions.values_list("module", "action"))
+
+        self.assertNotIn(("leads", "view"), telecaller_codes)
+        self.assertNotIn(("leads", "add"), telecaller_codes)
+        self.assertNotIn(("leads", "edit"), telecaller_codes)
+        self.assertNotIn(("documents", "view"), telecaller_codes)
+        self.assertNotIn(("documents", "add"), telecaller_codes)
+        self.assertIn(("leads", "view"), admin_codes)

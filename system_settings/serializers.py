@@ -3,6 +3,7 @@ from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from rest_framework import serializers
 from .models import AuditLog, BackupRecord, IntegrationConfiguration, MasterData, OrganizationSettings, SystemParameter
+from core.files import validate_image_upload
 
 
 class OrganizationSettingsSerializer(serializers.ModelSerializer):
@@ -10,6 +11,17 @@ class OrganizationSettingsSerializer(serializers.ModelSerializer):
         model = OrganizationSettings
         fields = ("company_name", "company_logo", "date_format", "timezone", "currency", "items_per_page", "updated_at")
         read_only_fields = ("updated_at",)
+    def validate_company_logo(self, value):
+        if value:
+            validate_image_upload(value)
+        return value
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        version = int(instance.updated_at.timestamp()) if instance.updated_at else 0
+        data["company_logo"] = (f"/api/organizations/{instance.organization.slug}/settings/general/logo/?v={version}"
+                                 if instance.company_logo else None)
+        return data
     def validate_timezone(self, value):
         try: ZoneInfo(value)
         except ZoneInfoNotFoundError: raise serializers.ValidationError("Use a valid IANA timezone.")

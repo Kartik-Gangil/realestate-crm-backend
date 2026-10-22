@@ -8,6 +8,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from organizations.models import Organization, OrganizationMembership
+from inventory.models import Project
 from leads.models import Lead, Sitevisit, SitevisitReschedule
 
 
@@ -24,10 +25,12 @@ class SiteVisitApiTests(TestCase):
         OrganizationMembership.objects.create(
             organization=self.other_organization, user=self.other_user, role=OrganizationMembership.Role.MANAGER
         )
-        self.lead = Lead.objects.create(organization=self.organization, first_name="Ravi", phone="9999999999")
+        self.project = Project.objects.create(organization=self.organization, name="Main", code="MAIN")
+        self.lead = Lead.objects.create(organization=self.organization, project=self.project, assigned_membership=self.membership, first_name="Ravi", phone="9999999999")
         self.other_lead = Lead.objects.create(organization=self.other_organization, first_name="Other", phone="8888888888")
         self.client = APIClient()
         self.client.force_authenticate(self.user)
+        self.client.defaults["HTTP_X_PROJECT_ID"] = str(self.project.id)
         self.list_url = reverse("leads:site-visit", args=[self.organization.slug])
 
     def schedule(self, **overrides):
@@ -108,8 +111,8 @@ class SiteVisitApiTests(TestCase):
         self.assertEqual(self.client.post(url, {"after_minutes": 0}, format="json").status_code, 400)
 
     def test_analytics_respects_date_range(self):
-        Sitevisit.objects.create(organization=self.organization, lead=self.lead, executive_membership=self.membership, visit_date=timezone.localdate(), visit_time="10:00", status=Sitevisit.Status.COMPLETED, outcome="interested", interest_level=4)
-        Sitevisit.objects.create(organization=self.organization, lead=self.lead, executive_membership=self.membership, visit_date=timezone.localdate() - timedelta(days=10), visit_time="10:00", status=Sitevisit.Status.CANCELLED)
+        Sitevisit.objects.create(organization=self.organization, project=self.project, lead=self.lead, executive_membership=self.membership, visit_date=timezone.localdate(), visit_time="10:00", status=Sitevisit.Status.COMPLETED, outcome="interested", interest_level=4)
+        Sitevisit.objects.create(organization=self.organization, project=self.project, lead=self.lead, executive_membership=self.membership, visit_date=timezone.localdate() - timedelta(days=10), visit_time="10:00", status=Sitevisit.Status.CANCELLED)
         url = reverse("leads:site-visit-analytics", args=[self.organization.slug])
         response = self.client.get(url, {"start_date": timezone.localdate().isoformat(), "end_date": timezone.localdate().isoformat()})
         self.assertEqual(response.status_code, 200)

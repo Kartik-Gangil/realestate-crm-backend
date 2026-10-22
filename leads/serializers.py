@@ -14,16 +14,33 @@ def membership_to_dict(membership):
 
 
 def follow_up_to_dict(follow_up: FollowUpCall) -> dict:
+    outcome_to_disposition = {
+        "Interested": "Interested",
+        "Callback Later": "Callback Later",
+        "busy": "Busy",
+        "no_answer": "No Answer",
+        "Switched Off": "Switched Off",
+        "Wrong Number": "Wrong Number",
+        "DND": "DND",
+        "Already Purchased": "Already Purchased",
+        "connected": "Interested",
+        "callback": "Callback Later",
+        "invalid_number": "Wrong Number",
+    }
     return {
         "id": follow_up.id,
         "lead_id": follow_up.lead_id,
         "telecaller": membership_to_dict(follow_up.telecaller_membership),
         "note": follow_up.note,
+        "notes": follow_up.note,
         "outcome": follow_up.outcome,
+        "disposition": outcome_to_disposition.get(follow_up.outcome, follow_up.outcome),
         "status": follow_up.status,
         "next_follow_up": follow_up.next_follow_up.isoformat() if follow_up.next_follow_up else None,
         "called_at": follow_up.called_at.isoformat() if follow_up.called_at else None,
         "created_at": follow_up.created_at.isoformat(),
+          "call_recording": (f"/api/v1/organizations/{follow_up.organization.slug}/telecalling/calls/{follow_up.id}/recording/"
+                             if follow_up.call_recording else None),
     }
     
 def site_visit_to_dict(site_visit: Sitevisit, include_history=False) -> dict:
@@ -109,6 +126,7 @@ def lead_to_dict(lead: Lead, include_follow_ups=False , latest_follow_up_status=
     data = {
         "id": lead.id,
         "organization": lead.organization.slug,
+        "project": {"id": lead.project_id, "name": lead.project.name, "code": lead.project.code} if lead.project_id else None,
         "first_name": lead.first_name,
         "last_name": lead.last_name,
         "full_name": lead.full_name,
@@ -125,5 +143,10 @@ def lead_to_dict(lead: Lead, include_follow_ups=False , latest_follow_up_status=
         "updated_at": lead.updated_at.isoformat(),
     }
     if include_follow_ups:
-        data["follow_up_calls"] = [follow_up_to_dict(call) for call in lead.follow_up_calls.select_related("telecaller_membership__user").all()]
+        data["follow_up_calls"] = [
+            follow_up_to_dict(call)
+            for call in lead.follow_up_calls
+            .select_related("telecaller_membership__user")
+            .order_by("-called_at", "-id")
+        ]
     return data

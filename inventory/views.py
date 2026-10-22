@@ -1,24 +1,29 @@
+import os
 from datetime import date
 from decimal import Decimal, InvalidOperation
 
 from django.core.exceptions import ValidationError
+from django.http import Http404
+from django.db import transaction
 from django.db.models import Prefetch, Q, Sum
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from rest_framework import status
 from rest_framework.exceptions import PermissionDenied
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, parser_classes, permission_classes
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from organizations.services import get_organization_access, has_permission
+from organizations.services import get_organization_access, get_project_context, has_permission, membership_role_code
 
 from leads.models import Lead, Sitevisit
+from documents.models import CustomerDocument
 
-from .models import (Agreement, Block, Installment, InstallmentPayment, Payment, PaymentAdjustment,
-    PaymentAllocation, PaymentReceipt, PaymentRefund, Plot, PlotBooking, PlotHold, PlotSelection,
-    Possession, RecentlyViewedPlot, Registry, RegistryCharge)
+from .models import (Agreement, AgreementSignedDocument, Block, Installment, InstallmentPayment, Payment, PaymentAdjustment,
+    PaymentAdvance, PaymentAllocation, PaymentReceipt, PaymentRefund, Plot, PlotBooking, PlotHold, PlotSelection,
+    Possession, Project, RecentlyViewedPlot, Registry, RegistryCharge, RegistryDocument)
 from .serializers import PlotWriteSerializer , BlockWriteSerializer
 from .services import (
     block_plot, bulk_change_plot_status, cancel_plot_booking, change_plot_status,
@@ -31,6 +36,7 @@ from .phase5_services import (
     transition_agreement, transition_possession, transition_registry,
 )
 from system_settings.audit import log_audit
+from core.files import DOCUMENT_KINDS, private_file_response, validate_upload
 from .selection_services import confirm_selection, create_selection, is_plot_selectable, release_selection
 
 
@@ -44,10 +50,56 @@ def _validation_response(error):
     return Response(details, status=status.HTTP_400_BAD_REQUEST)
 
 
-def _plots_for_access(access, include_active_hold=False):
+def project_to_dict(project):
+    return {
+        "id": project.id,
+        "name": project.name,
+        "code": project.code,
+        "description": project.description,
+        "organization_id": project.organization_id,
+        "created_at": project.created_at.isoformat() if project.created_at else None,
+        "updated_at": project.updated_at.isoformat() if project.updated_at else None,
+    }
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def project_list(request, organization_slug):
+    access = get_organization_access(request.user, organization_slug)
+    projects = Project.objects.filter(organization=access.organization)
+    if request.method == "GET":
+        return Response({
+            "count": projects.count(),
+            "results": [project_to_dict(project) for project in projects],
+        })
+
+    role = membership_role_code(access.membership)
+    if not access.is_platform and role != "admin":
+        raise PermissionDenied("Only organization admins and authorized platform users can create projects.")
+    name = str(request.data.get("name", "")).strip()
+    code = str(request.data.get("code", "")).strip()
+    if not name or not code:
+        errors = {}
+        if not name:
+            errors["name"] = "This field is required."
+        if not code:
+            errors["code"] = "This field is required."
+        return Response(errors, status=status.HTTP_400_BAD_REQUEST)
+    project = Project.objects.create(
+        organization=access.organization,
+        name=name,
+        code=code,
+        description=str(request.data.get("description", "")),
+    )
+    return Response(project_to_dict(project), status=status.HTTP_201_CREATED)
+
+
+def _plots_for_access(access, project=None, include_active_hold=False):
     queryset = Plot.objects.filter(organization=access.organization).select_related(
         "organization", "block", "created_by"
     )
+    if project is not None:
+        queryset = queryset.filter(project=project)
     if include_active_hold:
         queryset = queryset.prefetch_related(
             Prefetch(
@@ -66,12 +118,18 @@ def _related_to_dict(instance, include_code=False):
     return data
 
 
-def _blocks_for_access(access):
-    return Block.objects.filter(organization=access.organization).select_related("organization")
+def _blocks_for_access(access, project=None):
+    queryset = Block.objects.filter(organization=access.organization).select_related("organization")
+    return queryset.filter(project=project) if project is not None else queryset
 
 
 def block_to_dict(block, detailed=False):
-    data = {"id": block.id, "name": block.name, "code": block.code}
+    data = {
+        "id": block.id,
+        "name": block.name,
+        "code": block.code,
+        "project": _related_to_dict(block.project, include_code=True) if block.project_id else None,
+    }
     if detailed:
         data.update(
             {
@@ -94,6 +152,7 @@ def plot_to_dict(plot, detailed=False):
         "id": plot.id,
         "plot_number": plot.plot_number,
         "block": _related_to_dict(plot.block, include_code=True),
+        "project": _related_to_dict(plot.project, include_code=True) if plot.project_id else None,
         "size": str(plot.size),
         "plot_type": plot.plot_type,
         "status": plot.status,
@@ -172,12 +231,22 @@ def _parse_positive_id(params, name):
     return value
 
 
-def _filter_plots(queryset, params, organization):
+def _filter_plots(queryset, params, organization, active_project=None):
+    project_id = _parse_positive_id(params, "project")
+    if project_id is not None:
+        project = Project.objects.filter(pk=project_id, organization=organization).first()
+        if project is None:
+            raise ValidationError({"project": "Use a project in this organization."})
+        if active_project is not None and project.id != active_project.id:
+            raise ValidationError({"project": "The project filter must match X-Project-ID."})
+        queryset = queryset.filter(project=project)
     block_id = _parse_positive_id(params, "block")
     if block_id is not None:
         block = Block.objects.filter(pk=block_id, organization=organization).first()
         if block is None:
             raise ValidationError({"block": "Use a block in this organization."})
+        if project_id is not None and block.project_id and block.project_id != project_id:
+            raise ValidationError({"block": "Block must belong to the selected project."})
         queryset = queryset.filter(block=block)
     if status_value := params.get("status"):
         if status_value not in Plot.Status.values:
@@ -192,6 +261,8 @@ def _filter_plots(queryset, params, organization):
             Q(plot_number__icontains=search)
             | Q(block__name__icontains=search)
             | Q(block__code__icontains=search)
+            | Q(project__name__icontains=search)
+            | Q(project__code__icontains=search)
         )
     return queryset
 
@@ -227,9 +298,12 @@ def _require_inventory_management(access):
         raise PermissionDenied("Only organization admins, managers, and authorized platform users can change plot status.")
 
 
-def _bookings_for_access(access):
-    return PlotBooking.objects.filter(organization=access.organization).select_related(
-        "organization", "lead", "plot", "plot__block", "site_visit", "created_by"
+def _bookings_for_access(access, project=None):
+    queryset = PlotBooking.objects.filter(organization=access.organization)
+    if project is not None:
+        queryset = queryset.filter(plot__project=project)
+    return queryset.select_related(
+        "organization", "lead", "plot", "plot__block", "site_visit", "created_by", "agreement"
     )
 
 
@@ -239,6 +313,7 @@ def _actor_to_dict(user):
 
 def booking_to_dict(booking, detailed=False):
     plot, lead = booking.plot, booking.lead
+    agreement = getattr(booking, "agreement", None)
     data = {
         "id": booking.id, "status": booking.status, "notes": booking.notes, "plot_status": plot.status,
         "lead": {"id": lead.id, "first_name": lead.first_name, "last_name": lead.last_name,
@@ -255,6 +330,7 @@ def booking_to_dict(booking, detailed=False):
                        if booking.site_visit_id else None),
         "created_by": _actor_to_dict(booking.created_by),
         "created_at": booking.created_at.isoformat(), "updated_at": booking.updated_at.isoformat(),
+        "agreement": agreement_to_dict(agreement) if agreement else None,
     }
     if detailed:
         data.update({"organization": {"id": booking.organization_id, "name": booking.organization.name, "slug": booking.organization.slug},
@@ -262,7 +338,7 @@ def booking_to_dict(booking, detailed=False):
                      "financial_summary": {key: str(value) if value is not None else None for key, value in payment_totals(booking).items()},
                      "payments": [payment_to_dict(payment) for payment in booking.payments.select_related("received_by").all()],
                      "installments": [installment_to_dict(item) for item in booking.installments.all()],
-                     "agreement": agreement_to_dict(booking.agreement) if hasattr(booking, "agreement") else None,
+                     "agreement": agreement_to_dict(agreement) if agreement else None,
                      "registry": registry_to_dict(booking.registry) if hasattr(booking, "registry") else None,
                      "possession": possession_to_dict(booking.possession) if hasattr(booking, "possession") else None})
     return data
@@ -332,6 +408,7 @@ def _plot_response(access, plot):
 @permission_classes([IsAuthenticated])
 def block_list(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
     if request.method == "POST":
         try:
             _reject_protected_payload_fields(request.data)
@@ -342,11 +419,11 @@ def block_list(request, organization_slug):
         )
         serializer.is_valid(raise_exception=True)
         block = serializer.save()
-        block = _blocks_for_access(access).get(pk=block.pk)
+        block = _blocks_for_access(access, project).get(pk=block.pk)
         return Response(block_to_dict(block, detailed=True), status=status.HTTP_201_CREATED)
 
     try:
-        blocks = _filter_blocks(_blocks_for_access(access), request.query_params)
+        blocks = _filter_blocks(_blocks_for_access(access, project), request.query_params)
         count, page, page_size, results = _paginate(blocks, request.query_params)
     except ValidationError as error:
         return _validation_response(error)
@@ -364,7 +441,8 @@ def block_list(request, organization_slug):
 @permission_classes([IsAuthenticated])
 def block_detail(request, organization_slug, block_id):
     access = get_organization_access(request.user, organization_slug)
-    block = get_object_or_404(_blocks_for_access(access), pk=block_id)
+    project = get_project_context(request, access)
+    block = get_object_or_404(_blocks_for_access(access, project), pk=block_id)
     if request.method == "GET":
         return Response(block_to_dict(block, detailed=True))
 
@@ -380,7 +458,7 @@ def block_detail(request, organization_slug, block_id):
     )
     serializer.is_valid(raise_exception=True)
     block = serializer.save()
-    block = _blocks_for_access(access).get(pk=block.pk)
+    block = _blocks_for_access(access, project).get(pk=block.pk)
     return Response(block_to_dict(block, detailed=True))
 
 
@@ -388,6 +466,7 @@ def block_detail(request, organization_slug, block_id):
 @permission_classes([IsAuthenticated])
 def plot_list(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
     if request.method == "POST":
         try:
             _reject_protected_payload_fields(request.data)
@@ -398,11 +477,11 @@ def plot_list(request, organization_slug):
         )
         serializer.is_valid(raise_exception=True)
         plot = serializer.save()
-        plot = _plots_for_access(access, include_active_hold=True).get(pk=plot.pk)
+        plot = _plots_for_access(access, project, include_active_hold=True).get(pk=plot.pk)
         return Response(plot_to_dict(plot, detailed=True), status=status.HTTP_201_CREATED)
 
     try:
-        plots = _filter_plots(_plots_for_access(access), request.query_params, access.organization)
+        plots = _filter_plots(_plots_for_access(access, project), request.query_params, access.organization, project)
         count, page, page_size, results = _paginate(plots, request.query_params)
     except ValidationError as error:
         return _validation_response(error)
@@ -547,29 +626,35 @@ def _booking_page_response(request, bookings):
 @permission_classes([IsAuthenticated])
 def plot_select(request, organization_slug, plot_id):
     access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
     _require_inventory_management(access)
     try:
         lead, plot, site_visit, notes = _booking_payload(request, access.organization, plot_id=plot_id)
+        if plot.project_id != project.id:
+            raise ValidationError({"plot_id": "Plot does not belong to the active project."})
         booking = create_plot_booking(organization=access.organization, lead=lead, plot=plot, site_visit=site_visit, notes=notes, user=request.user)
     except (ValidationError, ValueError, TypeError) as error:
         return _validation_response(error)
-    return Response(booking_to_dict(_bookings_for_access(access).get(pk=booking.pk), detailed=True), status=status.HTTP_201_CREATED)
+    return Response(booking_to_dict(_bookings_for_access(access, project).get(pk=booking.pk), detailed=True), status=status.HTTP_201_CREATED)
 
 
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def booking_list(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
     if request.method == "POST":
         _require_inventory_management(access)
         try:
             lead, plot, site_visit, notes = _booking_payload(request, access.organization)
+            if plot.project_id != project.id:
+                raise ValidationError({"plot_id": "Plot does not belong to the active project."})
             booking = create_plot_booking(organization=access.organization, lead=lead, plot=plot, site_visit=site_visit, notes=notes, user=request.user)
         except (ValidationError, ValueError, TypeError) as error:
             return _validation_response(error)
-        return Response(booking_to_dict(_bookings_for_access(access).get(pk=booking.pk), detailed=True), status=status.HTTP_201_CREATED)
+        return Response(booking_to_dict(_bookings_for_access(access, project).get(pk=booking.pk), detailed=True), status=status.HTTP_201_CREATED)
     try:
-        return _booking_page_response(request, _filter_bookings(_bookings_for_access(access), request.query_params, access.organization))
+        return _booking_page_response(request, _filter_bookings(_bookings_for_access(access, project), request.query_params, access.organization))
     except ValidationError as error:
         return _validation_response(error)
 
@@ -578,44 +663,48 @@ def booking_list(request, organization_slug):
 @permission_classes([IsAuthenticated])
 def booking_detail(request, organization_slug, booking_id):
     access = get_organization_access(request.user, organization_slug)
-    return Response(booking_to_dict(get_object_or_404(_bookings_for_access(access), pk=booking_id), detailed=True))
+    project = get_project_context(request, access)
+    return Response(booking_to_dict(get_object_or_404(_bookings_for_access(access, project), pk=booking_id), detailed=True))
 
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def booking_confirm(request, organization_slug, booking_id):
     access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
     _require_inventory_management(access)
-    booking = get_object_or_404(_bookings_for_access(access), pk=booking_id)
+    booking = get_object_or_404(_bookings_for_access(access, project), pk=booking_id)
     try:
         booking = confirm_plot_booking(booking=booking, user=request.user)
     except (ValidationError, ValueError, TypeError) as error:
         if hasattr(error, "document_validation"):
             return Response({"detail": "Customer documents are incomplete.", "document_validation": error.document_validation}, status=status.HTTP_400_BAD_REQUEST)
         return _validation_response(error)
-    return Response(booking_to_dict(_bookings_for_access(access).get(pk=booking.pk), detailed=True))
+    return Response(booking_to_dict(_bookings_for_access(access, project).get(pk=booking.pk), detailed=True))
 
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def booking_cancel(request, organization_slug, booking_id):
     access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
     _require_inventory_management(access)
-    booking = get_object_or_404(_bookings_for_access(access), pk=booking_id)
+    booking = get_object_or_404(_bookings_for_access(access, project), pk=booking_id)
     try:
         booking = cancel_plot_booking(booking=booking, reason=str(request.data.get("reason", "")).strip(), user=request.user)
     except (ValidationError, ValueError, TypeError) as error:
         return _validation_response(error)
-    return Response(booking_to_dict(_bookings_for_access(access).get(pk=booking.pk), detailed=True))
+    return Response(booking_to_dict(_bookings_for_access(access, project).get(pk=booking.pk), detailed=True))
 
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def lead_bookings(request, organization_slug, lead_id):
     access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
     lead = get_object_or_404(Lead.objects.filter(organization=access.organization), pk=lead_id)
     try:
-        return _booking_page_response(request, _filter_bookings(_bookings_for_access(access).filter(lead=lead), request.query_params, access.organization))
+        return _booking_page_response(request, _filter_bookings(_bookings_for_access(access, project).filter(lead=lead), request.query_params, access.organization))
     except ValidationError as error:
         return _validation_response(error)
 
@@ -624,9 +713,10 @@ def lead_bookings(request, organization_slug, lead_id):
 @permission_classes([IsAuthenticated])
 def plot_bookings(request, organization_slug, plot_id):
     access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
     plot = get_object_or_404(Plot.objects.filter(organization=access.organization), pk=plot_id)
     try:
-        return _booking_page_response(request, _filter_bookings(_bookings_for_access(access).filter(plot=plot), request.query_params, access.organization))
+        return _booking_page_response(request, _filter_bookings(_bookings_for_access(access, project).filter(plot=plot), request.query_params, access.organization))
     except ValidationError as error:
         return _validation_response(error)
 
@@ -665,7 +755,8 @@ def plot_inventory(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
     try:
         _validate_inventory_context(request.query_params, access.organization)
-        plots = _filter_plots(_plots_for_access(access, include_active_hold=True), request.query_params, access.organization)
+        project = get_project_context(request, access)
+        plots = _filter_plots(_plots_for_access(access, project, include_active_hold=True), request.query_params, access.organization, project)
         if facing := request.query_params.get("facing"): plots = plots.filter(facing__iexact=facing)
         if request.query_params.get("available", "").lower() in {"true", "1"}: plots = plots.filter(status=Plot.Status.AVAILABLE)
         if min_size := request.query_params.get("min_size"): plots = plots.filter(size__gte=min_size)
@@ -768,8 +859,11 @@ def _date(payload, name, required=True):
     except (TypeError, ValueError) as error: raise ValidationError({name: "Use YYYY-MM-DD."}) from error
 
 
-def _sales_queryset(model, access):
-    return model.objects.filter(organization=access.organization).select_related("organization", "booking", "booking__lead", "booking__plot", "booking__plot__block")
+def _sales_queryset(model, access, project=None):
+    queryset = model.objects.filter(organization=access.organization)
+    if project is not None:
+        queryset = queryset.filter(booking__plot__project=project)
+    return queryset.select_related("organization", "booking", "booking__lead", "booking__plot", "booking__plot__block")
 
 
 def _require_permission(access, code):
@@ -777,8 +871,14 @@ def _require_permission(access, code):
         raise PermissionDenied("This role does not have the required permission.")
 
 
-def _payment_queryset(access):
-    return Payment.objects.filter(organization=access.organization).select_related("organization", "booking", "booking__lead", "booking__plot", "booking__plot__block", "received_by").prefetch_related("payment_allocations__booking__lead", "payment_allocations__booking__plot__block", "receipt", "refunds")
+def _payment_queryset(access, project=None):
+    queryset = Payment.objects.filter(organization=access.organization)
+    if project is not None:
+        queryset = queryset.filter(
+            Q(booking__plot__project=project)
+            | Q(payment_allocations__booking__plot__project=project)
+        ).distinct()
+    return queryset.select_related("organization", "booking", "booking__lead", "booking__plot", "booking__plot__block", "received_by").prefetch_related("payment_allocations__booking__lead", "payment_allocations__booking__plot__block", "receipt", "refunds")
 
 
 def _simple_page(request, queryset, serializer):
@@ -792,17 +892,52 @@ def _simple_page(request, queryset, serializer):
                      "results": [serializer(item) for item in results]})
 
 
+def _booking_has_overdue_balance(booking):
+    if payment_totals(booking)["outstanding_amount"] <= 0:
+        return False
+    for installment in Installment.objects.filter(booking=booking):
+        paid = InstallmentPayment.objects.filter(
+            installment=installment,
+            payment__status__in=[Payment.Status.SUCCESS, Payment.Status.REFUNDED],
+        ).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+        paid += PaymentAllocation.objects.filter(
+            installment=installment,
+            payment__status__in=[Payment.Status.SUCCESS, Payment.Status.REFUNDED],
+        ).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+        if installment.due_date < date.today() and paid < installment.amount:
+            return True
+    return False
+
+
 def payment_to_dict(payment, detailed=False):
     allocations = getattr(payment, "payment_allocations", None)
     allocation_rows = list(allocations.all()) if allocations is not None else list(PaymentAllocation.objects.filter(payment=payment).select_related("booking__lead", "booking__plot", "installment", "registry_charge"))
-    data = {"id": payment.id, "payment_id": payment.payment_id or f"PAY-{payment.id}", "booking_id": payment.booking_id, "amount": str(payment.amount), "status": payment.status,
+    context_booking = allocation_rows[0].booking if allocation_rows else getattr(payment, "booking", None)
+    context_customer = context_booking.lead if context_booking else None
+    context_plot = context_booking.plot if context_booking else None
+    refund_rows = list(payment.refunds.all())
+    account_status = payment.status
+    booking_contexts = {row.booking_id: row.booking for row in allocation_rows}
+    if payment.booking_id and payment.booking_id not in booking_contexts:
+        booking_contexts[payment.booking_id] = payment.booking
+    if any(_booking_has_overdue_balance(booking) for booking in booking_contexts.values()):
+        account_status = "overdue"
+    advance_rows = list(PaymentAdvance.objects.filter(payment=payment).select_related("booking"))
+    data = {"id": payment.id, "payment_id": payment.payment_id or f"PAY-{payment.id}", "booking_id": payment.booking_id or (context_booking.id if context_booking else None), "amount": str(payment.amount), "advance_amount": str(sum((row.amount for row in advance_rows), Decimal("0.00"))), "status": payment.status, "account_status": account_status,
             "payment_method": payment.payment_method, "transaction_reference": payment.transaction_reference,
             "payment_date": payment.payment_date.isoformat(), "notes": payment.notes,
+            "customer": ({"id": context_customer.id, "name": context_customer.full_name, "phone": context_customer.phone} if context_customer else None),
+            "customer_id": context_customer.id if context_customer else None,
+            "plot_number": context_plot.plot_number if context_plot else None,
+            "booking": ({"id": context_booking.id, "plot_number": context_plot.plot_number} if context_booking and context_plot else None),
+            "booking_ref": f"Booking #{context_booking.id}" if context_booking else None,
+            "refunds": [{"id": refund.id, "amount": str(refund.amount), "status": refund.status, "reason": refund.reason, "refund_date": refund.refund_date.isoformat()} for refund in refund_rows],
             "received_by": _actor_to_dict(payment.received_by), "created_at": payment.created_at.isoformat(), "updated_at": payment.updated_at.isoformat()}
     if detailed:
         data.update({"allocations": [{"booking_id": a.booking_id, "amount": str(a.amount), "installment_id": a.installment_id, "registry_charge_id": a.registry_charge_id, "customer": {"id": a.booking.lead_id, "name": a.booking.lead.full_name}, "plot": {"id": a.booking.plot_id, "plot_number": a.booking.plot.plot_number}} for a in allocation_rows],
+                     "advances": [{"booking_id": row.booking_id, "amount": str(row.amount)} for row in advance_rows],
                      "receipt": ({"receipt_number": payment.receipt.receipt_number, "generated_at": payment.receipt.generated_at.isoformat()} if hasattr(payment, "receipt") else None),
-                     "refunds": [{"id": r.id, "amount": str(r.amount), "reason": r.reason, "status": r.status, "refund_date": r.refund_date.isoformat()} for r in payment.refunds.all()]})
+                     "refunds": [{"id": r.id, "amount": str(r.amount), "reason": r.reason, "status": r.status, "refund_date": r.refund_date.isoformat()} for r in refund_rows]})
     return data
 
 
@@ -813,7 +948,9 @@ def installment_to_dict(item):
             "notes": item.notes, "created_at": item.created_at.isoformat(), "updated_at": item.updated_at.isoformat()}
 
 
-def agreement_to_dict(item): return {"id": item.id, "booking_id": item.booking_id, "agreement_number": item.agreement_number, "agreement_date": item.agreement_date.isoformat() if item.agreement_date else None, "status": item.status, "document_reference": item.document_reference, "notes": item.notes}
+def agreement_to_dict(item):
+    signed_copy = item.signed_documents.filter(superseded_at__isnull=True).order_by("-uploaded_at", "-id").first()
+    return {"id": item.id, "booking_id": item.booking_id, "agreement_number": item.agreement_number, "agreement_date": item.agreement_date.isoformat() if item.agreement_date else None, "status": item.status, "document_reference": item.document_reference, "notes": item.notes, "has_signed_file": bool(signed_copy), "signed_file_name": signed_copy.original_filename if signed_copy else None, "signed_file_size": signed_copy.file_size_bytes if signed_copy else None, "signed_file_uploaded_at": signed_copy.uploaded_at.isoformat() if signed_copy else None}
 def registry_to_dict(item): return {"id": item.id, "booking_id": item.booking_id, "registry_number": item.registry_number, "registry_date": item.registry_date.isoformat() if item.registry_date else None, "status": item.status, "notes": item.notes}
 def possession_to_dict(item): return {"id": item.id, "booking_id": item.booking_id, "possession_date": item.possession_date.isoformat() if item.possession_date else None, "status": item.status, "notes": item.notes, "handed_over_by": _actor_to_dict(item.handed_over_by)}
 
@@ -821,50 +958,52 @@ def possession_to_dict(item): return {"id": item.id, "booking_id": item.booking_
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def booking_payments(request, organization_slug, booking_id):
-    access = get_organization_access(request.user, organization_slug); booking = get_object_or_404(_bookings_for_access(access), pk=booking_id)
-    if request.method == "GET": return _simple_page(request, _sales_queryset(Payment, access).filter(booking=booking), payment_to_dict)
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); booking = get_object_or_404(_bookings_for_access(access, project), pk=booking_id)
+    if request.method == "GET": return _simple_page(request, _sales_queryset(Payment, access, project).filter(booking=booking), payment_to_dict)
     _require_inventory_management(access)
     try:
         payment = create_payment(booking=booking, amount=_decimal(request.data, "amount"), payment_method=request.data.get("payment_method"), transaction_reference=request.data.get("transaction_reference"), payment_date=_date(request.data, "payment_date"), notes=request.data.get("notes"), user=request.user)
     except (ValidationError, ValueError, TypeError) as error: return _validation_response(error)
-    return Response(payment_to_dict(_sales_queryset(Payment, access).get(pk=payment.pk), True), status=status.HTTP_201_CREATED)
+    return Response(payment_to_dict(_sales_queryset(Payment, access, project).get(pk=payment.pk), True), status=status.HTTP_201_CREATED)
 
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def payment_list(request, organization_slug):
-    return _simple_page(request, _sales_queryset(Payment, get_organization_access(request.user, organization_slug)), payment_to_dict)
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access)
+    return _simple_page(request, _sales_queryset(Payment, access, project), payment_to_dict)
 
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def payment_detail(request, organization_slug, payment_id):
     access = get_organization_access(request.user, organization_slug)
-    return Response(payment_to_dict(get_object_or_404(_sales_queryset(Payment, access), pk=payment_id), True))
+    project = get_project_context(request, access)
+    return Response(payment_to_dict(get_object_or_404(_sales_queryset(Payment, access, project), pk=payment_id), True))
 
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def payment_confirm(request, organization_slug, payment_id):
-    access = get_organization_access(request.user, organization_slug); _require_inventory_management(access); payment = get_object_or_404(_sales_queryset(Payment, access), pk=payment_id)
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_inventory_management(access); payment = get_object_or_404(_sales_queryset(Payment, access, project), pk=payment_id)
     try: payment = confirm_payment(payment=payment, user=request.user)
     except ValidationError as error: return _validation_response(error)
-    return Response(payment_to_dict(_sales_queryset(Payment, access).get(pk=payment.pk), True))
+    return Response(payment_to_dict(_sales_queryset(Payment, access, project).get(pk=payment.pk), True))
 
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def payment_fail(request, organization_slug, payment_id):
-    access = get_organization_access(request.user, organization_slug); _require_inventory_management(access); payment = get_object_or_404(_sales_queryset(Payment, access), pk=payment_id)
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_inventory_management(access); payment = get_object_or_404(_sales_queryset(Payment, access, project), pk=payment_id)
     try: payment = fail_payment(payment=payment)
     except ValidationError as error: return _validation_response(error)
-    return Response(payment_to_dict(_sales_queryset(Payment, access).get(pk=payment.pk), True))
+    return Response(payment_to_dict(_sales_queryset(Payment, access, project).get(pk=payment.pk), True))
 
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def payment_refund(request, organization_slug, payment_id):
-    access = get_organization_access(request.user, organization_slug); _require_inventory_management(access); payment = get_object_or_404(_sales_queryset(Payment, access), pk=payment_id)
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_inventory_management(access); payment = get_object_or_404(_sales_queryset(Payment, access, project), pk=payment_id)
     try: refund = refund_payment(payment=payment, amount=_decimal(request.data, "amount"), reason=str(request.data.get("reason", "")), refund_date=_date(request.data, "refund_date"), user=request.user)
     except (ValidationError, ValueError, TypeError) as error: return _validation_response(error)
     return Response({"id": refund.id, "payment_id": refund.payment_id, "amount": str(refund.amount), "refund_date": refund.refund_date.isoformat()}, status=status.HTTP_201_CREATED)
@@ -873,8 +1012,8 @@ def payment_refund(request, organization_slug, payment_id):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def booking_installments(request, organization_slug, booking_id):
-    access = get_organization_access(request.user, organization_slug); booking = get_object_or_404(_bookings_for_access(access), pk=booking_id)
-    if request.method == "GET": return _simple_page(request, _sales_queryset(Installment, access).filter(booking=booking), installment_to_dict)
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); booking = get_object_or_404(_bookings_for_access(access, project), pk=booking_id)
+    if request.method == "GET": return _simple_page(request, _sales_queryset(Installment, access, project).filter(booking=booking), installment_to_dict)
     _require_inventory_management(access)
     try: item = create_installment(booking=booking, installment_number=int(request.data.get("installment_number")), title=str(request.data.get("title", "")), due_date=_date(request.data, "due_date"), amount=_decimal(request.data, "amount"), notes=str(request.data.get("notes", "")))
     except (ValidationError, ValueError, TypeError) as error: return _validation_response(error)
@@ -884,7 +1023,7 @@ def booking_installments(request, organization_slug, booking_id):
 @api_view(["GET", "PATCH"])
 @permission_classes([IsAuthenticated])
 def installment_detail(request, organization_slug, installment_id):
-    access = get_organization_access(request.user, organization_slug); item = get_object_or_404(_sales_queryset(Installment, access), pk=installment_id)
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); item = get_object_or_404(_sales_queryset(Installment, access, project), pk=installment_id)
     if request.method == "GET": return Response(installment_to_dict(item))
     _require_inventory_management(access)
     try:
@@ -904,16 +1043,17 @@ def installment_detail(request, organization_slug, installment_id):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def installment_allocate(request, organization_slug, installment_id):
-    access = get_organization_access(request.user, organization_slug); _require_inventory_management(access); item = get_object_or_404(_sales_queryset(Installment, access), pk=installment_id)
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_inventory_management(access); item = get_object_or_404(_sales_queryset(Installment, access, project), pk=installment_id)
     try:
-        payment = get_object_or_404(_sales_queryset(Payment, access), pk=_parse_positive_id(request.data, "payment_id")); allocation = allocate_payment(payment=payment, installment=item, amount=_decimal(request.data, "amount"))
+        payment = get_object_or_404(_sales_queryset(Payment, access, project), pk=_parse_positive_id(request.data, "payment_id")); allocation = allocate_payment(payment=payment, installment=item, amount=_decimal(request.data, "amount"))
     except (ValidationError, ValueError, TypeError) as error: return _validation_response(error)
     return Response({"id": allocation.id, "payment_id": allocation.payment_id, "installment_id": allocation.installment_id, "amount": str(allocation.amount)}, status=status.HTTP_201_CREATED)
 
 
 def _legal_create_or_get(request, access, booking, model, creator, serializer):
+    project = get_project_context(request, access)
     if request.method == "GET":
-        return Response(serializer(get_object_or_404(_sales_queryset(model, access), booking=booking)))
+        return Response(serializer(get_object_or_404(_sales_queryset(model, access, project), booking=booking)))
     _require_inventory_management(access)
     try:
         if model is Agreement:
@@ -929,26 +1069,26 @@ def _legal_create_or_get(request, access, booking, model, creator, serializer):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def booking_agreement(request, organization_slug, booking_id):
-    access = get_organization_access(request.user, organization_slug); booking = get_object_or_404(_bookings_for_access(access), pk=booking_id)
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); booking = get_object_or_404(_bookings_for_access(access, project), pk=booking_id)
     return _legal_create_or_get(request, access, booking, Agreement, create_agreement, agreement_to_dict)
 
 
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def booking_registry(request, organization_slug, booking_id):
-    access = get_organization_access(request.user, organization_slug); booking = get_object_or_404(_bookings_for_access(access), pk=booking_id)
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); booking = get_object_or_404(_bookings_for_access(access, project), pk=booking_id)
     return _legal_create_or_get(request, access, booking, Registry, create_registry, registry_to_dict)
 
 
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def booking_possession(request, organization_slug, booking_id):
-    access = get_organization_access(request.user, organization_slug); booking = get_object_or_404(_bookings_for_access(access), pk=booking_id)
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); booking = get_object_or_404(_bookings_for_access(access, project), pk=booking_id)
     return _legal_create_or_get(request, access, booking, Possession, create_possession, possession_to_dict)
 
 
 def _legal_detail(request, organization_slug, item_id, model, serializer, editable, transition):
-    access = get_organization_access(request.user, organization_slug); item = get_object_or_404(_sales_queryset(model, access), pk=item_id)
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); item = get_object_or_404(_sales_queryset(model, access, project), pk=item_id)
     if request.method == "GET": return Response(serializer(item))
     _require_inventory_management(access)
     try:
@@ -973,10 +1113,10 @@ def possession_detail(request, organization_slug, possession_id): return _legal_
 
 
 def _legal_transition_view(request, organization_slug, item_id, model, service, target, serializer):
-    access = get_organization_access(request.user, organization_slug); _require_inventory_management(access); item = get_object_or_404(_sales_queryset(model, access), pk=item_id)
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_inventory_management(access); item = get_object_or_404(_sales_queryset(model, access, project), pk=item_id)
     try: item = service(**{model.__name__.lower(): item, "status": target})
     except ValidationError as error: return _validation_response(error)
-    return Response(serializer(_sales_queryset(model, access).get(pk=item.pk)))
+    return Response(serializer(_sales_queryset(model, access, project).get(pk=item.pk)))
 
 
 @api_view(["POST"])
@@ -985,6 +1125,51 @@ def agreement_ready(request, organization_slug, agreement_id): return _legal_tra
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def agreement_sign(request, organization_slug, agreement_id): return _legal_transition_view(request, organization_slug, agreement_id, Agreement, transition_agreement, Agreement.Status.SIGNED, agreement_to_dict)
+
+
+def _active_signed_copy(access, agreement_id, project):
+    agreement = get_object_or_404(_sales_queryset(Agreement, access, project), pk=agreement_id)
+    document = get_object_or_404(AgreementSignedDocument.objects.filter(agreement=agreement, superseded_at__isnull=True).order_by("-uploaded_at", "-id"))
+    return agreement, document
+
+
+@api_view(["GET", "POST"])
+@parser_classes([MultiPartParser, FormParser])
+@permission_classes([IsAuthenticated])
+def agreement_signed_copy(request, organization_slug, agreement_id):
+    access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
+    agreement = get_object_or_404(_sales_queryset(Agreement, access, project), pk=agreement_id)
+    if request.method == "GET":
+        document = get_object_or_404(AgreementSignedDocument.objects.filter(agreement=agreement, superseded_at__isnull=True).order_by("-uploaded_at", "-id"))
+        return Response({"id": document.id, "agreement_id": agreement.id, "original_filename": document.original_filename, "content_type": document.content_type, "file_size_bytes": document.file_size_bytes, "uploaded_by": _actor_to_dict(document.uploaded_by), "uploaded_at": document.uploaded_at.isoformat(), "superseded_at": document.superseded_at})
+
+    _require_inventory_management(access)
+    uploaded_file = request.FILES.get("file")
+    if not uploaded_file:
+        return _validation_response(ValidationError({"file": "A signed agreement file is required."}))
+    try:
+        content_type = validate_upload(uploaded_file, kinds=DOCUMENT_KINDS, max_bytes=10 * 1024 * 1024)
+    except ValidationError as error:
+        return _validation_response(error)
+    extension = uploaded_file.name.rsplit(".", 1)[-1].lower() if "." in uploaded_file.name else ""
+    if extension not in {"pdf", "jpg", "jpeg", "png"}:
+        return _validation_response(ValidationError({"file": "Supported signed agreement formats are PDF, JPG, and PNG."}))
+
+    with transaction.atomic():
+        AgreementSignedDocument.objects.filter(agreement=agreement, superseded_at__isnull=True).update(superseded_at=timezone.now())
+        AgreementSignedDocument.objects.create(agreement=agreement, file=uploaded_file, original_filename=uploaded_file.name, content_type=content_type, file_size_bytes=uploaded_file.size, uploaded_by=request.user)
+    return Response(agreement_to_dict(_sales_queryset(Agreement, access, project).get(pk=agreement.pk)), status=status.HTTP_201_CREATED)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def agreement_download_signed(request, organization_slug, agreement_id):
+    access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
+    agreement = get_object_or_404(_sales_queryset(Agreement, access, project), pk=agreement_id)
+    document = get_object_or_404(AgreementSignedDocument.objects.filter(agreement=agreement, superseded_at__isnull=True).order_by("-uploaded_at", "-id"))
+    return private_file_response(document.file, filename=document.original_filename)
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def agreement_cancel(request, organization_slug, agreement_id): return _legal_transition_view(request, organization_slug, agreement_id, Agreement, transition_agreement, Agreement.Status.CANCELLED, agreement_to_dict)
@@ -1010,21 +1195,29 @@ def possession_cancel(request, organization_slug, possession_id): return _legal_
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
-def installment_list(request, organization_slug): return _simple_page(request, _sales_queryset(Installment, get_organization_access(request.user, organization_slug)), installment_to_dict)
+def installment_list(request, organization_slug):
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access)
+    return _simple_page(request, _sales_queryset(Installment, access, project), installment_to_dict)
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
-def agreement_list(request, organization_slug): return _simple_page(request, _sales_queryset(Agreement, get_organization_access(request.user, organization_slug)), agreement_to_dict)
+def agreement_list(request, organization_slug):
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access)
+    return _simple_page(request, _sales_queryset(Agreement, access, project), agreement_to_dict)
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
-def registry_list(request, organization_slug): return _simple_page(request, _sales_queryset(Registry, get_organization_access(request.user, organization_slug)), registry_to_dict)
+def registry_list(request, organization_slug):
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access)
+    return _simple_page(request, _sales_queryset(Registry, access, project), registry_to_dict)
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
-def possession_list(request, organization_slug): return _simple_page(request, _sales_queryset(Possession, get_organization_access(request.user, organization_slug)), possession_to_dict)
+def possession_list(request, organization_slug):
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access)
+    return _simple_page(request, _sales_queryset(Possession, access, project), possession_to_dict)
 
 
 # Organization-level payment API.  The older inventory/payment routes above
 # remain available to existing clients.
-def _new_payment_payload(request, organization):
+def _new_payment_payload(request, organization, project):
     rows = request.data.get("booking_allocations") or request.data.get("allocations")
     # Backward-compatible single-booking shape used by older clients.
     if not rows and request.data.get("booking_id"):
@@ -1032,7 +1225,10 @@ def _new_payment_payload(request, organization):
     if not isinstance(rows, list) or not rows: raise ValidationError({"booking_allocations": "Provide at least one allocation."})
     parsed = []
     for row in rows:
-        booking = get_object_or_404(PlotBooking.objects.filter(organization=organization).select_related("plot"), pk=_parse_positive_id(row, "booking_id"))
+        booking = get_object_or_404(
+            PlotBooking.objects.filter(organization=organization, plot__project=project).select_related("plot"),
+            pk=_parse_positive_id(row, "booking_id"),
+        )
         installment = None
         charge = None
         if row.get("installment_id"):
@@ -1047,6 +1243,7 @@ def _new_payment_payload(request, organization):
 @permission_classes([IsAuthenticated])
 def managed_payments(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
     if request.method == "POST":
         _require_permission(access, "payments.add")
         try:
@@ -1055,12 +1252,12 @@ def managed_payments(request, organization_slug):
             if "payment_date" not in payload and "paymentDate" in payload: payload["payment_date"] = payload["paymentDate"]
             if "payment_mode" not in payload and "mode" in payload: payload["payment_mode"] = payload["mode"]
             request._full_data = payload
-            payment = create_allocated_payment(organization=access.organization, amount=_decimal(payload, "amount"), payment_method=payload.get("payment_mode") or payload.get("payment_method"), payment_date=_date(payload, "payment_date"), transaction_reference=payload.get("transaction_reference") or payload.get("reference_id"), notes=payload.get("remarks") or payload.get("notes"), user=request.user, allocations=_new_payment_payload(request, access.organization))
+            payment = create_allocated_payment(organization=access.organization, amount=_decimal(payload, "amount"), payment_method=payload.get("payment_mode") or payload.get("payment_method"), payment_date=_date(payload, "payment_date"), transaction_reference=payload.get("transaction_reference") or payload.get("reference_id"), notes=payload.get("remarks") or payload.get("notes"), user=request.user, allocations=_new_payment_payload(request, access.organization, project))
         except (ValidationError, ValueError, TypeError) as error: return _validation_response(error)
         log_audit(request=request, organization=access.organization, module="payments", action="payment_created", target=payment)
-        return Response(payment_to_dict(_payment_queryset(access).get(pk=payment.pk), True), status=status.HTTP_201_CREATED)
+        return Response(payment_to_dict(_payment_queryset(access, project).get(pk=payment.pk), True), status=status.HTTP_201_CREATED)
     _require_permission(access, "payments.view")
-    queryset = _payment_queryset(access)
+    queryset = _payment_queryset(access, project)
     if value := request.query_params.get("status"): queryset = queryset.filter(status=value)
     if value := request.query_params.get("payment_mode"): queryset = queryset.filter(payment_method=value)
     if value := request.query_params.get("date_from"): queryset = queryset.filter(payment_date__gte=value)
@@ -1076,19 +1273,19 @@ def managed_payments(request, organization_slug):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def managed_payment_detail(request, organization_slug, payment_id):
-    access = get_organization_access(request.user, organization_slug); _require_permission(access, "payments.view")
-    return Response(payment_to_dict(get_object_or_404(_payment_queryset(access), pk=payment_id), True))
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_permission(access, "payments.view")
+    return Response(payment_to_dict(get_object_or_404(_payment_queryset(access, project), pk=payment_id), True))
 
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def managed_payment_summary(request, organization_slug):
-    access = get_organization_access(request.user, organization_slug); _require_permission(access, "payments.view")
-    bookings = PlotBooking.objects.filter(organization=access.organization, status=PlotBooking.Status.CONFIRMED).select_related("plot")
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_permission(access, "payments.view")
+    bookings = PlotBooking.objects.filter(organization=access.organization, plot__project=project, status=PlotBooking.Status.CONFIRMED).select_related("plot")
     totals = [payment_totals(booking) for booking in bookings]
     total_dues = sum((item["final_price"] or Decimal("0") for item in totals), Decimal("0"))
     total_paid = sum((item["net_paid"] for item in totals), Decimal("0"))
-    payments = _payment_queryset(access)
+    payments = _payment_queryset(access, project)
     distribution = {value: payments.filter(status=value).count() for value, _ in Payment.Status.choices}
     last = payments.filter(status__in=[Payment.Status.SUCCESS, Payment.Status.REFUNDED]).first()
     return Response({"total_dues": str(total_dues), "total_paid": str(total_paid), "outstanding": str(max(total_dues - total_paid, Decimal("0"))), "last_payment": payment_to_dict(last) if last else None, "status_distribution": distribution})
@@ -1097,18 +1294,18 @@ def managed_payment_summary(request, organization_slug):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def managed_payment_confirm(request, organization_slug, payment_id):
-    access = get_organization_access(request.user, organization_slug); _require_permission(access, "payments.add"); payment = get_object_or_404(_payment_queryset(access), pk=payment_id)
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_permission(access, "payments.add"); payment = get_object_or_404(_payment_queryset(access, project), pk=payment_id)
     try: payment = confirm_payment(payment=payment, user=request.user)
     except ValidationError as error: return _validation_response(error)
     log_audit(request=request, organization=access.organization, module="payments", action="payment_confirmed", target=payment)
-    return Response(payment_to_dict(_payment_queryset(access).get(pk=payment.pk), True))
+    return Response(payment_to_dict(_payment_queryset(access, project).get(pk=payment.pk), True))
 
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def payment_receipt(request, organization_slug, payment_id):
-    access = get_organization_access(request.user, organization_slug); _require_permission(access, "payments.view")
-    payment = get_object_or_404(_payment_queryset(access), pk=payment_id)
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_permission(access, "payments.view")
+    payment = get_object_or_404(_payment_queryset(access, project), pk=payment_id)
     if not hasattr(payment, "receipt"): raise PermissionDenied("A receipt is available after payment confirmation.")
     return Response({"receipt_number": payment.receipt.receipt_number, "payment": payment_to_dict(payment, True)})
 
@@ -1116,7 +1313,7 @@ def payment_receipt(request, organization_slug, payment_id):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def managed_payment_refund(request, organization_slug, payment_id):
-    access = get_organization_access(request.user, organization_slug); _require_permission(access, "payments.refund"); payment = get_object_or_404(_payment_queryset(access), pk=payment_id)
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_permission(access, "payments.refund"); payment = get_object_or_404(_payment_queryset(access, project), pk=payment_id)
     try: refund = refund_payment(payment=payment, amount=_decimal(request.data, "amount"), reason=str(request.data.get("reason", "")), refund_date=_date(request.data, "refund_date"), user=request.user)
     except (ValidationError, ValueError, TypeError) as error: return _validation_response(error)
     log_audit(request=request, organization=access.organization, module="payments", action="payment_refund_requested", target=refund)
@@ -1126,8 +1323,9 @@ def managed_payment_refund(request, organization_slug, payment_id):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def payment_refund_approve(request, organization_slug, payment_id, refund_id):
-    access = get_organization_access(request.user, organization_slug); _require_permission(access, "payments.refund")
-    refund = get_object_or_404(PaymentRefund.objects.filter(organization=access.organization, payment_id=payment_id), pk=refund_id)
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_permission(access, "payments.refund")
+    payment = get_object_or_404(_payment_queryset(access, project), pk=payment_id)
+    refund = get_object_or_404(PaymentRefund.objects.filter(organization=access.organization, payment=payment), pk=refund_id)
     try: refund = approve_refund(refund=refund, user=request.user)
     except ValidationError as error: return _validation_response(error)
     log_audit(request=request, organization=access.organization, module="payments", action="payment_refunded", target=refund)
@@ -1137,8 +1335,8 @@ def payment_refund_approve(request, organization_slug, payment_id, refund_id):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def managed_payment_adjustment(request, organization_slug, payment_id):
-    access = get_organization_access(request.user, organization_slug); _require_permission(access, "payments.adjust")
-    payment = get_object_or_404(_payment_queryset(access), pk=payment_id)
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_permission(access, "payments.adjust")
+    payment = get_object_or_404(_payment_queryset(access, project), pk=payment_id)
     try: adjustment = adjust_payment(payment=payment, amount=_decimal(request.data, "amount"), reason=str(request.data.get("reason", "")), user=request.user)
     except (ValidationError, ValueError, TypeError) as error: return _validation_response(error)
     log_audit(request=request, organization=access.organization, module="payments", action="payment_adjusted", target=adjustment)
@@ -1148,29 +1346,29 @@ def managed_payment_adjustment(request, organization_slug, payment_id):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def customer_payment_history(request, organization_slug, customer_id):
-    access = get_organization_access(request.user, organization_slug); _require_permission(access, "payments.view")
-    get_object_or_404(Lead.objects.filter(organization=access.organization), pk=customer_id)
-    return _simple_page(request, _payment_queryset(access).filter(payment_allocations__booking__lead_id=customer_id).distinct(), payment_to_dict)
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_permission(access, "payments.view")
+    get_object_or_404(Lead.objects.filter(organization=access.organization, project=project), pk=customer_id)
+    return _simple_page(request, _payment_queryset(access, project).filter(payment_allocations__booking__lead_id=customer_id).distinct(), payment_to_dict)
 
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def customer_payment_ledger(request, organization_slug, customer_id):
-    access = get_organization_access(request.user, organization_slug); _require_permission(access, "payments.view")
-    customer = get_object_or_404(Lead.objects.filter(organization=access.organization), pk=customer_id)
-    bookings = PlotBooking.objects.filter(organization=access.organization, lead=customer, status=PlotBooking.Status.CONFIRMED)
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_permission(access, "payments.view")
+    customer = get_object_or_404(Lead.objects.filter(organization=access.organization, project=project), pk=customer_id)
+    bookings = PlotBooking.objects.filter(organization=access.organization, plot__project=project, lead=customer, status=PlotBooking.Status.CONFIRMED)
     totals = [payment_totals(item) for item in bookings]
     due = sum((item["final_price"] or Decimal("0") for item in totals), Decimal("0")); paid = sum((item["net_paid"] for item in totals), Decimal("0"))
-    entries = [{"date": p.payment_date.isoformat(), "type": "payment", "reference": p.payment_id, "credit": str(p.amount), "debit": "0.00"} for p in _payment_queryset(access).filter(payment_allocations__booking__lead=customer, status__in=[Payment.Status.SUCCESS, Payment.Status.REFUNDED]).distinct()]
+    entries = [{"date": p.payment_date.isoformat(), "type": "payment", "reference": p.payment_id, "credit": str(p.amount), "debit": "0.00"} for p in _payment_queryset(access, project).filter(payment_allocations__booking__lead=customer, status__in=[Payment.Status.SUCCESS, Payment.Status.REFUNDED]).distinct()]
     return Response({"customer": {"id": customer.id, "name": customer.full_name}, "opening_balance": "0.00", "total_dues": str(due), "total_paid": str(paid), "current_outstanding": str(max(due - paid, Decimal("0"))), "entries": entries})
 
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def customer_dues(request, organization_slug, customer_id):
-    access = get_organization_access(request.user, organization_slug); _require_permission(access, "payments.view")
-    customer = get_object_or_404(Lead.objects.filter(organization=access.organization), pk=customer_id)
-    bookings = PlotBooking.objects.filter(organization=access.organization, lead=customer, status=PlotBooking.Status.CONFIRMED).select_related("plot", "plot__block").prefetch_related("installments")
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_permission(access, "payments.view")
+    customer = get_object_or_404(Lead.objects.filter(organization=access.organization, project=project), pk=customer_id)
+    bookings = PlotBooking.objects.filter(organization=access.organization, plot__project=project, lead=customer, status=PlotBooking.Status.CONFIRMED).select_related("plot", "plot__block").prefetch_related("installments")
     rows = []
     for booking in bookings:
         summary = payment_totals(booking)
@@ -1183,32 +1381,125 @@ def customer_dues(request, organization_slug, customer_id):
     return Response({"customer": {"id": customer.id, "name": customer.full_name}, "results": rows})
 
 
-def _registry_queryset(access):
-    return Registry.objects.filter(organization=access.organization).select_related("booking__lead", "booking__plot__block", "created_by").prefetch_related("charges", "status_history__changed_by")
+def _registry_queryset(access, project=None):
+    queryset = Registry.objects.filter(organization=access.organization)
+    if project is not None:
+        queryset = queryset.filter(booking__plot__project=project)
+    return queryset.select_related("booking__lead", "booking__plot__block", "created_by").prefetch_related("charges", "status_history__changed_by")
 
 
 def managed_registry_to_dict(item, detailed=False):
     charges = list(item.charges.all())
     total = sum((charge.amount for charge in charges), Decimal("0"))
     paid = PaymentAllocation.objects.filter(registry_charge__registry=item, payment__status__in=[Payment.Status.SUCCESS, Payment.Status.REFUNDED]).aggregate(total=Sum("amount"))["total"] or Decimal("0")
-    data = {"id": item.id, "registry_id": item.registry_number or f"REG-{item.id}", "status": item.status, "registry_number": item.registry_number, "registry_date": item.registry_date.isoformat() if item.registry_date else None, "booking": {"id": item.booking_id, "customer": {"id": item.booking.lead_id, "name": item.booking.lead.full_name}, "plot": {"id": item.booking.plot_id, "plot_number": item.booking.plot.plot_number, "block": item.booking.plot.block.name}}, "total_charges": str(total), "paid_amount": str(paid), "pending_amount": str(max(total - paid, Decimal("0")))}
+    charge_values = {charge.code: charge.amount for charge in charges}
+    data = {"id": item.id, "registry_id": item.registry_number or f"REG-{item.id}", "status": item.status, "registry_number": item.registry_number, "registry_date": item.registry_date.isoformat() if item.registry_date else None, "booking_id": item.booking_id, "customer_id": item.booking.lead_id, "buyer_name": item.booking.lead.full_name, "buyer_mobile": item.booking.lead.phone, "buyer_email": item.booking.lead.email, "plot_id": item.booking.plot_id, "plot_number": item.booking.plot.plot_number, "block_name": item.booking.plot.block.name, "consideration_amount": str(item.consideration_amount) if item.consideration_amount is not None else None, "booking": {"id": item.booking_id, "customer": {"id": item.booking.lead_id, "name": item.booking.lead.full_name}, "plot": {"id": item.booking.plot_id, "plot_number": item.booking.plot.plot_number, "block": item.booking.plot.block.name}}, "charges": {"stamp_duty": str(charge_values.get("stamp_duty", 0)), "registration_charges": str(charge_values.get("registration_charges", 0)), "legal_fees": str(charge_values.get("legal_fees", 0)), "miscellaneous": str(charge_values.get("miscellaneous", 0)), "tds": str(charge_values.get("tds", 0)), "total_charges": str(total), "paid_amount": str(paid), "pending_amount": str(max(total - paid, Decimal("0")))}, "total_charges": str(total), "paid_amount": str(paid), "pending_amount": str(max(total - paid, Decimal("0")))}
     if detailed: data.update({"registry_time": item.registry_time.isoformat() if item.registry_time else None, "sub_registrar_office": item.sub_registrar_office, "document_type": item.document_type, "consideration_amount": str(item.consideration_amount) if item.consideration_amount is not None else None, "agreement_number": item.agreement_number, "agreement_date": item.agreement_date.isoformat() if item.agreement_date else None, "notes": item.notes, "reminder_date": item.reminder_date.isoformat() if item.reminder_date else None, "reminder_enabled": item.reminder_enabled, "charges": [{"id": c.id, "code": c.code, "label": c.label, "calculation_type": c.calculation_type, "calculation_value": str(c.calculation_value), "amount": str(c.amount)} for c in charges], "history": [{"status": h.new_status, "old_status": h.old_status, "remarks": h.remarks, "changed_at": h.changed_at.isoformat(), "actor": _actor_to_dict(h.changed_by)} for h in item.status_history.all()]})
     return data
+
+
+def registry_document_to_dict(document):
+    customer_document = document.customer_document
+    return {"id": document.id, "registry_id": document.registry_id, "document_label": document.document_label, "document_type": document.document_type, "source": document.source, "original_filename": document.original_filename or (customer_document.file_name if customer_document else None), "content_type": document.content_type or (customer_document.content_type if customer_document else None), "file_size": document.file_size_bytes or (customer_document.file_size if customer_document else 0), "uploaded_by": _actor_to_dict(document.uploaded_by), "created_at": document.created_at.isoformat(), "download_url": f"/api/organizations/{document.registry.organization.slug}/registries/{document.registry_id}/documents/{document.id}/download/", "customer_document": ({"id": customer_document.id, "document_name": customer_document.document_name, "file_name": customer_document.file_name, "content_type": customer_document.content_type} if customer_document else None)}
+
+
+def _registry_documents_queryset(access, project, registry_id):
+    registry = get_object_or_404(_registry_queryset(access, project), pk=registry_id)
+    return registry, RegistryDocument.objects.filter(registry=registry).select_related("customer_document", "uploaded_by", "registry__organization")
+
+
+@api_view(["GET", "POST"])
+@parser_classes([MultiPartParser, FormParser])
+@permission_classes([IsAuthenticated])
+def managed_registry_documents(request, organization_slug, registry_id):
+    access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
+    registry, queryset = _registry_documents_queryset(access, project, registry_id)
+    if request.method == "GET":
+        results = [registry_document_to_dict(document) for document in queryset]
+        return Response({"count": len(results), "results": results})
+
+    _require_permission(access, "registry.edit")
+    customer_document_id = request.data.get("customer_document_id")
+    customer_document = None
+    uploaded_file = request.FILES.get("file")
+    if customer_document_id:
+        customer_document = get_object_or_404(
+            CustomerDocument.objects.filter(
+                organization=access.organization,
+                customer=registry.booking.lead,
+                customer__project=project,
+                pk=customer_document_id,
+            )
+        )
+    elif not uploaded_file:
+        return _validation_response(ValidationError({"file": "Attach a file or select an existing customer document."}))
+    content_type = ""
+    if uploaded_file:
+        try:
+            content_type = validate_upload(uploaded_file, kinds=DOCUMENT_KINDS, max_bytes=10 * 1024 * 1024)
+        except ValidationError as error:
+            return _validation_response(error)
+
+    document = RegistryDocument(
+        registry=registry,
+        customer_document=customer_document,
+        file=uploaded_file,
+        document_label=str(request.data.get("document_label", "Customer Document" if customer_document else uploaded_file.name)).strip(),
+        document_type=str(request.data.get("document_type", "other")).strip() or "other",
+        original_filename=uploaded_file.name if uploaded_file else "",
+        content_type=content_type,
+        file_size_bytes=uploaded_file.size if uploaded_file else 0,
+        uploaded_by=request.user,
+    )
+    try:
+        document.full_clean()
+        document.save()
+    except ValidationError as error:
+        return _validation_response(error)
+    return Response(registry_document_to_dict(document), status=status.HTTP_201_CREATED)
+
+
+@api_view(["DELETE"])
+@permission_classes([IsAuthenticated])
+def managed_registry_document_delete(request, organization_slug, registry_id, document_id):
+    access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
+    registry, queryset = _registry_documents_queryset(access, project, registry_id)
+    _require_permission(access, "registry.edit")
+    document = get_object_or_404(queryset, pk=document_id)
+    document.delete()
+    return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def managed_registry_document_download(request, organization_slug, registry_id, document_id):
+    access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
+    _registry, queryset = _registry_documents_queryset(access, project, registry_id)
+    document = get_object_or_404(queryset, pk=document_id)
+    if document.file:
+        return private_file_response(document.file, filename=document.original_filename or os.path.basename(document.file.name))
+    if document.customer_document_id:
+        return private_file_response(document.customer_document.file, filename=document.customer_document.file_name)
+    raise Http404("File not found.")
 
 
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def managed_registries(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
     if request.method == "POST":
         _require_permission(access, "registry.add")
-        booking = get_object_or_404(PlotBooking.objects.filter(organization=access.organization), pk=_parse_positive_id(request.data, "booking_id"))
+        booking = get_object_or_404(_bookings_for_access(access, project), pk=_parse_positive_id(request.data, "booking_id"))
         try:
             item = create_registry(booking=booking, registry_number=str(request.data.get("registry_number", "")).strip(), registry_date=_date(request.data, "registry_date", False), registry_time=request.data.get("registry_time") or None, sub_registrar_office=str(request.data.get("sub_registrar_office", "")), document_type=str(request.data.get("document_type", "")), consideration_amount=_decimal(request.data, "consideration_amount") if request.data.get("consideration_amount") else None, agreement_number=str(request.data.get("agreement_number", "")), agreement_date=_date(request.data, "agreement_date", False), notes=str(request.data.get("notes", "")), reminder_date=_date(request.data, "reminder_date", False), reminder_enabled=bool(request.data.get("reminder_enabled", False)), created_by=request.user)
         except (ValidationError, ValueError, TypeError) as error: return _validation_response(error)
         log_audit(request=request, organization=access.organization, module="registry", action="registry_created", target=item)
-        return Response(managed_registry_to_dict(_registry_queryset(access).get(pk=item.pk), True), status=status.HTTP_201_CREATED)
-    _require_permission(access, "registry.view"); queryset = _registry_queryset(access)
+        return Response(managed_registry_to_dict(_registry_queryset(access, project).get(pk=item.pk), True), status=status.HTTP_201_CREATED)
+    _require_permission(access, "registry.view"); queryset = _registry_queryset(access, project)
     if value := request.query_params.get("status"): queryset = queryset.filter(status=value)
     if value := request.query_params.get("plot"): queryset = queryset.filter(booking__plot_id=value)
     if value := request.query_params.get("block"): queryset = queryset.filter(booking__plot__block_id=value)
@@ -1223,7 +1514,7 @@ def managed_registries(request, organization_slug):
 @api_view(["GET", "PATCH"])
 @permission_classes([IsAuthenticated])
 def managed_registry_detail(request, organization_slug, registry_id):
-    access = get_organization_access(request.user, organization_slug); item = get_object_or_404(_registry_queryset(access), pk=registry_id)
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); item = get_object_or_404(_registry_queryset(access, project), pk=registry_id)
     if request.method == "GET": _require_permission(access, "registry.view"); return Response(managed_registry_to_dict(item, True))
     _require_permission(access, "registry.edit")
     if "status" in request.data: return _validation_response(ValidationError({"status": "Use the status endpoint."}))
@@ -1236,23 +1527,23 @@ def managed_registry_detail(request, organization_slug, registry_id):
         item.full_clean(); item.save()
     except (ValidationError, ValueError, TypeError) as error: return _validation_response(error)
     log_audit(request=request, organization=access.organization, module="registry", action="registry_updated", target=item)
-    return Response(managed_registry_to_dict(_registry_queryset(access).get(pk=item.pk), True))
+    return Response(managed_registry_to_dict(_registry_queryset(access, project).get(pk=item.pk), True))
 
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def managed_registry_status(request, organization_slug, registry_id):
-    access = get_organization_access(request.user, organization_slug); _require_permission(access, "registry.status"); item = get_object_or_404(_registry_queryset(access), pk=registry_id)
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_permission(access, "registry.status"); item = get_object_or_404(_registry_queryset(access, project), pk=registry_id)
     target = request.data.get("status")
     try: item = transition_registry(registry=item, status=target, user=request.user, remarks=str(request.data.get("remarks", "")))
     except ValidationError as error: return _validation_response(error)
     log_audit(request=request, organization=access.organization, module="registry", action="registry_status_changed", target=item, details={"status": target})
-    return Response(managed_registry_to_dict(_registry_queryset(access).get(pk=item.pk), True))
+    return Response(managed_registry_to_dict(_registry_queryset(access, project).get(pk=item.pk), True))
 
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def managed_registry_history(request, organization_slug, registry_id):
-    access = get_organization_access(request.user, organization_slug); _require_permission(access, "registry.view")
-    item = get_object_or_404(_registry_queryset(access), pk=registry_id)
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_permission(access, "registry.view")
+    item = get_object_or_404(_registry_queryset(access, project), pk=registry_id)
     return Response({"results": [{"action": h.new_status, "old_status": h.old_status, "remarks": h.remarks, "performed_by": _actor_to_dict(h.changed_by), "timestamp": h.changed_at.isoformat()} for h in item.status_history.all()]})

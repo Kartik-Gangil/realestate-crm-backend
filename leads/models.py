@@ -15,6 +15,7 @@ class Lead(models.Model):
         WALKIN = "walk_in", "Walk-in"
 
     organization = models.ForeignKey("organizations.Organization", on_delete=models.CASCADE, related_name="leads")
+    project = models.ForeignKey("inventory.Project", null=True, blank=True, on_delete=models.SET_NULL, related_name="leads")
     first_name = models.CharField(max_length=100)
     last_name = models.CharField(max_length=100, blank=True)
     occupation = models.CharField(max_length=100, blank=True)
@@ -66,6 +67,7 @@ class Sitevisit(models.Model):
         OTHER = "other", "Other"
 
     organization = models.ForeignKey("organizations.Organization" , on_delete=models.CASCADE, related_name="site_visit")
+    project = models.ForeignKey("inventory.Project", null=True, blank=True, on_delete=models.SET_NULL, related_name="site_visits")
     lead = models.ForeignKey(Lead, on_delete=models.CASCADE,related_name="site_visit")
     # An organization membership is the project's existing representation of a team member/executive.
     executive_membership = models.ForeignKey("organizations.OrganizationMembership", null=True, blank=True, on_delete=models.SET_NULL, related_name="site_visits")
@@ -90,6 +92,10 @@ class Sitevisit(models.Model):
     def clean(self): 
         if self.lead_id and self.organization_id != self.lead.organization_id: 
             raise ValidationError({"organization": "Site visit organization must match the lead organization."})
+        if self.project_id and self.project.organization_id != self.organization_id:
+            raise ValidationError({"project": "Project must belong to the site visit organization."})
+        if self.lead_id and self.project_id and self.lead.project_id and self.project_id != self.lead.project_id:
+            raise ValidationError({"project": "Project must match the lead project."})
         if self.executive_membership_id and self.executive_membership.organization_id != self.organization_id:
             raise ValidationError({"executive_membership": "Executive must belong to this organization."})
         if self.duration_minutes is not None and self.duration_minutes == 0:
@@ -183,6 +189,12 @@ class FollowUpCall(models.Model):
         WON = "won", "Won"
         LOST = "lost", "Lost"
     class Outcome(models.TextChoices):
+        INTERESTED = "Interested", "Interested"
+        CALLBACK_LATER = "Callback Later", "Callback Later"
+        SWITCHED_OFF = "Switched Off", "Switched Off"
+        WRONG_NUMBER = "Wrong Number", "Wrong Number"
+        DND = "DND", "DND"
+        ALREADY_PURCHASED = "Already Purchased", "Already Purchased"
         CONNECTED = "connected", "Connected"
         NO_ANSWER = "no_answer", "No answer"
         BUSY = "busy", "Busy"
@@ -198,6 +210,7 @@ class FollowUpCall(models.Model):
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.NEW)
     next_follow_up = models.DateTimeField(null=True, blank=True)
     called_at = models.DateTimeField(null=True, blank=True)
+    call_recording = models.FileField(upload_to="call_recordings/%Y/%m/", null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

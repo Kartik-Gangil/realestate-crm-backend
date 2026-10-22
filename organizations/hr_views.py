@@ -28,6 +28,7 @@ def _dict_employee(employee):
 
 def _role(role):
     return {"id": role.id, "name": role.name, "code": role.code, "is_system": role.is_system,
+            "permission_ids": list(role.permissions.values_list("id", flat=True)),
             "permissions": [item.code for item in role.permissions.all()]}
 
 
@@ -87,7 +88,14 @@ def role_detail(request, organization_slug, role_id):
 @permission_classes([IsAuthenticated])
 def permissions(request, organization_slug):
     get_organization_access(request.user, organization_slug)
-    return Response([{"id": item.id, "code": item.code, "name": item.name} for item in Permission.objects.all()])
+    return Response([{
+        "id": item.id,
+        "module": item.module,
+        "action": item.action,
+        "code": item.code,
+        "name": item.name,
+        "actions": [item.action],
+    } for item in Permission.objects.all()])
 
 
 def _attendance(record):

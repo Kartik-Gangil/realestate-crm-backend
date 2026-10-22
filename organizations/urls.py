@@ -10,6 +10,7 @@ urlpatterns = [
     path("organizations/<slug:slug>/my-tab-permissions/", views.my_tab_permissions, name="my-tab-permissions"),
     path("organizations/<slug:organization_slug>/employees/", employee_views.employee_list, name="employee-list"),
     path("organizations/<slug:organization_slug>/employees/<int:employee_id>/", employee_views.employee_detail, name="employee-detail"),
+    path("organizations/<slug:organization_slug>/employees/<int:employee_id>/photo/", employee_views.employee_photo, name="employee-photo"),
     path("organizations/<slug:organization_slug>/employees/<int:employee_id>/activate/", employee_views.employee_activate, name="employee-activate"),
     path("organizations/<slug:organization_slug>/employees/<int:employee_id>/deactivate/", employee_views.employee_deactivate, name="employee-deactivate"),
     path("organizations/<slug:organization_slug>/employees/<int:employee_id>/reset-password/", employee_views.employee_reset_password, name="employee-reset-password"),

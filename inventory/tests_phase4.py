@@ -32,6 +32,7 @@ class PlotBookingApiTests(TestCase):
         self.other_visit = Sitevisit.objects.create(organization=self.organization, lead=Lead.objects.create(organization=self.organization, first_name="Other", phone="333"))
         self.client = APIClient()
         self.client.force_authenticate(self.manager)
+        self.client.defaults["HTTP_X_PROJECT_ID"] = str(self.project.id)
 
     def plot(self, number="A-101", status=Plot.Status.AVAILABLE, organization=None):
         organization = organization or self.organization

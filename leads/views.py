@@ -14,7 +14,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from organizations.models import OrganizationMembership
-from organizations.services import get_organization_access, has_permission
+from organizations.services import get_organization_access, get_project_context, has_permission
 from .models import FollowUpCall, Lead , Sitevisit , SitevisitReschedule
 from .serializers import (
     follow_up_to_dict,
@@ -89,13 +89,14 @@ def _parse_time(value, field_name):
     return parsed
 
 
-def _site_visits_for_access(access, leads):
-    return Sitevisit.objects.filter(
+def _site_visits_for_access(access, leads, project=None):
+    visits = Sitevisit.objects.filter(
         organization=access.organization,
         lead__in=leads,
     ).select_related(
         "organization", "lead", "executive_membership__user", "created_by"
     ).prefetch_related("reschedules")
+    return visits.filter(project=project) if project is not None else visits
 
 
 def _schedule_validation(visit_date, visit_time):
@@ -151,14 +152,49 @@ def _reschedule_site_visit(site_visit, new_date, new_time, reason=None):
     site_visit.save(update_fields=["visit_date", "visit_time", "status", "updated_at"])
     return reschedule
 
-def _leads_for_access(access):
+def _leads_for_access(access, project=None):
     leads = Lead.objects.filter(organization=access.organization).select_related("organization", "assigned_membership__user")
+    if project is not None:
+        leads = leads.filter(project=project)
     return leads if access.can_view_all_leads else leads.filter(assigned_membership=access.membership)
 
 
 def _require_lead_management(access):
     if not access.is_platform and not has_permission(access.membership.user, access.organization, "leads.edit"):
         raise PermissionDenied("Only managers, organization admins, and authorized platform users can manage leads.")
+
+
+def _normalise_phone(value):
+    return "".join(character for character in str(value or "") if character.isdigit())
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def check_duplicate_lead(request, organization_slug):
+    access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
+    phone = _normalise_phone(request.data.get("phone"))
+    email = str(request.data.get("email") or "").strip().lower()
+    if not phone and not email:
+        return Response({"matches": []})
+
+    # Duplicate detection is project-scoped and must include leads owned by
+    # another caller; otherwise a newly entered lead can bypass the warning.
+    leads = Lead.objects.filter(organization=access.organization, project=project).order_by("id")
+    matches = []
+    for lead in leads:
+        phone_match = bool(phone and _normalise_phone(lead.phone) == phone)
+        email_match = bool(email and lead.email and lead.email.strip().lower() == email)
+        if phone_match or email_match:
+            matches.append({
+                "id": lead.id,
+                "name": lead.full_name,
+                "full_name": lead.full_name,
+                "phone": lead.phone,
+                "email": lead.email,
+                "confidence": 95 if phone_match else 80,
+            })
+    return Response({"matches": matches})
 
 
 def _apply_payload(lead, payload, organization, partial=False, save=True):
@@ -192,6 +228,14 @@ def _validation_response(error):
     return Response(details, status=status.HTTP_400_BAD_REQUEST)
 
 def _create_pending_follow_up(lead, telecaller):
+    existing = FollowUpCall.objects.filter(
+        organization=lead.organization,
+        lead=lead,
+        telecaller_membership=telecaller,
+        called_at__isnull=True,
+    ).order_by("created_at", "id").first()
+    if existing is not None:
+        return existing
     return FollowUpCall.objects.create(organization=lead.organization, lead=lead, telecaller_membership=telecaller, note="", outcome="", called_at=None)
 
 
@@ -222,10 +266,12 @@ def _update_follow_up_result(call, payload):
 def remove_assignment_of_lead(request ,organization_slug):
     """Remove current assignments from all assigned leads."""
     access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
     _require_lead_management(access)
 
     leads = Lead.objects.filter(
         organization=access.organization,
+        project=project,
         assigned_membership__isnull=False,
     )
 
@@ -246,8 +292,9 @@ def remove_assignment_of_lead(request ,organization_slug):
 def assign_lead(request, organization_slug, lead_id):
     """Assign or reassign one organization lead to an active telecaller."""
     access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
     _require_lead_management(access)
-    lead = get_object_or_404(Lead.objects.filter(organization=access.organization), pk=lead_id)
+    lead = get_object_or_404(Lead.objects.filter(organization=access.organization, project=project), pk=lead_id)
     membership_id = request.data.get("telecaller_membership")
     if not membership_id:
         return Response({"telecaller_membership": ["This field is required."]}, status=status.HTTP_400_BAD_REQUEST)
@@ -399,17 +446,20 @@ def import_leads_csv(request, organization_slug):
 @permission_classes([IsAuthenticated])
 def lead_list(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
     if request.method == "POST":
         _require_lead_management(access)
         try:
             lead = _apply_payload(Lead(), request.data, access.organization)
+            lead.project = project
+            lead.save()
         except (ValidationError, ValueError, TypeError) as error:
             return _validation_response(error)
         if lead.assigned_membership_id:
             _create_pending_follow_up(lead, lead.assigned_membership)
         return Response(lead_to_dict(lead), status=status.HTTP_201_CREATED)
 
-    leads = _leads_for_access(access)
+    leads = _leads_for_access(access, project)
     latest_follow_up = FollowUpCall.objects.filter(lead=OuterRef("pk")).order_by("-created_at")
     # Add latest follow-up status to every lead
     leads = leads.annotate(
@@ -450,7 +500,8 @@ def lead_list(request, organization_slug):
 @permission_classes([IsAuthenticated])
 def lead_detail(request, organization_slug, lead_id):
     access = get_organization_access(request.user, organization_slug)
-    lead = get_object_or_404(_leads_for_access(access), pk=lead_id)
+    project = get_project_context(request, access)
+    lead = get_object_or_404(_leads_for_access(access, project), pk=lead_id)
 
     if request.method == "GET":
         return Response(lead_to_dict(lead, include_follow_ups=True))
@@ -503,7 +554,7 @@ def follow_up_list(request, organization_slug, lead_id):
     access = get_organization_access(request.user, organization_slug)
     lead = get_object_or_404(_leads_for_access(access), pk=lead_id)
     if request.method == "GET":
-        calls = lead.follow_up_calls.select_related("telecaller_membership__user").all()
+        calls = lead.follow_up_calls.select_related("telecaller_membership__user").order_by("-called_at", "-id")
         if status_filter := request.query_params.get("status"):
             calls = calls.filter(status=status_filter)
         return Response({"count": calls.count(), "results": [follow_up_to_dict(call) for call in calls]})
@@ -564,10 +615,11 @@ def assign_leads_round_robin_view(request, organization_slug):
 def sitevisit_dashboard(request, organization_slug):
     """List or schedule visits. Dates are kept as database fields for calendar queries."""
     access = get_organization_access(request.user, organization_slug)
-    leads = _leads_for_access(access)
+    project = get_project_context(request, access)
+    leads = _leads_for_access(access, project)
     if request.method == "GET":
         try:
-            site_visits = _filter_site_visits(_site_visits_for_access(access, leads), request.query_params)
+            site_visits = _filter_site_visits(_site_visits_for_access(access, leads, project), request.query_params)
         except ValidationError as exc:
             return _validation_response(exc)
         return Response({
@@ -594,7 +646,7 @@ def sitevisit_dashboard(request, organization_slug):
         # duration = int(request.data["duration_minutes"])
         with transaction.atomic():
             site_visit = Sitevisit(
-                organization=access.organization, lead=lead, executive_membership=executive,
+                organization=access.organization, project=project, lead=lead, executive_membership=executive,
                 visit_date=visit_date, visit_time=visit_time, duration_minutes=1,
                 site=request.data.get("site"), location=request.data.get("location"),
                 customer_preference=request.data.get("customer_preference"), notes=request.data.get("notes"),
@@ -611,7 +663,8 @@ def sitevisit_dashboard(request, organization_slug):
 @permission_classes([IsAuthenticated])
 def rescheduledSitevisit(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
-    leads = _leads_for_access(access)
+    project = get_project_context(request, access)
+    leads = _leads_for_access(access, project)
 
     if request.method == "GET":
         rescheduled_sitevisits = SitevisitReschedule.objects.select_related(
@@ -621,6 +674,7 @@ def rescheduledSitevisit(request, organization_slug):
         ).filter(
             site_visit__organization=access.organization,
             site_visit__lead__in=leads,
+            site_visit__project=project,
         )
         return Response({
             "organization": access.organization.slug,
@@ -715,7 +769,8 @@ def _get_site_visit_or_404(access, leads, site_visit_id, for_update=False):
 @permission_classes([IsAuthenticated])
 def sitevisit_detail(request, organization_slug, site_visit_id):
     access = get_organization_access(request.user, organization_slug)
-    leads = _leads_for_access(access)
+    project = get_project_context(request, access)
+    leads = _leads_for_access(access, project)
     if request.method == "GET":
         visit = _get_site_visit_or_404(access, leads, site_visit_id)
         return Response(site_visit_to_dict(visit, include_history=True))
@@ -752,7 +807,8 @@ def sitevisit_detail(request, organization_slug, site_visit_id):
 def sitevisit_reschedule(request, organization_slug, site_visit_id):
     """Resource-oriented reschedule endpoint; the legacy collection endpoint remains supported."""
     access = get_organization_access(request.user, organization_slug)
-    leads = _leads_for_access(access)
+    project = get_project_context(request, access)
+    leads = _leads_for_access(access, project)
     try:
         new_date = _parse_date(request.data.get("new_date"), "new_date")
         new_time = _parse_time(request.data.get("new_time"), "new_time")
@@ -772,7 +828,8 @@ def sitevisit_reschedule(request, organization_slug, site_visit_id):
 @permission_classes([IsAuthenticated])
 def sitevisit_cancel(request, organization_slug, site_visit_id):
     access = get_organization_access(request.user, organization_slug)
-    leads = _leads_for_access(access)
+    project = get_project_context(request, access)
+    leads = _leads_for_access(access, project)
     reason = str(request.data.get("cancellation_reason", "")).strip()
     if not reason:
         return Response({"cancellation_reason": "This field is required."}, status=status.HTTP_400_BAD_REQUEST)
@@ -796,7 +853,8 @@ def sitevisit_cancel(request, organization_slug, site_visit_id):
 @permission_classes([IsAuthenticated])
 def sitevisit_no_show(request, organization_slug, site_visit_id):
     access = get_organization_access(request.user, organization_slug)
-    leads = _leads_for_access(access)
+    project = get_project_context(request, access)
+    leads = _leads_for_access(access, project)
     try:
         after_minutes = int(request.data.get("after_minutes", 15))
         if not 0 <= after_minutes <= 1440:
@@ -826,7 +884,8 @@ def sitevisit_no_show(request, organization_slug, site_visit_id):
 @permission_classes([IsAuthenticated])
 def sitevisit_outcome(request, organization_slug, site_visit_id):
     access = get_organization_access(request.user, organization_slug)
-    leads = _leads_for_access(access)
+    project = get_project_context(request, access)
+    leads = _leads_for_access(access, project)
     outcome = request.data.get("outcome")
     if outcome not in Sitevisit.Outcome.values:
         return Response({"outcome": "Use a valid outcome."}, status=status.HTTP_400_BAD_REQUEST)
@@ -852,7 +911,8 @@ def sitevisit_outcome(request, organization_slug, site_visit_id):
 @permission_classes([IsAuthenticated])
 def sitevisit_history(request, organization_slug, site_visit_id):
     access = get_organization_access(request.user, organization_slug)
-    visit = _get_site_visit_or_404(access, _leads_for_access(access), site_visit_id)
+    project = get_project_context(request, access)
+    visit = _get_site_visit_or_404(access, _leads_for_access(access, project), site_visit_id)
     return Response(site_visit_to_dict(visit, include_history=True))
 
 
@@ -860,8 +920,9 @@ def sitevisit_history(request, organization_slug, site_visit_id):
 @permission_classes([IsAuthenticated])
 def lead_sitevisits(request, organization_slug, lead_id):
     access = get_organization_access(request.user, organization_slug)
-    lead = get_object_or_404(_leads_for_access(access), pk=lead_id)
-    visits = _site_visits_for_access(access, _leads_for_access(access)).filter(lead=lead).order_by("-visit_date", "-visit_time", "-id")
+    project = get_project_context(request, access)
+    lead = get_object_or_404(_leads_for_access(access, project), pk=lead_id)
+    visits = _site_visits_for_access(access, _leads_for_access(access, project), project).filter(lead=lead).order_by("-visit_date", "-visit_time", "-id")
     return Response({"lead": lead_to_dict(lead), "count": visits.count(), "results": [site_visit_to_dict(visit) for visit in visits]})
 
 
@@ -880,7 +941,8 @@ def _paginate(queryset, params):
 @permission_classes([IsAuthenticated])
 def sitevisit_upcoming(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
-    visits = _site_visits_for_access(access, _leads_for_access(access)).filter(
+    project = get_project_context(request, access)
+    visits = _site_visits_for_access(access, _leads_for_access(access, project), project).filter(
         visit_date__gte=timezone.localdate(),
         status__in=[Sitevisit.Status.SCHEDULED, Sitevisit.Status.UPCOMING, Sitevisit.Status.RESCHEDULED],
     ).order_by("visit_date", "visit_time", "id")
@@ -898,7 +960,8 @@ def sitevisit_upcoming(request, organization_slug):
 @permission_classes([IsAuthenticated])
 def sitevisit_today(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
-    visits = _site_visits_for_access(access, _leads_for_access(access)).filter(visit_date=timezone.localdate())
+    project = get_project_context(request, access)
+    visits = _site_visits_for_access(access, _leads_for_access(access, project), project).filter(visit_date=timezone.localdate())
     if executive := request.query_params.get("executive"):
         visits = visits.filter(executive_membership_id=executive)
     return Response({"date": timezone.localdate().isoformat(), "count": visits.count(), "results": [site_visit_to_dict(visit) for visit in visits.order_by("visit_time", "id")]})
@@ -908,8 +971,9 @@ def sitevisit_today(request, organization_slug):
 @permission_classes([IsAuthenticated])
 def sitevisit_calendar(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
     try:
-        visits = _filter_site_visits(_site_visits_for_access(access, _leads_for_access(access)), request.query_params)
+        visits = _filter_site_visits(_site_visits_for_access(access, _leads_for_access(access, project), project), request.query_params)
         if not request.query_params.get("start_date") and not request.query_params.get("month"):
             raise ValidationError({"start_date": "Provide start_date/end_date or month for calendar data."})
     except ValidationError as exc:
@@ -927,8 +991,9 @@ def sitevisit_calendar(request, organization_slug):
 @permission_classes([IsAuthenticated])
 def sitevisit_analytics(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
     try:
-        visits = _filter_site_visits(_site_visits_for_access(access, _leads_for_access(access)), request.query_params)
+        visits = _filter_site_visits(_site_visits_for_access(access, _leads_for_access(access, project), project), request.query_params)
     except ValidationError as exc:
         return _validation_response(exc)
     summary = visits.aggregate(total_visits=Count("id"), average_interest_level=Avg("interest_level"))
