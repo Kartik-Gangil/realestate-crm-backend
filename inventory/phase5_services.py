@@ -10,6 +10,7 @@ from django.utils import timezone
 from .models import (Agreement, AgreementSignedDocument, Installment, InstallmentPayment, Payment, PaymentAdjustment,
     PaymentAllocation, PaymentAdvance, PaymentReceipt, PaymentRefund, PaymentStatusHistory, Plot, PlotBooking,
     Possession, Registry, RegistryCharge, RegistryStatusHistory)
+from .services import change_plot_status
 from system_settings.models import MasterData
 
 
@@ -267,7 +268,7 @@ def create_registry(*, booking, **data):
         return registry
 def transition_registry(*, registry, status, user=None, remarks=""):
     with transaction.atomic():
-        registry = Registry.objects.select_for_update().get(pk=registry.pk)
+        registry = Registry.objects.select_for_update().select_related("booking__lead", "booking__plot").get(pk=registry.pk)
         if status == Registry.Status.COMPLETED:
             if not registry.registry_date: raise ValidationError({"registry_date": "Registry date is required before completion."})
             from documents.services import validate_customer_documents_for_booking
@@ -275,6 +276,13 @@ def transition_registry(*, registry, status, user=None, remarks=""):
             if not validation["allowed"]: raise ValidationError({"documents": validation})
         old = registry.status; result = _transition(registry, status, REGISTRY_TRANSITIONS, "registry")
         RegistryStatusHistory.objects.create(registry=result, old_status=old, new_status=status, remarks=remarks, changed_by=user)
+        if status == Registry.Status.COMPLETED:
+            change_plot_status(
+                plot=registry.booking.plot,
+                new_status=Plot.Status.SOLD,
+                reason="Registry completed",
+                user=user,
+            )
         return result
 def create_possession(*, booking, **data):
     _confirmed(booking)

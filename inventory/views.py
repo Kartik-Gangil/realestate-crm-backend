@@ -3,7 +3,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 
 from django.core.exceptions import ValidationError
-from django.http import Http404
+from django.http import Http404, HttpResponse
 from django.db import transaction
 from django.db.models import Prefetch, Q, Sum
 from django.shortcuts import get_object_or_404
@@ -38,6 +38,7 @@ from .phase5_services import (
 from system_settings.audit import log_audit
 from core.files import DOCUMENT_KINDS, private_file_response, validate_upload
 from .selection_services import confirm_selection, create_selection, is_plot_selectable, release_selection
+from .receipt_pdf import payment_receipt_filename, payment_receipt_pdf
 
 
 def _validation_response(error):
@@ -472,8 +473,10 @@ def plot_list(request, organization_slug):
             _reject_protected_payload_fields(request.data)
         except ValidationError as error:
             return _validation_response(error)
+        payload = request.data.copy()
+        payload["project"] = project.id
         serializer = PlotWriteSerializer(
-            data=request.data, context={"organization": access.organization, "request": request}
+            data=payload, context={"organization": access.organization, "request": request}
         )
         serializer.is_valid(raise_exception=True)
         plot = serializer.save()
@@ -1307,7 +1310,12 @@ def payment_receipt(request, organization_slug, payment_id):
     access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_permission(access, "payments.view")
     payment = get_object_or_404(_payment_queryset(access, project), pk=payment_id)
     if not hasattr(payment, "receipt"): raise PermissionDenied("A receipt is available after payment confirmation.")
-    return Response({"receipt_number": payment.receipt.receipt_number, "payment": payment_to_dict(payment, True)})
+    receipt = payment.receipt
+    response = HttpResponse(payment_receipt_pdf(payment, receipt), content_type="application/pdf")
+    response["Content-Disposition"] = f'attachment; filename="{payment_receipt_filename(receipt)}"'
+    response["X-Content-Type-Options"] = "nosniff"
+    response["Cache-Control"] = "private, no-store"
+    return response
 
 
 @api_view(["POST"])

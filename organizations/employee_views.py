@@ -13,7 +13,7 @@ from core.files import private_file_response
 
 from .employee_serializers import DepartmentSerializer, EmployeeCreateSerializer, EmployeeUpdateSerializer
 from .models import Department, Organization, OrganizationActivity, OrganizationMembership, OrganizationRole
-from .services import ensure_default_roles, get_organization_access, has_permission
+from .services import effective_tab_permissions, ensure_default_roles, get_organization_access, has_permission, membership_permission_codes
 
 
 def _validation_response(error):
@@ -38,7 +38,7 @@ def _require_role_management(access):
 
 def _employees_for_access(access):
     queryset = OrganizationMembership.objects.filter(organization=access.organization).select_related(
-        "user", "department", "reporting_manager__user", "organization"
+        "user", "department", "reporting_manager__user", "organization", "organization_role"
     )
     if access.is_platform or access.membership.access_scope == OrganizationMembership.AccessScope.ALL:
         return queryset
@@ -74,6 +74,9 @@ def _employee_to_dict(employee, request=None, detailed=False):
             if employee.reporting_manager_id else None
         ),
         "role": employee.role,
+        "role_id": employee.organization_role_id,
+        "role_name": employee.organization_role.name if employee.organization_role_id else employee.role,
+        "role_code": employee.organization_role.code if employee.organization_role_id else employee.role,
         "access_scope": employee.access_scope,
         "status": "active" if employee.is_active else "inactive",
         "is_active": employee.is_active,
@@ -99,6 +102,31 @@ def _employee_to_dict(employee, request=None, detailed=False):
             "joined_at": employee.joined_at.isoformat() if employee.joined_at else None,
         })
     return data
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def member_tab_permissions(request, organization_slug, employee_id):
+    """Return role-derived tab access for a member.
+
+    Per-member tab overrides were removed in favor of organization roles. The
+    edit form still needs this read model to show selected, role-allowed, and
+    effective access consistently.
+    """
+    access = get_organization_access(request.user, organization_slug)
+    employee = get_object_or_404(_employees_for_access(access), pk=employee_id)
+    tabs = effective_tab_permissions(employee, is_platform=access.is_platform)
+    permission_codes = sorted(
+        f"{module}.{action}"
+        for module, action in membership_permission_codes(employee)
+    )
+    return Response({
+        "selected_tab_permissions": tabs,
+        "role_allowed_tabs": tabs,
+        "effective_tab_permissions": tabs,
+        "selected_permission_codes": permission_codes,
+        "role_permission_codes": permission_codes,
+    })
 
 
 def _activity_to_dict(activity):
@@ -169,12 +197,15 @@ def _resolve_relations(data, organization, employee=None):
     resolved = {}
     if "department" in data:
         value = data["department"]
-        if value is None:
+        if value is None or value == "":
             resolved["department"] = None
         else:
-            department = Department.objects.filter(pk=value, organization=organization, is_active=True).first()
+            department = Department.objects.filter(
+                organization=organization,
+                is_active=True,
+            ).filter(Q(pk=value) if str(value).isdigit() else Q(name__iexact=str(value))).first()
             if department is None:
-                raise ValidationError({"department": "Use an active department in this organization."})
+                raise ValidationError({"department": "Use an active department ID or name in this organization."})
             resolved["department"] = department
     if "reporting_manager" in data:
         value = data["reporting_manager"]
@@ -295,17 +326,37 @@ def employee_detail(request, organization_slug, employee_id):
     serializer = EmployeeUpdateSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     data = serializer.validated_data
+    if not data:
+        return Response({"detail": "At least one editable user field is required."}, status=status.HTTP_400_BAD_REQUEST)
     protected = set(request.data) - set(serializer.fields)
     if protected:
         return Response({field: ["This field cannot be updated."] for field in protected}, status=status.HTTP_400_BAD_REQUEST)
-    role_or_scope = {"role", "access_scope", "custom_scope_memberships"} & set(data)
+    role_or_scope = {"role", "role_id", "access_scope", "custom_scope_memberships"} & set(data)
     if role_or_scope:
         _require_role_management(access)
+    assigned_role = None
+    if "role_id" in data:
+        assigned_role = OrganizationRole.objects.filter(
+            organization=access.organization,
+            pk=data["role_id"],
+        ).first()
+        if assigned_role is None:
+            return Response(
+                {"role_id": ["Use a role from this organization."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        data.pop("role_id")
     try:
         with transaction.atomic():
             employee = OrganizationMembership.objects.select_for_update().select_related("user").get(
                 pk=employee.pk, organization=access.organization
             )
+            new_email = data.pop("email", None)
+            if new_email is not None:
+                new_email = new_email.lower()
+                duplicate = get_user_model().objects.filter(email__iexact=new_email).exclude(pk=employee.user_id).exists()
+                if duplicate:
+                    raise ValidationError({"email": "An account with this email already exists."})
             relations = _resolve_relations(data, access.organization, employee)
             changed = []
             for field, value in data.items():
@@ -314,8 +365,11 @@ def employee_detail(request, organization_slug, employee_id):
                 if getattr(employee, field) != value:
                     setattr(employee, field, value)
                     changed.append(field)
-            if "role" in changed:
+            if "role" in changed and assigned_role is None:
                 employee.organization_role = ensure_default_roles(access.organization)[employee.role]
+                changed.append("organization_role")
+            if assigned_role is not None and employee.organization_role_id != assigned_role.id:
+                employee.organization_role = assigned_role
                 changed.append("organization_role")
             for field, value in relations.items():
                 if field != "custom_scope_memberships" and getattr(employee, field) != value:
@@ -329,10 +383,22 @@ def employee_detail(request, organization_slug, employee_id):
             if "custom_scope_departments" in relations:
                 employee.custom_scope_departments.set(relations["custom_scope_departments"])
                 changed.append("custom_scope_departments")
+            if new_email is not None and employee.user.email.lower() != new_email:
+                old_email = employee.user.email
+                employee.user.email = new_email
+                if employee.user.username == old_email:
+                    employee.user.username = new_email
+                employee.user.save(update_fields=["email", "username"])
+                changed.append("email")
             if changed:
                 _activity(employee=employee, action="employee_updated", actor=request.user, details={"fields": changed})
-                if "role" in changed:
-                    _activity(employee=employee, action="role_changed", actor=request.user, details={"role": employee.role})
+                if {"role", "organization_role"} & set(changed):
+                    _activity(
+                        employee=employee,
+                        action="role_changed",
+                        actor=request.user,
+                        details={"role": employee.organization_role.code if employee.organization_role_id else employee.role},
+                    )
                 if {"access_scope", "custom_scope_memberships", "custom_scope_departments"} & set(changed):
                     _activity(employee=employee, action="access_scope_changed", actor=request.user,
                               details={"access_scope": employee.access_scope})

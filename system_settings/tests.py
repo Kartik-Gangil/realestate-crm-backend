@@ -29,6 +29,24 @@ class SettingsApiTests(APITestCase):
         self.client.force_authenticate(user=None)
         self.assertEqual(self.client.get("/api/settings/overview/").status_code, 401)
 
+    def test_v1_audit_logs_returns_paginated_actor_data_and_supports_search(self):
+        AuditLog.objects.create(
+            organization=self.org,
+            actor=self.admin,
+            module="users",
+            action="user_updated",
+            ip_address="127.0.0.1",
+            details={"fields": ["email"]},
+        )
+        self.client.force_authenticate(self.platform)
+
+        response = self.client.get("/api/v1/audit-logs/", {"search": "user_updated"})
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["results"][0]["actor"]["email"], self.admin.email)
+        self.assertEqual(response.data["results"][0]["details"], {"fields": ["email"]})
+
     def test_general_settings_and_isolation(self):
         self.client.force_authenticate(self.admin)
         response = self.client.patch("/api/organizations/org-a/settings/general/", {"timezone": "UTC", "items_per_page": 50}, format="json")

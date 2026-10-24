@@ -100,6 +100,33 @@ class ProjectContextApiTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual([item["id"] for item in response.data["results"]], [self.plot_a.id])
 
+    def test_plot_create_assigns_active_project_and_returns_created_plot(self):
+        """FR-P8-01/API-P8-03: plot creation is scoped to X-Project-ID."""
+        url = "/api/organizations/scoped-org/inventory/plots/"
+        response = self.client.post(
+            url,
+            {
+                "block": self.block_a.id,
+                "plot_number": "A-002",
+                "size": "120.00",
+                "plot_type": "residential",
+                "rate_per_sq_unit": "10.00",
+                "total_price": "1200.00",
+                "facing": "East",
+                "dimensions": "10 x 12",
+                "description": "Project-scoped test plot",
+            },
+            format="json",
+            HTTP_X_PROJECT_ID=str(self.project_a.id),
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["project"]["id"], self.project_a.id)
+        self.assertEqual(
+            Plot.objects.get(organization=self.organization, plot_number="A-002").project_id,
+            self.project_a.id,
+        )
+
     def test_lead_list_requires_project_header_and_returns_only_active_project(self):
         url = "/api/organizations/scoped-org/leads/"
 

@@ -5,7 +5,7 @@ from django.test import TestCase
 from django.urls import reverse
 from rest_framework.test import APIClient
 
-from .models import Department, Organization, OrganizationActivity, OrganizationMembership
+from .models import Department, Organization, OrganizationActivity, OrganizationMembership, OrganizationRole, Permission
 
 
 class EmployeeApiTests(TestCase):
@@ -29,6 +29,15 @@ class EmployeeApiTests(TestCase):
     def employees_url(self):
         return reverse("employee-list", args=[self.org.slug])
 
+    def v1_users_url(self):
+        return f"/api/v1/organizations/{self.org.slug}/users/"
+
+    def v1_user_detail_url(self, employee):
+        return f"{self.v1_users_url()}{employee.id}/"
+
+    def v1_user_status_url(self, employee, action):
+        return f"{self.v1_user_detail_url(employee)}{action}/"
+
     def detail_url(self, employee):
         return reverse("employee-detail", args=[self.org.slug, employee.id])
 
@@ -44,6 +53,128 @@ class EmployeeApiTests(TestCase):
     def test_unauthenticated_employee_api_is_rejected(self):
         self.client.force_authenticate(None)
         self.assertEqual(self.client.get(self.employees_url()).status_code, 401)
+
+    def test_v1_user_directory_route_returns_organization_users(self):
+        response = self.client.get(self.v1_users_url())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 3)
+        self.assertEqual({item["email"] for item in response.data["results"]}, {
+            self.admin.email,
+            self.manager.email,
+            self.viewer.email,
+        })
+
+        self.client.force_authenticate(None)
+        self.assertEqual(self.client.get(self.v1_users_url()).status_code, 401)
+
+    def test_v1_user_update_and_status_routes_persist_changes(self):
+        response = self.client.put(
+            self.v1_user_detail_url(self.manager_membership),
+            {
+                "first_name": "Updated",
+                "last_name": "Manager",
+                "mobile_number": "9999999999",
+                "designation": "Sales Lead",
+                "role": "manager",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.manager_membership.refresh_from_db()
+        self.assertEqual(self.manager_membership.first_name, "Updated")
+        self.assertEqual(self.manager_membership.designation, "Sales Lead")
+
+        response = self.client.post(self.v1_user_status_url(self.manager_membership, "deactivate"))
+        self.assertEqual(response.status_code, 200, response.data)
+        self.manager_membership.refresh_from_db()
+        self.assertFalse(self.manager_membership.is_active)
+
+    def test_v1_user_update_persists_canonical_role_assignment_and_effective_permissions(self):
+        expense_role = OrganizationRole.objects.create(
+            organization=self.org,
+            name="Expense Reviewer",
+            code="expense-reviewer",
+        )
+        mark_paid, _ = Permission.objects.get_or_create(
+            module="expenses",
+            action="mark_paid",
+            defaults={"name": "Mark expenses as paid"},
+        )
+        expense_role.permissions.add(mark_paid)
+
+        response = self.client.put(
+            self.v1_user_detail_url(self.manager_membership),
+            {"role_id": expense_role.id},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.manager_membership.refresh_from_db()
+        self.assertEqual(self.manager_membership.organization_role_id, expense_role.id)
+        self.assertEqual(response.data["role_id"], expense_role.id)
+        self.assertEqual(response.data["role_name"], "Expense Reviewer")
+
+        permissions = self.client.get(
+            f"/api/v1/organizations/{self.org.slug}/users/{self.manager_membership.id}/tab-permissions/"
+        )
+        self.assertEqual(permissions.status_code, 200, permissions.data)
+        self.assertEqual(permissions.data["selected_permission_codes"], ["expenses.mark_paid"])
+
+    def test_v1_user_update_rejects_a_role_from_another_organization(self):
+        foreign_role = OrganizationRole.objects.create(
+            organization=self.other_org,
+            name="Foreign Role",
+            code="foreign-role",
+        )
+
+        response = self.client.put(
+            self.v1_user_detail_url(self.manager_membership),
+            {"role_id": foreign_role.id},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400, response.data)
+        self.manager_membership.refresh_from_db()
+        self.assertIsNone(self.manager_membership.organization_role_id)
+
+    def test_v1_user_update_accepts_settings_fields_and_persists_them(self):
+        response = self.client.put(
+            self.v1_user_detail_url(self.manager_membership),
+            {
+                "email": "updated.manager@example.com",
+                "department": self.department.name,
+                "address": "22 Main Street",
+                "date_of_birth": "1990-01-02",
+                "shift_start_time": "09:00",
+                "shift_end_time": "18:00",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.manager_membership.refresh_from_db()
+        self.manager_membership.user.refresh_from_db()
+        self.assertEqual(self.manager_membership.user.email, "updated.manager@example.com")
+        self.assertEqual(self.manager_membership.department_id, self.department.id)
+        self.assertEqual(self.manager_membership.address, "22 Main Street")
+        self.assertEqual(str(self.manager_membership.date_of_birth), "1990-01-02")
+        self.assertEqual(str(self.manager_membership.shift_start_time), "09:00:00")
+        self.assertEqual(str(self.manager_membership.shift_end_time), "18:00:00")
+
+        response = self.client.put(self.v1_user_detail_url(self.manager_membership), {}, format="json")
+        self.assertEqual(response.status_code, 400, response.data)
+
+    def test_v1_user_email_update_does_not_require_a_department(self):
+        response = self.client.put(
+            self.v1_user_detail_url(self.viewer_membership),
+            {"email": "updated.viewer@example.com"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.viewer_membership.refresh_from_db()
+        self.viewer_membership.user.refresh_from_db()
+        self.assertEqual(self.viewer_membership.user.email, "updated.viewer@example.com")
+        self.assertIsNone(self.viewer_membership.department_id)
 
     def test_create_list_search_filter_and_activity(self):
         response = self.client.post(self.employees_url(), self.create_payload(), format="json")

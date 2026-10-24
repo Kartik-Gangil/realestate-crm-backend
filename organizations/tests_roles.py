@@ -71,3 +71,23 @@ class RolePermissionUpdateTests(APITestCase):
         codes = {item["code"] for item in response.data}
         for module in ("assigned_leads", "site_visits", "loans"):
             self.assertTrue({f"{module}.{action}" for action in ("view", "add", "edit", "delete", "export")} <= codes)
+
+    def test_admin_can_assign_expense_reject_and_mark_paid_permissions(self):
+        response = self.client.get(f"/api/organizations/{self.organization.slug}/permissions/")
+
+        self.assertEqual(response.status_code, 200)
+        permissions = {item["code"]: item["id"] for item in response.data}
+        self.assertIn("expenses.reject", permissions)
+        self.assertIn("expenses.mark_paid", permissions)
+
+        updated = self.client.patch(
+            f"/api/organizations/{self.organization.slug}/roles/{self.role.id}/",
+            {"permission_ids": [permissions["expenses.reject"], permissions["expenses.mark_paid"]]},
+            format="json",
+        )
+
+        self.assertEqual(updated.status_code, 200, updated.data)
+        self.assertEqual(
+            set(updated.data["permissions"]),
+            {"expenses.reject", "expenses.mark_paid"},
+        )

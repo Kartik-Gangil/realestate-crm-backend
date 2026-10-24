@@ -52,3 +52,7 @@ class LoginSerializer(serializers.Serializer):
             raise serializers.ValidationError({"detail": "Invalid email or password."})
         attrs["user"] = user
         return attrs
+
+
+class OtpRequestSerializer(serializers.Serializer):
+    email = serializers.EmailField()

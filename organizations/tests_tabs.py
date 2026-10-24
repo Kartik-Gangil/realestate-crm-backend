@@ -27,6 +27,16 @@ class RoleDerivedTabPermissionsTests(APITestCase):
         self.assertEqual(response.data["role"], "lead-agent")
         self.assertEqual(response.data["permissions"], ["dashboard.view", "leads.view"])
 
+    def test_member_tab_permissions_endpoint_returns_role_derived_tabs(self):
+        membership = self.role.memberships.first()
+        response = self.client.get(f"/api/v1/organizations/acme/users/{membership.id}/tab-permissions/")
+
+        self.assertEqual(response.status_code, 200)
+        expected_tabs = ["dashboard", "leads", "assigned_leads", "follow_ups"]
+        self.assertEqual(response.data["selected_tab_permissions"], expected_tabs)
+        self.assertEqual(response.data["role_allowed_tabs"], expected_tabs)
+        self.assertEqual(response.data["effective_tab_permissions"], expected_tabs)
+
     def test_role_permission_changes_update_tabs_for_assigned_user(self):
         admin = get_user_model().objects.create_user(username="admin", email="admin@example.com", password="password123")
         admin_role = OrganizationRole.objects.create(organization=self.organization, name="Administrator", code="administrator")

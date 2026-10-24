@@ -12,7 +12,16 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
-from .serializers import LoginSerializer, RegisterSerializer, UserSerializer
+
+from .otp import (
+    FirebaseOtpStorageUnavailable,
+    OtpDeliveryUnavailable,
+    OtpInvalid,
+    OtpRateLimited,
+    request_email_otp,
+    verify_email_otp,
+)
+from .serializers import LoginSerializer, OtpRequestSerializer, RegisterSerializer, UserSerializer
 
 
 def _auth_response(user, created=False):
@@ -31,9 +40,43 @@ def register(request):
 @api_view(["POST"])
 @permission_classes([AllowAny])
 def login(request):
+    if request.data.get("mode") == "otp":
+        serializer = OtpRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        email = serializer.validated_data["email"].lower()
+        user = get_user_model().objects.filter(email__iexact=email, is_active=True).first()
+        if user is None:
+            return Response({"detail": "If an active account uses this email address, an OTP has been sent."})
+        try:
+            request_email_otp(user)
+        except OtpRateLimited as error:
+            return Response(
+                {"detail": "Too many OTP requests. Try again later.", "retry_after_seconds": error.retry_after_seconds},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+        except (FirebaseOtpStorageUnavailable, OtpDeliveryUnavailable):
+            return Response({"detail": "OTP delivery is temporarily unavailable."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        return Response({"detail": "If an active account uses this email address, an OTP has been sent."})
+
     serializer = LoginSerializer(data=request.data, context={"request": request})
     serializer.is_valid(raise_exception=True)
     return _auth_response(serializer.validated_data["user"])
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def verify_otp(request):
+    identifier = request.data.get("identifier")
+    otp = request.data.get("otp")
+    if not identifier or not otp:
+        return Response({"detail": "identifier and otp are required."}, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        user = verify_email_otp(identifier, otp)
+    except OtpInvalid:
+        return Response({"detail": "Invalid or expired OTP."}, status=status.HTTP_400_BAD_REQUEST)
+    except FirebaseOtpStorageUnavailable:
+        return Response({"detail": "OTP verification is temporarily unavailable."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+    return _auth_response(user)
 
 
 @api_view(["POST"])

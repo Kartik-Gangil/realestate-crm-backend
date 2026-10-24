@@ -3,7 +3,7 @@ import platform
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import transaction
-from django.db.models import Count
+from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from core.files import private_file_response
@@ -209,6 +209,13 @@ def audit_logs(request):
     require_platform_settings(request.user); query = AuditLog.objects.select_related("organization", "actor")
     for key, lookup in (("user", "actor_id"), ("organization", "organization_id"), ("module", "module"), ("action", "action")):
         if value := request.query_params.get(key): query = query.filter(**{lookup: value})
+    if value := request.query_params.get("search"):
+        query = query.filter(
+            Q(module__icontains=value) |
+            Q(action__icontains=value) |
+            Q(ip_address__icontains=value) |
+            Q(actor__email__icontains=value)
+        )
     if value := request.query_params.get("date_from"): query = query.filter(timestamp__date__gte=value)
     if value := request.query_params.get("date_to"): query = query.filter(timestamp__date__lte=value)
     return _page(query, request, AuditLogSerializer)
