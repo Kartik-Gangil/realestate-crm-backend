@@ -3,7 +3,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.test import override_settings
 from rest_framework.test import APITestCase
-from organizations.models import Organization, OrganizationMembership, OrganizationRole
+from organizations.models import Organization, OrganizationMembership, OrganizationRole, Permission
 from organizations.services import ensure_default_roles, has_permission
 from .models import AuditLog, IntegrationConfiguration, SystemParameter
 
@@ -15,10 +15,12 @@ class SettingsApiTests(APITestCase):
         self.platform = User.objects.create_user(username="platform", email="platform@example.test", password="password123")
         Group.objects.create(name="Platform Admin").user_set.add(self.platform)
         self.admin = User.objects.create_user(username="admin", email="admin@example.test", password="password123")
+        self.manager = User.objects.create_user(username="manager", email="manager@example.test", password="password123")
         self.member = User.objects.create_user(username="member", email="member@example.test", password="password123")
         self.org = Organization.objects.create(name="Org A", slug="org-a")
         ensure_default_roles(self.org)
         self.admin_member = OrganizationMembership.objects.create(organization=self.org, user=self.admin, role="admin")
+        self.manager_membership = OrganizationMembership.objects.create(organization=self.org, user=self.manager, role="manager")
         self.member_membership = OrganizationMembership.objects.create(organization=self.org, user=self.member, role="telecaller")
 
     def test_platform_access_is_not_organization_admin_access(self):
@@ -82,3 +84,35 @@ class SettingsApiTests(APITestCase):
         self.assertTrue(self.member_membership.organization_role_id)
         self.assertTrue(has_permission(self.admin, self.org, "settings.edit"))
         self.assertFalse(has_permission(self.member, self.org, "settings.edit"))
+
+    def test_manager_can_view_organization_settings_but_needs_edit_permission_to_manage_roles(self):
+        self.assertTrue(has_permission(self.manager, self.org, "settings.view"))
+        self.assertFalse(has_permission(self.manager, self.org, "settings.edit"))
+
+        self.client.force_authenticate(self.manager)
+        overview_response = self.client.get("/api/organizations/org-a/settings/overview/")
+        self.assertEqual(overview_response.status_code, 200, overview_response.data)
+        self.assertEqual(overview_response.data["organization_slug"], "org-a")
+        settings_response = self.client.get("/api/organizations/org-a/settings/general/")
+        self.assertEqual(settings_response.status_code, 200, settings_response.data)
+
+        role_response = self.client.post(
+            "/api/organizations/org-a/roles/",
+            {"name": "Manager Attempt", "code": "manager-attempt", "permission_ids": []},
+            format="json",
+        )
+        self.assertEqual(role_response.status_code, 403, role_response.data)
+
+    def test_manager_with_settings_edit_can_create_a_role(self):
+        settings_edit = Permission.objects.get(module="settings", action="edit")
+        self.manager_membership.organization_role.permissions.add(settings_edit)
+        self.client.force_authenticate(self.manager)
+
+        response = self.client.post(
+            "/api/organizations/org-a/roles/",
+            {"name": "Expense Reviewer", "code": "expense-reviewer", "permission_ids": []},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["code"], "expense-reviewer")

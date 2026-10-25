@@ -119,3 +119,66 @@ class SiteVisitApiTests(TestCase):
         self.assertEqual(response.data["total_visits"], 1)
         self.assertEqual(response.data["completed"], 1)
         self.assertEqual(response.data["average_interest_level"], 4.0)
+
+    def test_telecaller_keeps_historical_visits_after_lead_is_unassigned(self):
+        User = get_user_model()
+        telecaller_user = User.objects.create_user(username="historical-caller", password="test-pass")
+        telecaller = OrganizationMembership.objects.create(
+            organization=self.organization,
+            user=telecaller_user,
+            role=OrganizationMembership.Role.TELECALLER,
+        )
+        other_telecaller_user = User.objects.create_user(username="other-historical-caller", password="test-pass")
+        other_telecaller = OrganizationMembership.objects.create(
+            organization=self.organization,
+            user=other_telecaller_user,
+            role=OrganizationMembership.Role.TELECALLER,
+        )
+        lead = Lead.objects.create(
+            organization=self.organization,
+            project=self.project,
+            assigned_membership=telecaller,
+            first_name="Historical",
+            phone="7777777777",
+        )
+        visit = Sitevisit.objects.create(
+            organization=self.organization,
+            project=self.project,
+            lead=lead,
+            executive_membership=telecaller,
+            created_by=telecaller_user,
+            visit_date=timezone.localdate() - timedelta(days=1),
+            visit_time="10:00",
+            status=Sitevisit.Status.COMPLETED,
+        )
+        other_lead = Lead.objects.create(
+            organization=self.organization,
+            project=self.project,
+            assigned_membership=other_telecaller,
+            first_name="Other historical",
+            phone="6666666666",
+        )
+        other_visit = Sitevisit.objects.create(
+            organization=self.organization,
+            project=self.project,
+            lead=other_lead,
+            executive_membership=other_telecaller,
+            created_by=other_telecaller_user,
+            visit_date=timezone.localdate() - timedelta(days=2),
+            visit_time="11:00",
+            status=Sitevisit.Status.COMPLETED,
+        )
+
+        self.client.force_authenticate(telecaller_user)
+        response = self.client.get(self.list_url)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(visit.id, [item["id"] for item in response.data["results"]])
+        self.assertNotIn(other_visit.id, [item["id"] for item in response.data["results"]])
+
+        lead.assigned_membership = None
+        lead.save(update_fields=["assigned_membership", "updated_at"])
+
+        response = self.client.get(self.list_url)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(visit.id, [item["id"] for item in response.data["results"]])
+        self.assertNotIn(other_visit.id, [item["id"] for item in response.data["results"]])

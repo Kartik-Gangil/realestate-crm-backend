@@ -11,7 +11,7 @@ from rest_framework.response import Response
 from rest_framework import status
 
 from leads.models import Lead
-from organizations.services import get_organization_access, get_project_context
+from organizations.services import apply_data_scope, get_organization_access, get_project_context
 from .models import CustomerDocument, CustomerDocumentRequirement, DocumentCategory, EmployeeDocument, EmployeeDocumentCategory
 from .permissions import require_document_management, require_document_view
 from .serializers import CustomerDocumentSerializer, CustomerDocumentUploadSerializer, DocumentCategorySerializer, DocumentRequirementSerializer, VerificationHistorySerializer
@@ -27,14 +27,23 @@ def _page(request, queryset, serializer):
     count = queryset.count(); results = queryset[(page - 1) * page_size:page * page_size]
     return Response({"count": count, "next": None, "previous": None, "results": [serializer(item).data for item in results]})
 def _docs(access, project):
-    return CustomerDocument.objects.filter(
+    queryset = CustomerDocument.objects.filter(
         organization=access.organization,
         customer__project=project,
     ).select_related("customer", "document_category", "uploaded_by", "verified_by", "rejected_by")
+    return apply_data_scope(
+        queryset,
+        access,
+        module="documents",
+        membership_lookups=("customer__assigned_membership",),
+        user_lookups=("uploaded_by",),
+    )
 
 
 def _customer(access, customer_id, project):
-    return get_object_or_404(Lead.objects.filter(organization=access.organization, project=project), pk=customer_id)
+    queryset = Lead.objects.filter(organization=access.organization, project=project)
+    queryset = apply_data_scope(queryset, access, module="documents", membership_lookups=("assigned_membership",))
+    return get_object_or_404(queryset, pk=customer_id)
 
 
 def _doc(access, document_id, project): return get_object_or_404(_docs(access, project), pk=document_id)
@@ -160,7 +169,9 @@ def expiry_alerts(request, organization_slug):
 
 
 def _employee_document(access, document_id):
-    return get_object_or_404(EmployeeDocument.objects.filter(organization=access.organization).select_related("employee__user", "document_category", "uploaded_by"), pk=document_id)
+    queryset = EmployeeDocument.objects.filter(organization=access.organization).select_related("employee__user", "document_category", "uploaded_by")
+    queryset = apply_data_scope(queryset, access, module="documents", membership_lookups=("employee",), user_lookups=("uploaded_by",))
+    return get_object_or_404(queryset, pk=document_id)
 
 
 def _employee_document_data(document):
@@ -175,7 +186,15 @@ def _employee_document_data(document):
 @permission_classes([IsAuthenticated])
 def employee_documents(request, organization_slug, employee_id):
     access = get_organization_access(request.user, organization_slug)
-    employee = get_object_or_404(OrganizationMembership.objects.filter(organization=access.organization), pk=employee_id)
+    employee = get_object_or_404(
+        apply_data_scope(
+            OrganizationMembership.objects.filter(organization=access.organization),
+            access,
+            module="documents",
+            membership_lookups=("pk",),
+        ),
+        pk=employee_id,
+    )
     docs = EmployeeDocument.objects.filter(organization=access.organization, employee=employee).select_related("employee__user", "document_category", "uploaded_by")
     if request.method == "GET":
         require_document_view(access)

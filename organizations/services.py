@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+from django.db.models import Q
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 
 from .models import Organization, OrganizationMembership, OrganizationRole, Permission, PlatformOrganizationAccess, TAB_PERMISSIONS
@@ -58,6 +59,7 @@ def ensure_default_roles(organization):
     roles["admin"].permissions.set(Permission.objects.all())
     if not roles["manager"].permissions.exists():
         roles["manager"].permissions.set(Permission.objects.filter(module__in=["dashboard", "leads", "customers", "plots", "documents", "employees", "attendance", "leave"]).exclude(action__in=["delete", "export"]))
+    roles["manager"].permissions.add(*Permission.objects.filter(module="settings", action="view"))
     telecaller_permissions = Permission.objects.filter(
         module__in=["dashboard", "customers", "follow_ups", "telecalling"],
         action__in=["view", "add", "edit"],
@@ -90,6 +92,78 @@ def has_permission(user, organization, permission_code):
         ).exists()
     # Compatibility only until the data migration has run.
     return membership.role == OrganizationMembership.Role.ADMIN
+
+
+def data_scope_membership_ids(access):
+    """Return memberships visible under the selected organization data scope."""
+    if access.is_platform or not access.membership:
+        return None
+    membership = access.membership
+    if membership.access_scope == OrganizationMembership.AccessScope.ALL:
+        return None
+    if membership.access_scope == OrganizationMembership.AccessScope.OWN:
+        return {membership.pk}
+
+    ids = {membership.pk}
+    if membership.access_scope == OrganizationMembership.AccessScope.DEPARTMENT:
+        if membership.department_id:
+            ids.update(
+                OrganizationMembership.objects.filter(
+                    organization=membership.organization,
+                    department_id=membership.department_id,
+                    is_active=True,
+                ).values_list("id", flat=True)
+            )
+        return ids
+
+    if membership.access_scope == OrganizationMembership.AccessScope.CUSTOM:
+        ids.update(membership.custom_scope_memberships.filter(is_active=True).values_list("id", flat=True))
+        ids.update(
+            OrganizationMembership.objects.filter(
+                organization=membership.organization,
+                department__in=membership.custom_scope_departments.all(),
+                is_active=True,
+            ).values_list("id", flat=True)
+        )
+        return ids
+
+    return ids
+
+
+def data_scope_is_unrestricted(access, module=None):
+    """Return whether a request may see all records in its current project."""
+    if access.is_platform or not access.membership:
+        return True
+    if access.membership.access_scope == OrganizationMembership.AccessScope.ALL:
+        return True
+    if module and any(
+        has_permission(access.membership.user, access.organization, permission)
+        for permission in (f"{module}.view_team", f"{module}.team_view", f"{module}.view_all")
+    ):
+        return True
+    return False
+
+
+def apply_data_scope(queryset, access, *, module=None, membership_lookups=(), user_lookups=()):
+    """Apply organization data scope to a queryset with explicit owner relations.
+
+    GNFR-06/FR-P3-07: project records are visible only through their assigned
+    membership or owner user unless the membership has unrestricted/team scope.
+    """
+    if data_scope_is_unrestricted(access, module):
+        return queryset
+    membership_ids = data_scope_membership_ids(access) or set()
+    user_ids = set(
+        OrganizationMembership.objects.filter(pk__in=membership_ids).values_list("user_id", flat=True)
+    )
+    predicates = [Q(**{f"{lookup}__in": membership_ids}) for lookup in membership_lookups]
+    predicates.extend(Q(**{f"{lookup}__in": user_ids}) for lookup in user_lookups)
+    if not predicates:
+        return queryset.none()
+    combined = predicates[0]
+    for predicate in predicates[1:]:
+        combined |= predicate
+    return queryset.filter(combined).distinct()
 
 
 def membership_permission_codes(membership):

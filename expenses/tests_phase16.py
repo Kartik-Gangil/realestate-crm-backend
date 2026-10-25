@@ -11,7 +11,7 @@ from inventory.models import Project
 from system_settings.models import SystemParameter
 
 from organizations.models import Organization, OrganizationMembership, OrganizationRole, Permission
-from .models import Expense, ExpenseCategory
+from .models import ApprovalStep, Expense, ExpenseCategory
 from django.core.files.uploadedfile import SimpleUploadedFile
 
 
@@ -33,7 +33,7 @@ class ExpensePhase16WorkflowTests(TestCase):
             ])
             return item
 
-        employee_role = role("telecaller", ["expenses.view_own", "expenses.edit_own", "expenses.submit"])
+        employee_role = role("telecaller", ["expenses.view_own", "expenses.edit_own", "expenses.submit", "expenses.add"])
         manager_role = role("manager", ["expenses.view_team", "expenses.approve", "expenses.reject"])
         admin_role = role("admin", [
             "expenses.view_team", "expenses.approve", "expenses.manage_categories",
@@ -110,7 +110,120 @@ class ExpensePhase16WorkflowTests(TestCase):
         self.assertEqual(rejected.status, Expense.Status.REJECTED)
         self.assertEqual(with_reason.data["data"]["rejection_reason"], "Receipt is not readable.")
 
-    def test_receipt_threshold_comes_from_system_parameter(self):
+    def test_telecaller_add_permission_does_not_grant_org_wide_expense_visibility(self):
+        other_user = get_user_model().objects.create_user(
+            username="other-expense-employee", email="other-expense@example.com"
+        )
+        other_role = OrganizationRole.objects.create(
+            organization=self.organization, name="Other Telecaller", code="other-telecaller"
+        )
+        other_role.permissions.set([
+            Permission.objects.get_or_create(
+                module="expenses", action=action, defaults={"name": f"expenses.{action}"}
+            )[0]
+            for action in ("view_own", "edit_own", "submit")
+        ])
+        OrganizationMembership.objects.create(
+            organization=self.organization, user=other_user, role="telecaller", organization_role=other_role
+        )
+        Expense.objects.create(
+            organization=self.organization,
+            project=self.project,
+            submitted_by=other_user,
+            paid_by=self.employee,
+            category=self.category,
+            amount="200.00",
+            description="Another employee expense",
+        )
+
+        response = self.client.get("/api/expenses/", format="json", **self.auth(self.employee))
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["data"]["results"], [])
+
+    def test_expense_visibility_uses_expense_permissions_not_data_scope(self):
+        viewer = get_user_model().objects.create_user(
+            username="expense-viewer", email="expense-viewer@example.com"
+        )
+        viewer_role = OrganizationRole.objects.create(
+            organization=self.organization, name="Expense Viewer", code="expense-viewer"
+        )
+        viewer_role.permissions.add(
+            Permission.objects.get_or_create(
+                module="expenses", action="view", defaults={"name": "expenses.view"}
+            )[0]
+        )
+        viewer_membership = OrganizationMembership.objects.create(
+            organization=self.organization,
+            user=viewer,
+            role="telecaller",
+            organization_role=viewer_role,
+        )
+        own_expense = Expense.objects.create(
+            organization=self.organization,
+            project=self.project,
+            submitted_by=viewer,
+            category=self.category,
+            amount="100.00",
+            description="Viewer expense",
+        )
+        other_expense = Expense.objects.create(
+            organization=self.organization,
+            project=self.project,
+            submitted_by=self.employee,
+            category=self.category,
+            amount="150.00",
+            description="Other expense",
+        )
+
+        visible_by_scope = {}
+        for scope in (
+            OrganizationMembership.AccessScope.OWN,
+            OrganizationMembership.AccessScope.ALL,
+        ):
+            viewer_membership.access_scope = scope
+            viewer_membership.save(update_fields=["access_scope"])
+            response = self.client.get(
+                "/api/expenses/",
+                format="json",
+                **self.auth(viewer),
+            )
+            self.assertEqual(response.status_code, 200, response.data)
+            visible_by_scope[scope] = {item["id"] for item in response.data["data"]["results"]}
+
+        self.assertEqual(visible_by_scope[OrganizationMembership.AccessScope.OWN], {
+            own_expense.id, other_expense.id,
+        })
+        self.assertEqual(visible_by_scope[OrganizationMembership.AccessScope.ALL], {
+            own_expense.id, other_expense.id,
+        })
+
+    def test_legacy_pending_expense_without_manager_step_can_be_approved(self):
+        expense = Expense.objects.create(
+            organization=self.organization,
+            project=self.project,
+            submitted_by=self.employee,
+            category=self.category,
+            amount=Decimal("125.00"),
+            description="Legacy pending expense",
+            status=Expense.Status.PENDING_APPROVAL,
+        )
+
+        response = self.client.post(
+            f"/api/expenses/{expense.id}/approve/",
+            {},
+            format="json",
+            **self.auth(self.manager),
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        expense.refresh_from_db()
+        self.assertEqual(expense.status, Expense.Status.APPROVED)
+        manager_step = expense.approval_steps.get(step_name="Manager Review")
+        self.assertEqual(manager_step.status, ApprovalStep.Status.DONE)
+        self.assertEqual(manager_step.actor_id, self.manager.id)
+
+    def test_task_p16_001_allows_submission_without_receipt_above_configured_threshold(self):
         SystemParameter.objects.create(
             organization=self.organization,
             parameter_key="expense_receipt_threshold",
@@ -130,8 +243,8 @@ class ExpensePhase16WorkflowTests(TestCase):
             format="json",
             **self.auth(self.employee),
         )
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("receipt", response.data)
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["data"]["status"], Expense.Status.PENDING_APPROVAL)
 
     def test_approved_expense_cannot_be_edited_and_project_scope_is_enforced(self):
         expense = Expense.objects.create(
@@ -225,11 +338,12 @@ class ExpensePhase16WorkflowTests(TestCase):
 
         allowed_payment = self.client.post(
             f"/api/expenses/{paid_expense.id}/mark-paid/",
-            {"paid_amount": "125.00", "payment_method": "cash"},
+            {"paid_amount": "125.00", "payment_method": "cash", "paid_by": ""},
             format="json",
             **self.auth(processor),
         )
         self.assertEqual(allowed_payment.status_code, 201, allowed_payment.data)
+        self.assertEqual(allowed_payment.data["data"]["paid_by"]["id"], processor.id)
 
     def test_org_scoped_expense_creation_without_active_project_does_not_500(self):
         category = ExpenseCategory.objects.create(
@@ -253,3 +367,80 @@ class ExpensePhase16WorkflowTests(TestCase):
 
         self.assertEqual(response.status_code, 201, response.data)
         self.assertEqual(response.data["data"]["status"], Expense.Status.DRAFT)
+
+    def test_mark_paid_uses_authenticated_actor_when_paid_by_is_blank(self):
+        processor = get_user_model().objects.create_user(
+            username="blank-paid-by-processor",
+            email="blank-paid-by-processor@example.com",
+        )
+        permission = Permission.objects.get_or_create(
+            module="expenses",
+            action="mark_paid",
+            defaults={"name": "Mark expenses as paid"},
+        )[0]
+        role = OrganizationRole.objects.create(
+            organization=self.organization,
+            name="Blank Paid By Processor",
+            code="blank-paid-by-processor",
+        )
+        role.permissions.add(permission)
+        OrganizationMembership.objects.create(
+            organization=self.organization,
+            user=processor,
+            role="blank-paid-by-processor",
+            organization_role=role,
+        )
+        expense = Expense.objects.create(
+            organization=self.organization,
+            project=self.project,
+            submitted_by=self.employee,
+            category=self.category,
+            amount=Decimal("125.00"),
+            description="Direct payment regression",
+            status=Expense.Status.APPROVED,
+        )
+
+        response = self.client.post(
+            f"/api/expenses/{expense.id}/mark-paid/",
+            {"paid_amount": "125.00", "payment_method": "cash", "paid_by": ""},
+            format="json",
+            **self.auth(processor),
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["data"]["paid_by"]["id"], processor.id)
+
+    def test_mark_paid_returns_conflict_for_an_already_paid_expense(self):
+        expense = Expense.objects.create(
+            organization=self.organization,
+            project=self.project,
+            submitted_by=self.employee,
+            category=self.category,
+            amount=Decimal("125.00"),
+            description="Duplicate payment regression",
+            status=Expense.Status.APPROVED,
+        )
+        first = self.client.post(
+            f"/api/expenses/{expense.id}/mark-paid/",
+            {"paid_amount": "125.00", "payment_method": "cash"},
+            format="json",
+            **self.auth(self.admin),
+        )
+        self.assertEqual(first.status_code, 201, first.data)
+
+        unauthorized = self.client.post(
+            f"/api/expenses/{expense.id}/mark-paid/",
+            {"paid_amount": "125.00", "payment_method": "cash"},
+            format="json",
+            **self.auth(self.employee),
+        )
+        self.assertEqual(unauthorized.status_code, 403)
+
+        duplicate = self.client.post(
+            f"/api/expenses/{expense.id}/mark-paid/",
+            {"paid_amount": "125.00", "payment_method": "cash"},
+            format="json",
+            **self.auth(self.admin),
+        )
+        self.assertEqual(duplicate.status_code, 409, duplicate.data)
+        self.assertEqual(duplicate.data["code"], "expense_already_paid")

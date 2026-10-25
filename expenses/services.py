@@ -1,6 +1,5 @@
 from decimal import Decimal, InvalidOperation
 
-from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import transaction
@@ -8,8 +7,6 @@ from django.utils import timezone
 
 from organizations.models import OrganizationMembership
 from organizations.services import has_permission, is_platform_admin, membership_role_code
-from system_settings.services import get_system_parameter
-
 from .models import ActivityLog, ApprovalStep, Expense, Payment, ReimbursementRequest
 
 
@@ -26,6 +23,10 @@ EXPENSE_PERMISSIONS = {
     "process_reimbursement": "expenses.process_reimbursement",
     "reports": "expenses.reports",
 }
+
+
+class ExpenseAlreadyPaid(Exception):
+    """Raised when an authorized payment request targets an already-paid expense."""
 
 
 def _has_any(user, organization, *permissions):
@@ -46,10 +47,10 @@ def can_create(user, organization):
 def can_view(user, expense):
     if not expense or not expense.organization_id or expense.is_deleted:
         return False
-    if _has_any(user, expense.organization, EXPENSE_PERMISSIONS["view_team"], "expenses.view", "expenses.add"):
+    if _has_any(user, expense.organization, EXPENSE_PERMISSIONS["view_team"], "expenses.view"):
         return True
     return (
-        (expense.submitted_by_id == user.id or expense.paid_by_id == user.id)
+        expense.submitted_by_id == user.id
         and _has_any(user, expense.organization, EXPENSE_PERMISSIONS["view_own"], EXPENSE_PERMISSIONS["edit_own"], "expenses.edit")
     )
 
@@ -90,18 +91,6 @@ def can_reject(user, expense):
     )
 
 
-def _receipt_threshold(organization):
-    configured = get_system_parameter(
-        organization,
-        "expense_receipt_threshold",
-        getattr(settings, "EXPENSE_RECEIPT_THRESHOLD", "5000"),
-    )
-    try:
-        return Decimal(str(configured))
-    except (InvalidOperation, TypeError, ValueError) as error:
-        raise ValidationError({"receipt": "The expense receipt threshold is misconfigured."}) from error
-
-
 def expense_snapshot(expense):
     return {
         "expense_id": expense.expense_id,
@@ -130,8 +119,6 @@ def submit_expense(expense, actor):
         raise PermissionDenied("You can only submit your own editable expense.")
     if expense.status not in {Expense.Status.DRAFT, Expense.Status.CHANGES_REQUESTED}:
         raise ValidationError("Only draft or changes-requested expenses can be submitted.")
-    if expense.amount > _receipt_threshold(expense.organization) and not expense.receipt:
-        raise ValidationError({"receipt": "A receipt is mandatory before submission."})
     expense.status = Expense.Status.PENDING_APPROVAL
     expense.rejection_reason = ""
     expense.save(update_fields=["status", "rejection_reason", "updated_at"])
@@ -154,11 +141,24 @@ def _current_approval_step(expense):
     return expense.approval_steps.filter(status=ApprovalStep.Status.PENDING).order_by("id").first()
 
 
+def _ensure_manager_review_step(expense):
+    """Repair legacy pending expenses that predate the manager-review step."""
+    step = _current_approval_step(expense)
+    if step is not None:
+        return step
+    manager_step, _ = ApprovalStep.objects.get_or_create(
+        expense=expense,
+        step_name="Manager Review",
+        defaults={"status": ApprovalStep.Status.PENDING},
+    )
+    return manager_step if manager_step.status == ApprovalStep.Status.PENDING else None
+
+
 @transaction.atomic
 def approve_expense(expense, actor):
     if not can_approve(actor, expense):
         raise PermissionDenied("Only the assigned manager or an admin can approve this expense.")
-    step = _current_approval_step(expense)
+    step = _ensure_manager_review_step(expense)
     if not step or step.step_name != "Manager Review":
         raise ValidationError("This expense is not waiting for manager approval.")
     now = timezone.now()
@@ -180,7 +180,7 @@ def reject_expense(expense, actor, reason):
     reason = str(reason or "").strip()
     if not reason:
         raise ValidationError({"reason": "A reason is required when rejecting an expense."})
-    step = _current_approval_step(expense)
+    step = _ensure_manager_review_step(expense)
     if not step or step.step_name != "Manager Review":
         raise ValidationError("This expense is not waiting for manager approval.")
     step.status = ApprovalStep.Status.REJECTED
@@ -202,7 +202,7 @@ def request_expense_changes(expense, actor, comment):
     comment = str(comment or "").strip()
     if not comment:
         raise ValidationError({"comment": "A comment is required when requesting changes."})
-    step = _current_approval_step(expense)
+    step = _ensure_manager_review_step(expense)
     if not step or step.step_name != "Manager Review":
         raise ValidationError("This expense is not waiting for manager approval.")
     step.status = ApprovalStep.Status.REJECTED
@@ -238,7 +238,12 @@ def _organization_user(user_id, organization):
 
 @transaction.atomic
 def mark_expense_paid(expense, actor, data):
-    if not can_process_payment(actor, expense):
+    expense = Expense.objects.select_for_update().get(pk=expense.pk)
+    if not expense or expense.is_deleted or expense.status != Expense.Status.APPROVED or not _has_any(actor, expense.organization, EXPENSE_PERMISSIONS["mark_paid"]):
+        raise PermissionDenied("Only Finance or an authorized admin can mark an expense paid.")
+    if expense.payment_status == Expense.PaymentStatus.PAID:
+        raise ExpenseAlreadyPaid
+    if expense.payment_status != Expense.PaymentStatus.UNPAID:
         raise PermissionDenied("Only Finance or an authorized admin can mark an expense paid.")
     method = data.get("payment_method") or expense.payment_method
     if method not in Expense.PaymentMethod.values:
@@ -249,7 +254,9 @@ def mark_expense_paid(expense, actor, data):
         raise ValidationError({"paid_amount": "Use a valid amount."}) from error
     if paid_amount <= 0 or paid_amount > expense.amount:
         raise ValidationError({"paid_amount": "Paid amount must be positive and cannot exceed the expense amount."})
-    paid_by = _organization_user(data.get("paid_by", actor.id), expense.organization)
+    raw_paid_by = data.get("paid_by")
+    paid_by_id = actor.id if raw_paid_by is None or not str(raw_paid_by).strip() else raw_paid_by
+    paid_by = _organization_user(paid_by_id, expense.organization)
     payment = Payment.objects.create(
         expense=expense,
         payment_method=method,

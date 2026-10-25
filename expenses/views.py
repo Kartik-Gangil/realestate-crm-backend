@@ -17,7 +17,7 @@ from rest_framework.response import Response
 from core.files import private_file_response
 
 from inventory.models import Project
-from organizations.services import has_permission, is_platform_admin
+from organizations.services import get_organization_access, get_project_context, has_permission, is_platform_admin
 from organizations.models import OrganizationMembership
 
 from .models import ActivityLog, Expense, ExpenseCategory, Payment, ReimbursementRequest
@@ -34,6 +34,7 @@ from .services import (
     can_reject,
     can_view,
     cancel_expense,
+    ExpenseAlreadyPaid,
     log_activity,
     mark_expense_paid,
     reject_expense,
@@ -120,7 +121,9 @@ def _serialize_expense(expense, request, detailed=False):
     return data
 
 
-def _expense_queryset(organization, project):
+def _expense_queryset(organization, project, _access=None):
+    # Expense visibility is governed by expenses.* permissions (view, view_own,
+    # view_team), not by the cross-module employee data-scope selector.
     return Expense.objects.filter(
         organization=organization,
         project=project,
@@ -174,7 +177,7 @@ def category_detail(request, category_id):
 def expense_list(request):
     organization, project = _organization_context(request)
     if request.method == "GET":
-        expenses = Expense.objects.filter(organization=organization, project=project, is_deleted=False).select_related("category", "submitted_by", "paid_by").prefetch_related("approval_steps", "activity_logs")
+        expenses = _expense_queryset(organization, project, get_organization_access(request.user, organization.slug)).filter(is_deleted=False)
         for field in ("status", "payment_status"):
             if request.query_params.get(field):
                 expenses = expenses.filter(**{field: request.query_params[field]})
@@ -226,7 +229,8 @@ def expense_list(request):
 
 def _get_scoped_expense(request, expense_id):
     organization, project = _organization_context(request)
-    return get_object_or_404(_expense_queryset(organization, project), pk=expense_id), organization, project
+    access = get_organization_access(request.user, organization.slug)
+    return get_object_or_404(_expense_queryset(organization, project, access), pk=expense_id), organization, project
 
 
 @api_view(["GET", "PATCH"])
@@ -284,7 +288,8 @@ def expense_cancel(request, expense_id):
 
 def _approval_queue(request):
     organization, project = _organization_context(request)
-    queryset = _expense_queryset(organization, project).filter(status=Expense.Status.PENDING_APPROVAL, is_deleted=False)
+    access = get_organization_access(request.user, organization.slug)
+    queryset = _expense_queryset(organization, project, access).filter(status=Expense.Status.PENDING_APPROVAL, is_deleted=False)
     return [expense for expense in queryset if can_approve(request.user, expense) or can_reject(request.user, expense)]
 
 
@@ -345,7 +350,8 @@ def _payment_dict(payment):
 
 def _payment_queue(request, paid):
     organization, project = _organization_context(request)
-    queryset = _expense_queryset(organization, project).filter(
+    access = get_organization_access(request.user, organization.slug)
+    queryset = _expense_queryset(organization, project, access).filter(
         status=Expense.Status.APPROVED,
         payment_status=Expense.PaymentStatus.PAID if paid else Expense.PaymentStatus.UNPAID,
         is_deleted=False,
@@ -388,6 +394,11 @@ def expense_mark_paid(request, expense_id):
     expense, _, _ = _get_scoped_expense(request, expense_id)
     try:
         payment = mark_expense_paid(expense, request.user, request.data)
+    except ExpenseAlreadyPaid:
+        return Response(
+            {"detail": "This expense has already been paid.", "code": "expense_already_paid"},
+            status=status.HTTP_409_CONFLICT,
+        )
     except (ValidationError, DjangoValidationError) as error:
         return Response(error.message_dict if hasattr(error, "message_dict") else {"detail": error.messages}, status=status.HTTP_400_BAD_REQUEST)
     return Response(_envelope(_payment_dict(payment), request=request), status=status.HTTP_201_CREATED)
@@ -493,7 +504,9 @@ def reimbursement_reject(request, reimbursement_id):
 @permission_classes([IsAuthenticated])
 def expense_history(request):
     organization, project = _organization_context(request)
-    query = ActivityLog.objects.filter(expense__organization=organization, expense__project=project).select_related("expense", "actor")
+    access = get_organization_access(request.user, organization.slug)
+    scoped_expenses = _expense_queryset(organization, project, access)
+    query = ActivityLog.objects.filter(expense__in=scoped_expenses).select_related("expense", "actor")
     if request.query_params.get("action"):
         query = query.filter(action=request.query_params["action"])
     items = [item for item in query if can_view(request.user, item.expense) or can_approve(request.user, item.expense)]
@@ -526,14 +539,16 @@ def _paginate_history(request, items):
 @permission_classes([IsAuthenticated])
 def deleted_expenses(request):
     organization, project = _organization_context(request)
-    query = _expense_queryset(organization, project).filter(is_deleted=True)
+    access = get_organization_access(request.user, organization.slug)
+    query = _expense_queryset(organization, project, access).filter(is_deleted=True)
     items = [expense for expense in query if can_view(request.user, expense) or can_approve(request.user, expense)]
     return Response(_envelope(_paginate(request, items), request=request))
 
 
 def _report_items(request):
     organization, project = _organization_context(request)
-    query = _expense_queryset(organization, project).filter(is_deleted=False)
+    access = get_organization_access(request.user, organization.slug)
+    query = _expense_queryset(organization, project, access).filter(is_deleted=False)
     start_date = _parse_date(request.query_params, "start")
     end_date = _parse_date(request.query_params, "end")
     if start_date and end_date and start_date > end_date:
@@ -629,9 +644,7 @@ def report_export(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def expense_receipt(request, expense_id):
-    organization, project = _organization_context(request)
-    expenses = Expense.objects.filter(organization=organization)
-    if project:
-        expenses = expenses.filter(project=project)
-    expense = get_object_or_404(expenses, pk=expense_id)
+    expense, _organization, _project = _get_scoped_expense(request, expense_id)
+    if not can_view(request.user, expense) and not can_approve(request.user, expense) and not can_reject(request.user, expense):
+        raise PermissionDenied("You do not have access to this expense receipt.")
     return private_file_response(expense.receipt, filename=os.path.basename(expense.receipt.name or "") or "receipt")

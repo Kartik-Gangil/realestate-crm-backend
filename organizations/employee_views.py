@@ -57,8 +57,14 @@ def _employee_to_dict(employee, request=None, detailed=False):
     photo = f"/api/organizations/{employee.organization.slug}/employees/{employee.id}/photo/" if employee.profile_photo else None
     name_first = employee.first_name or employee.user.first_name
     name_last = employee.last_name or employee.user.last_name
+    role_code = (employee.organization_role.code if employee.organization_role_id else employee.role or "").strip().lower()
+    permission_codes = {f"{module}.{action}" for module, action in membership_permission_codes(employee)}
+    can_process_expense_payment = role_code in {"admin", "manager", "finance"} or bool(
+        permission_codes & {"expenses.mark_paid", "expenses.process_payment"}
+    )
     data = {
         "id": employee.id,
+        "user_id": employee.user_id,
         "employee_id": employee.employee_id,
         "name": " ".join(part for part in (name_first, name_last) if part).strip() or employee.user.email,
         "first_name": name_first,
@@ -77,6 +83,7 @@ def _employee_to_dict(employee, request=None, detailed=False):
         "role_id": employee.organization_role_id,
         "role_name": employee.organization_role.name if employee.organization_role_id else employee.role,
         "role_code": employee.organization_role.code if employee.organization_role_id else employee.role,
+        "can_process_expense_payment": can_process_expense_payment,
         "access_scope": employee.access_scope,
         "status": "active" if employee.is_active else "inactive",
         "is_active": employee.is_active,
@@ -267,7 +274,15 @@ def employee_list(request, organization_slug):
     serializer = EmployeeCreateSerializer(data=request.data, context={"organization": access.organization})
     serializer.is_valid(raise_exception=True)
     data = serializer.validated_data
-    _assert_role_change_allowed(access, data["role"])
+    assigned_role = None
+    if data.get("role_id") is not None:
+        assigned_role = OrganizationRole.objects.filter(
+            organization=access.organization, pk=data["role_id"]
+        ).first()
+        if assigned_role is None:
+            return Response({"role_id": ["Use a role from this organization."]}, status=status.HTTP_400_BAD_REQUEST)
+        data.pop("role_id")
+    _assert_role_change_allowed(access, assigned_role.code if assigned_role else data["role"])
     if not access.is_platform and not has_permission(access.membership.user, access.organization, "settings.edit"):
         if data["access_scope"] != OrganizationMembership.AccessScope.ALL or data.get("custom_scope_memberships") or data.get("custom_scope_departments"):
             raise PermissionDenied("Only organization admins can assign employee access scopes.")
@@ -293,7 +308,11 @@ def employee_list(request, organization_slug):
                 organization=organization, user=user, employee_id=employee_identifier,
                 role=data["role"], first_name=data["first_name"], last_name=data.get("last_name", ""),
             )
-            employee.organization_role = ensure_default_roles(organization)[data["role"]]
+            employee.organization_role = (
+                OrganizationRole.objects.get(organization=organization, pk=assigned_role.pk)
+                if assigned_role is not None
+                else ensure_default_roles(organization)[data["role"]]
+            )
             for field in ("profile_photo", "mobile_number", "address", "date_of_birth", "gender", "designation",
                           "date_of_joining", "employment_type", "salary", "work_location", "access_scope"):
                 if field in data:

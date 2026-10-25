@@ -11,7 +11,7 @@ from rest_framework.parsers import JSONParser, MultiPartParser, FormParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from organizations.services import get_organization_access, get_project_context
+from organizations.services import apply_data_scope, get_organization_access, get_project_context
 from core.files import AUDIO_KINDS, private_file_response, validate_upload
 from .models import FollowUpCall, Lead
 from .serializers import follow_up_to_dict, lead_to_dict
@@ -38,6 +38,7 @@ def _queue_leads(access, project):
     leads = Lead.objects.filter(organization=access.organization, project=project).select_related("assigned_membership__user")
     if not access.can_view_all_leads:
         leads = leads.filter(assigned_membership=access.membership)
+    leads = apply_data_scope(leads, access, module="telecalling", membership_lookups=("assigned_membership",))
     follow_ups = FollowUpCall.objects.filter(lead=OuterRef("pk"))
     pending_filter = Q(follow_up_calls__called_at__isnull=True)
     follow_up_count_filter = Q(follow_up_calls__next_follow_up__isnull=False)
@@ -90,6 +91,7 @@ def telecalling_call_log(request, organization_slug):
     lead = Lead.objects.filter(organization=access.organization, project=project, pk=request.data.get("lead_id"))
     if not access.can_view_all_leads:
         lead = lead.filter(assigned_membership=access.membership)
+    lead = apply_data_scope(lead, access, module="telecalling", membership_lookups=("assigned_membership",))
     lead = lead.first()
     if lead is None:
         return Response({"detail": "Lead is not assigned to this telecaller."}, status=status.HTTP_404_NOT_FOUND)
@@ -139,6 +141,12 @@ def telecalling_analytics(request, organization_slug):
     calls = FollowUpCall.objects.filter(organization=access.organization, lead__project=project)
     if not access.can_view_all_leads:
         calls = calls.filter(telecaller_membership=access.membership)
+    calls = apply_data_scope(
+        calls,
+        access,
+        module="telecalling",
+        membership_lookups=("telecaller_membership", "lead__assigned_membership"),
+    )
     today = timezone.localdate()
     return Response({"calls_today": calls.filter(called_at__date=today).count(), "connected": calls.filter(outcome__in=["Interested", "connected"]).count(), "follow_ups_due": calls.filter(next_follow_up__date__lte=today, next_follow_up__isnull=False).count()})
 
@@ -151,5 +159,11 @@ def telecalling_call_recording(request, organization_slug, call_id):
     calls = FollowUpCall.objects.filter(organization=access.organization, lead__project=project)
     if not access.can_view_all_leads:
         calls = calls.filter(telecaller_membership=access.membership)
+    calls = apply_data_scope(
+        calls,
+        access,
+        module="telecalling",
+        membership_lookups=("telecaller_membership", "lead__assigned_membership"),
+    )
     call = get_object_or_404(calls, pk=call_id)
     return private_file_response(call.call_recording, filename=os.path.basename(call.call_recording.name or "") or "recording")

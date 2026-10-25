@@ -48,6 +48,26 @@ def overview(request):
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
+def organization_overview(request, organization_slug):
+    access = _org_access(request, organization_slug)
+    organization = access.organization
+    last_general = OrganizationSettings.objects.filter(organization=organization).values_list("updated_at", flat=True).first()
+    return Response({
+        "organization_slug": organization.slug,
+        "general_last_updated": last_general,
+        "total_users": OrganizationMembership.objects.filter(organization=organization).count(),
+        "total_roles": OrganizationRole.objects.filter(organization=organization).count(),
+        "total_master_records": MasterData.objects.filter(organization=organization).count(),
+        "active_integrations": IntegrationConfiguration.objects.filter(organization=organization, enabled=True).count(),
+        "total_parameters": SystemParameter.objects.filter(organization=organization).count(),
+        "total_audit_logs": AuditLog.objects.filter(organization=organization).count(),
+        "last_backup_date": None,
+        "last_backup_size": "0 MB",
+    })
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
 def organizations(request):
     require_platform_settings(request.user)
     query = Organization.objects.order_by("name")

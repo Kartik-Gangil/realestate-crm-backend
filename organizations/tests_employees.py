@@ -177,6 +177,11 @@ class EmployeeApiTests(TestCase):
         self.assertIsNone(self.viewer_membership.department_id)
 
     def test_create_list_search_filter_and_activity(self):
+        directory = self.client.get(self.employees_url())
+        self.assertEqual(directory.status_code, 200, directory.data)
+        admin_row = next(item for item in directory.data["results"] if item["email"] == self.admin.email)
+        self.assertEqual(admin_row["user_id"], self.admin.id)
+
         response = self.client.post(self.employees_url(), self.create_payload(), format="json")
         self.assertEqual(response.status_code, 201, response.data)
         employee = OrganizationMembership.objects.get(user__email="new.employee@example.com")
@@ -192,6 +197,54 @@ class EmployeeApiTests(TestCase):
     def test_cross_organization_objects_and_employees_are_not_usable(self):
         response = self.client.post(self.employees_url(), self.create_payload(department=self.other_department.id), format="json")
         self.assertEqual(response.status_code, 400)
+
+    def test_employee_list_marks_only_finance_payment_eligible_members(self):
+        user_model = get_user_model()
+        finance_user = user_model.objects.create_user(username="finance@example.com", email="finance@example.com")
+        finance_role = OrganizationRole.objects.create(organization=self.org, name="Finance", code="finance")
+        finance_membership = OrganizationMembership.objects.create(
+            organization=self.org, user=finance_user, role="finance", organization_role=finance_role, employee_id="EMP0004"
+        )
+
+        permission_user = user_model.objects.create_user(username="payment-reviewer@example.com", email="payment-reviewer@example.com")
+        payment_role = OrganizationRole.objects.create(
+            organization=self.org, name="Payment Reviewer", code="payment-reviewer"
+        )
+        mark_paid, _ = Permission.objects.get_or_create(
+            module="expenses", action="mark_paid", defaults={"name": "Mark expenses as paid"}
+        )
+        payment_role.permissions.add(mark_paid)
+        permission_membership = OrganizationMembership.objects.create(
+            organization=self.org, user=permission_user, role="payment-reviewer",
+            organization_role=payment_role, employee_id="EMP0005",
+        )
+
+        response = self.client.get(self.employees_url())
+
+        self.assertEqual(response.status_code, 200, response.data)
+        eligibility = {item["email"]: item["can_process_expense_payment"] for item in response.data["results"]}
+        self.assertTrue(eligibility[self.admin.email])
+        self.assertTrue(eligibility[self.manager.email])
+        self.assertTrue(eligibility[finance_user.email])
+        self.assertTrue(eligibility[permission_user.email])
+        self.assertFalse(eligibility[self.viewer.email])
+        self.assertEqual(finance_membership.employee_id, "EMP0004")
+        self.assertEqual(permission_membership.employee_id, "EMP0005")
+
+    def test_employee_create_uses_the_selected_organization_role(self):
+        selected_role = OrganizationRole.objects.create(
+            organization=self.org, name="Expense Reviewer", code="expense-reviewer"
+        )
+        payload = self.create_payload()
+        payload.pop("role")
+        payload["role_id"] = selected_role.id
+
+        response = self.client.post(self.employees_url(), payload, format="json")
+
+        self.assertEqual(response.status_code, 201, response.data)
+        employee = OrganizationMembership.objects.get(user__email="new.employee@example.com")
+        self.assertEqual(employee.organization_role_id, selected_role.id)
+        self.assertEqual(response.data["role_name"], "Expense Reviewer")
         response = self.client.post(self.employees_url(), self.create_payload(reporting_manager=self.other_membership.id), format="json")
         self.assertEqual(response.status_code, 400)
         self.assertEqual(self.client.get(self.detail_url(self.other_membership)).status_code, 404)

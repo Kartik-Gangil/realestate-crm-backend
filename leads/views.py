@@ -14,7 +14,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from organizations.models import OrganizationMembership
-from organizations.services import get_organization_access, get_project_context, has_permission
+from organizations.services import apply_data_scope, get_organization_access, get_project_context, has_permission
 from .models import FollowUpCall, Lead , Sitevisit , SitevisitReschedule
 from .serializers import (
     follow_up_to_dict,
@@ -89,14 +89,37 @@ def _parse_time(value, field_name):
     return parsed
 
 
-def _site_visits_for_access(access, leads, project=None):
+def _site_visits_for_access(access, leads=None, project=None):
     visits = Sitevisit.objects.filter(
         organization=access.organization,
-        lead__in=leads,
     ).select_related(
         "organization", "lead", "executive_membership__user", "created_by"
     ).prefetch_related("reschedules")
-    return visits.filter(project=project) if project is not None else visits
+    # A visit is historical activity. Listing it must not depend on the lead's
+    # current assignment, otherwise unassigning a lead erases the visit from
+    # the telecaller who previously handled it. Callers that are validating a
+    # lead relationship (for example inventory booking) may still pass a
+    # restricted lead queryset explicitly.
+    if leads is not None:
+        visits = visits.filter(lead__in=leads)
+    if leads is None and not access.can_view_all_leads:
+        # Telecallers and other non-manager users keep access to visits they
+        # historically handled, even after the linked lead is unassigned.
+        visits = visits.filter(
+            Q(executive_membership=access.membership)
+            | Q(created_by=access.membership.user)
+        )
+    if project is not None:
+        # Older visits may not have a project reference yet. They remain
+        # project-safe when their linked lead belongs to the active project.
+        visits = visits.filter(Q(project=project) | Q(project__isnull=True, lead__project=project))
+    return apply_data_scope(
+        visits,
+        access,
+        module="site_visits",
+        membership_lookups=("executive_membership", "lead__assigned_membership"),
+        user_lookups=("created_by",),
+    )
 
 
 def _schedule_validation(visit_date, visit_time):
@@ -156,7 +179,9 @@ def _leads_for_access(access, project=None):
     leads = Lead.objects.filter(organization=access.organization).select_related("organization", "assigned_membership__user")
     if project is not None:
         leads = leads.filter(project=project)
-    return leads if access.can_view_all_leads else leads.filter(assigned_membership=access.membership)
+    if not access.can_view_all_leads:
+        leads = leads.filter(assigned_membership=access.membership)
+    return apply_data_scope(leads, access, module="leads", membership_lookups=("assigned_membership",))
 
 
 def _require_lead_management(access):
@@ -269,11 +294,7 @@ def remove_assignment_of_lead(request ,organization_slug):
     project = get_project_context(request, access)
     _require_lead_management(access)
 
-    leads = Lead.objects.filter(
-        organization=access.organization,
-        project=project,
-        assigned_membership__isnull=False,
-    )
+    leads = _leads_for_access(access, project).filter(assigned_membership__isnull=False)
 
     updated_count = leads.update(
         assigned_membership=None,
@@ -294,7 +315,7 @@ def assign_lead(request, organization_slug, lead_id):
     access = get_organization_access(request.user, organization_slug)
     project = get_project_context(request, access)
     _require_lead_management(access)
-    lead = get_object_or_404(Lead.objects.filter(organization=access.organization, project=project), pk=lead_id)
+    lead = get_object_or_404(_leads_for_access(access, project), pk=lead_id)
     membership_id = request.data.get("telecaller_membership")
     if not membership_id:
         return Response({"telecaller_membership": ["This field is required."]}, status=status.HTTP_400_BAD_REQUEST)
@@ -619,7 +640,7 @@ def sitevisit_dashboard(request, organization_slug):
     leads = _leads_for_access(access, project)
     if request.method == "GET":
         try:
-            site_visits = _filter_site_visits(_site_visits_for_access(access, leads, project), request.query_params)
+            site_visits = _filter_site_visits(_site_visits_for_access(access, project=project), request.query_params)
         except ValidationError as exc:
             return _validation_response(exc)
         return Response({
@@ -664,7 +685,6 @@ def sitevisit_dashboard(request, organization_slug):
 def rescheduledSitevisit(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
     project = get_project_context(request, access)
-    leads = _leads_for_access(access, project)
 
     if request.method == "GET":
         rescheduled_sitevisits = SitevisitReschedule.objects.select_related(
@@ -673,8 +693,8 @@ def rescheduledSitevisit(request, organization_slug):
             "site_visit__created_by",
         ).filter(
             site_visit__organization=access.organization,
-            site_visit__lead__in=leads,
             site_visit__project=project,
+            site_visit__in=_site_visits_for_access(access, project=project),
         )
         return Response({
             "organization": access.organization.slug,
@@ -705,11 +725,7 @@ def rescheduledSitevisit(request, organization_slug):
 
     with transaction.atomic():
         try:
-            site_visit = Sitevisit.objects.select_for_update().get(
-                id=site_visit_id,
-                organization=access.organization,
-                lead__in=leads,
-            )
+            site_visit = _site_visits_for_access(access, project=project).select_for_update().get(id=site_visit_id)
         except Sitevisit.DoesNotExist:
             return Response(
                 {"error": "Site visit not found or you don't have access to it."},
@@ -758,8 +774,8 @@ def _filter_site_visits(queryset, params):
     return queryset.order_by("visit_date", "visit_time", "id")
 
 
-def _get_site_visit_or_404(access, leads, site_visit_id, for_update=False):
-    queryset = _site_visits_for_access(access, leads)
+def _get_site_visit_or_404(access, leads, site_visit_id, for_update=False, project=None):
+    queryset = _site_visits_for_access(access, leads, project=project)
     if for_update:
         queryset = queryset.select_for_update()
     return get_object_or_404(queryset, pk=site_visit_id)
@@ -770,13 +786,12 @@ def _get_site_visit_or_404(access, leads, site_visit_id, for_update=False):
 def sitevisit_detail(request, organization_slug, site_visit_id):
     access = get_organization_access(request.user, organization_slug)
     project = get_project_context(request, access)
-    leads = _leads_for_access(access, project)
     if request.method == "GET":
-        visit = _get_site_visit_or_404(access, leads, site_visit_id)
+        visit = _get_site_visit_or_404(access, None, site_visit_id, project=project)
         return Response(site_visit_to_dict(visit, include_history=True))
 
     with transaction.atomic():
-        visit = _get_site_visit_or_404(access, leads, site_visit_id, for_update=True)
+        visit = _get_site_visit_or_404(access, None, site_visit_id, for_update=True, project=project)
         payload = request.data
         allowed = {"visit_date", "visit_time", "duration_minutes", "executive", "site", "location", "customer_preference", "notes", "status", "reschedule_reason"}
         unknown = set(payload) - allowed
@@ -808,7 +823,6 @@ def sitevisit_reschedule(request, organization_slug, site_visit_id):
     """Resource-oriented reschedule endpoint; the legacy collection endpoint remains supported."""
     access = get_organization_access(request.user, organization_slug)
     project = get_project_context(request, access)
-    leads = _leads_for_access(access, project)
     try:
         new_date = _parse_date(request.data.get("new_date"), "new_date")
         new_time = _parse_time(request.data.get("new_time"), "new_time")
@@ -816,7 +830,7 @@ def sitevisit_reschedule(request, organization_slug, site_visit_id):
     except ValidationError as exc:
         return _validation_response(exc)
     with transaction.atomic():
-        visit = _get_site_visit_or_404(access, leads, site_visit_id, for_update=True)
+        visit = _get_site_visit_or_404(access, None, site_visit_id, for_update=True, project=project)
         try:
             history = _reschedule_site_visit(visit, new_date, new_time, request.data.get("reason"))
         except ValidationError as exc:
@@ -829,12 +843,11 @@ def sitevisit_reschedule(request, organization_slug, site_visit_id):
 def sitevisit_cancel(request, organization_slug, site_visit_id):
     access = get_organization_access(request.user, organization_slug)
     project = get_project_context(request, access)
-    leads = _leads_for_access(access, project)
     reason = str(request.data.get("cancellation_reason", "")).strip()
     if not reason:
         return Response({"cancellation_reason": "This field is required."}, status=status.HTTP_400_BAD_REQUEST)
     with transaction.atomic():
-        visit = _get_site_visit_or_404(access, leads, site_visit_id, for_update=True)
+        visit = _get_site_visit_or_404(access, None, site_visit_id, for_update=True, project=project)
         try:
             visit.transition_to(Sitevisit.Status.CANCELLED)
             visit.cancellation_reason = reason
@@ -854,7 +867,6 @@ def sitevisit_cancel(request, organization_slug, site_visit_id):
 def sitevisit_no_show(request, organization_slug, site_visit_id):
     access = get_organization_access(request.user, organization_slug)
     project = get_project_context(request, access)
-    leads = _leads_for_access(access, project)
     try:
         after_minutes = int(request.data.get("after_minutes", 15))
         if not 0 <= after_minutes <= 1440:
@@ -862,7 +874,7 @@ def sitevisit_no_show(request, organization_slug, site_visit_id):
     except (TypeError, ValueError):
         return Response({"after_minutes": "Use a whole number from 0 to 1440."}, status=status.HTTP_400_BAD_REQUEST)
     with transaction.atomic():
-        visit = _get_site_visit_or_404(access, leads, site_visit_id, for_update=True)
+        visit = _get_site_visit_or_404(access, None, site_visit_id, for_update=True, project=project)
         if not visit.visit_date or not visit.visit_time:
             return Response({"visit_date": "The visit must have a date and time."}, status=status.HTTP_400_BAD_REQUEST)
         visit_at = timezone.make_aware(datetime.combine(visit.visit_date, visit.visit_time), timezone.get_current_timezone())
@@ -885,7 +897,6 @@ def sitevisit_no_show(request, organization_slug, site_visit_id):
 def sitevisit_outcome(request, organization_slug, site_visit_id):
     access = get_organization_access(request.user, organization_slug)
     project = get_project_context(request, access)
-    leads = _leads_for_access(access, project)
     outcome = request.data.get("outcome")
     if outcome not in Sitevisit.Outcome.values:
         return Response({"outcome": "Use a valid outcome."}, status=status.HTTP_400_BAD_REQUEST)
@@ -894,7 +905,7 @@ def sitevisit_outcome(request, organization_slug, site_visit_id):
     except (TypeError, ValueError):
         return Response({"interest_level": "Use an integer from 1 to 5."}, status=status.HTTP_400_BAD_REQUEST)
     with transaction.atomic():
-        visit = _get_site_visit_or_404(access, leads, site_visit_id, for_update=True)
+        visit = _get_site_visit_or_404(access, None, site_visit_id, for_update=True, project=project)
         try:
             visit.transition_to(Sitevisit.Status.COMPLETED)
             visit.outcome = outcome
@@ -912,7 +923,7 @@ def sitevisit_outcome(request, organization_slug, site_visit_id):
 def sitevisit_history(request, organization_slug, site_visit_id):
     access = get_organization_access(request.user, organization_slug)
     project = get_project_context(request, access)
-    visit = _get_site_visit_or_404(access, _leads_for_access(access, project), site_visit_id)
+    visit = _get_site_visit_or_404(access, None, site_visit_id, project=project)
     return Response(site_visit_to_dict(visit, include_history=True))
 
 
@@ -942,7 +953,7 @@ def _paginate(queryset, params):
 def sitevisit_upcoming(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
     project = get_project_context(request, access)
-    visits = _site_visits_for_access(access, _leads_for_access(access, project), project).filter(
+    visits = _site_visits_for_access(access, project=project).filter(
         visit_date__gte=timezone.localdate(),
         status__in=[Sitevisit.Status.SCHEDULED, Sitevisit.Status.UPCOMING, Sitevisit.Status.RESCHEDULED],
     ).order_by("visit_date", "visit_time", "id")
@@ -961,7 +972,7 @@ def sitevisit_upcoming(request, organization_slug):
 def sitevisit_today(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
     project = get_project_context(request, access)
-    visits = _site_visits_for_access(access, _leads_for_access(access, project), project).filter(visit_date=timezone.localdate())
+    visits = _site_visits_for_access(access, project=project).filter(visit_date=timezone.localdate())
     if executive := request.query_params.get("executive"):
         visits = visits.filter(executive_membership_id=executive)
     return Response({"date": timezone.localdate().isoformat(), "count": visits.count(), "results": [site_visit_to_dict(visit) for visit in visits.order_by("visit_time", "id")]})
@@ -973,7 +984,7 @@ def sitevisit_calendar(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
     project = get_project_context(request, access)
     try:
-        visits = _filter_site_visits(_site_visits_for_access(access, _leads_for_access(access, project), project), request.query_params)
+        visits = _filter_site_visits(_site_visits_for_access(access, project=project), request.query_params)
         if not request.query_params.get("start_date") and not request.query_params.get("month"):
             raise ValidationError({"start_date": "Provide start_date/end_date or month for calendar data."})
     except ValidationError as exc:
@@ -993,7 +1004,7 @@ def sitevisit_analytics(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
     project = get_project_context(request, access)
     try:
-        visits = _filter_site_visits(_site_visits_for_access(access, _leads_for_access(access, project), project), request.query_params)
+        visits = _filter_site_visits(_site_visits_for_access(access, project=project), request.query_params)
     except ValidationError as exc:
         return _validation_response(exc)
     summary = visits.aggregate(total_visits=Count("id"), average_interest_level=Avg("interest_level"))

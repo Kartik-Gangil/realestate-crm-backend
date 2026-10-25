@@ -32,6 +32,29 @@ def _role(role):
             "permissions": [item.code for item in role.permissions.all()]}
 
 
+def _validated_permission_ids(raw_permission_ids):
+    if not isinstance(raw_permission_ids, list):
+        return None, "Provide permission_ids as a list of numeric IDs."
+
+    permission_ids = []
+    for raw_id in raw_permission_ids:
+        if isinstance(raw_id, bool):
+            return None, "Use valid unique permission IDs."
+        if isinstance(raw_id, int):
+            permission_id = raw_id
+        elif isinstance(raw_id, str) and raw_id.strip().isdigit():
+            permission_id = int(raw_id.strip())
+        else:
+            return None, "Use valid unique permission IDs."
+        if permission_id <= 0:
+            return None, "Use valid unique permission IDs."
+        permission_ids.append(permission_id)
+
+    if len(permission_ids) != len(set(permission_ids)):
+        return None, "Use valid unique permission IDs."
+    return permission_ids, None
+
+
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def roles(request, organization_slug):
@@ -41,6 +64,9 @@ def roles(request, organization_slug):
     _manage(access)
     name, code = str(request.data.get("name", "")).strip(), str(request.data.get("code", "")).strip().lower()
     permission_ids = request.data.get("permission_ids", [])
+    permission_ids, permission_error = _validated_permission_ids(permission_ids)
+    if permission_error:
+        return Response({"permission_ids": permission_error}, status=400)
     if not name or not code:
         return Response({"detail": "name and code are required."}, status=400)
     permissions = list(Permission.objects.filter(pk__in=permission_ids))
@@ -74,8 +100,11 @@ def role_detail(request, organization_slug, role_id):
     for field in ("name", "code"):
         if field in request.data: setattr(role, field, str(request.data[field]).strip())
     if "permission_ids" in request.data:
-        selected = list(Permission.objects.filter(pk__in=request.data["permission_ids"]))
-        if len(selected) != len(set(request.data["permission_ids"])): return Response({"permission_ids": "Use valid unique permission IDs."}, status=400)
+        permission_ids, permission_error = _validated_permission_ids(request.data["permission_ids"])
+        if permission_error:
+            return Response({"permission_ids": permission_error}, status=400)
+        selected = list(Permission.objects.filter(pk__in=permission_ids))
+        if len(selected) != len(permission_ids): return Response({"permission_ids": "Use valid unique permission IDs."}, status=400)
         role.permissions.set(selected)
     try: role.save()
     except IntegrityError: return Response({"name": "Role name and code must be unique within this organization."}, status=400)
@@ -195,7 +224,14 @@ def leaves(request, organization_slug):
 @api_view(["GET", "PATCH"])
 @permission_classes([IsAuthenticated])
 def leave_detail(request, organization_slug, leave_id):
-    access = get_organization_access(request.user, organization_slug); leave = get_object_or_404(LeaveRequest.objects.select_related("employee__user"), organization=access.organization, pk=leave_id)
+    access = get_organization_access(request.user, organization_slug)
+    leave = get_object_or_404(
+        LeaveRequest.objects.select_related("employee__user").filter(
+            organization=access.organization,
+            employee__in=_employees_for_access(access),
+        ),
+        pk=leave_id,
+    )
     if request.method == "GET": return Response(_leave(leave))
     if leave.employee_id != getattr(access.membership, "id", None) or leave.status != LeaveRequest.Status.PENDING: raise PermissionDenied("Only the requesting employee may edit a pending leave request.")
     if any(key in request.data for key in ("status", "days", "approved_by", "approved_at")): return Response({"detail": "Workflow and calculated fields are server controlled."}, status=400)
@@ -206,7 +242,14 @@ def leave_detail(request, organization_slug, leave_id):
 
 
 def _leave_action(request, slug, leave_id, approved):
-    access = get_organization_access(request.user, slug); leave = get_object_or_404(LeaveRequest.objects.filter(organization=access.organization), pk=leave_id)
+    access = get_organization_access(request.user, slug)
+    leave = get_object_or_404(
+        LeaveRequest.objects.filter(
+            organization=access.organization,
+            employee__in=_employees_for_access(access),
+        ),
+        pk=leave_id,
+    )
     try: leave = decide_leave(leave=leave, actor_membership=access.membership, actor=request.user, approved=approved, rejection_reason=str(request.data.get("rejection_reason", "")))
     except ValidationError as error: return _validation_response(error)
     return Response(_leave(LeaveRequest.objects.select_related("employee__user").get(pk=leave.pk)))
@@ -219,6 +262,13 @@ def leave_reject(request, organization_slug, leave_id): return _leave_action(req
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def leave_cancel(request, organization_slug, leave_id):
-    access = get_organization_access(request.user, organization_slug); leave = get_object_or_404(LeaveRequest.objects.filter(organization=access.organization), pk=leave_id)
+    access = get_organization_access(request.user, organization_slug)
+    leave = get_object_or_404(
+        LeaveRequest.objects.filter(
+            organization=access.organization,
+            employee__in=_employees_for_access(access),
+        ),
+        pk=leave_id,
+    )
     if leave.employee_id != getattr(access.membership, "id", None) or leave.status != LeaveRequest.Status.PENDING: raise PermissionDenied("Only a pending request can be cancelled by its employee.")
     leave.status = LeaveRequest.Status.CANCELLED; leave.save(update_fields=["status", "updated_at"]); log_activity(organization=access.organization, employee=leave.employee, action="leave_cancelled", actor=request.user, module="leave", details={"leave_id": leave.id}); return Response(_leave(leave))

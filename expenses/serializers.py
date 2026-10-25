@@ -1,11 +1,7 @@
-from decimal import Decimal, InvalidOperation
-
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
 from core.files import DOCUMENT_KINDS, validate_upload
-from system_settings.services import get_system_parameter
-
 from .models import MAX_RECEIPT_SIZE, Expense, ExpenseCategory
 
 
@@ -96,18 +92,3 @@ class ExpenseSerializer(serializers.ModelSerializer):
             validate_upload(value, kinds=DOCUMENT_KINDS, max_bytes=MAX_RECEIPT_SIZE, field=None)
         return value
 
-    def validate(self, attrs):
-        action = str(self.context.get("action", "draft")).lower().replace("_", "-")
-        amount = attrs.get("amount", getattr(self.instance, "amount", Decimal("0")))
-        receipt = attrs.get("receipt", getattr(self.instance, "receipt", None))
-        organization = self.context.get("organization") or getattr(self.instance, "organization", None)
-        threshold = Decimal("5000")
-        if organization:
-            configured = get_system_parameter(organization, "expense_receipt_threshold", threshold)
-            try:
-                threshold = Decimal(str(configured))
-            except (InvalidOperation, TypeError, ValueError):
-                raise serializers.ValidationError({"receipt": "The expense receipt threshold is misconfigured."})
-        if action in {"submit", "submit-for-approval"} and amount > threshold and not receipt:
-            raise serializers.ValidationError({"receipt": f"A receipt is required for expenses above ₹{threshold:,.2f}."})
-        return attrs

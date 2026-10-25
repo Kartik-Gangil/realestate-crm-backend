@@ -69,6 +69,18 @@ class RolePermissionUpdateTests(APITestCase):
 
         self.assertEqual(response.status_code, 200)
         codes = {item["code"] for item in response.data}
+        for module in (
+            "dashboard", "leads", "assigned_leads", "customers", "telecalling", "follow_ups",
+            "site_visits", "plots", "payments", "registry", "loans", "employees", "documents",
+            "expenses", "communication", "activity", "reports", "role", "settings", "employee",
+            "attendance", "leave",
+        ):
+            expected_actions = ("view", "add", "edit", "delete", "export", "approve")
+            self.assertTrue(
+                {f"{module}.{action}" for action in expected_actions} <= codes,
+                module,
+            )
+
         for module in ("assigned_leads", "site_visits", "loans"):
             self.assertTrue({f"{module}.{action}" for action in ("view", "add", "edit", "delete", "export")} <= codes)
 
@@ -90,4 +102,20 @@ class RolePermissionUpdateTests(APITestCase):
         self.assertEqual(
             set(updated.data["permissions"]),
             {"expenses.reject", "expenses.mark_paid"},
+        )
+
+    def test_permission_update_rejects_malformed_ids_without_server_error(self):
+        original_ids = set(self.role.permissions.values_list("id", flat=True))
+
+        response = self.client.patch(
+            f"/api/organizations/{self.organization.slug}/roles/{self.role.id}/",
+            {"permission_ids": [""]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("permission_ids", response.data)
+        self.assertEqual(
+            set(self.role.permissions.values_list("id", flat=True)),
+            original_ids,
         )

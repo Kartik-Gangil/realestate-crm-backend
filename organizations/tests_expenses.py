@@ -62,6 +62,21 @@ class ExpenseCategoryApiTests(TestCase):
 
         self.assertEqual(response.status_code, 403)
 
+    def test_receipt_download_requires_expense_visibility_permission(self):
+        expense = Expense.objects.create(
+            organization=self.org,
+            project=self.project,
+            submitted_by=self.admin,
+            category=self.category,
+            amount="125.00",
+            description="Restricted receipt",
+        )
+        self.authenticate(self.viewer)
+
+        response = self.client.get(f"/api/expenses/{expense.id}/receipt/")
+
+        self.assertEqual(response.status_code, 403)
+
     def test_expense_categories_are_available_in_django_admin(self):
         self.assertIn(ExpenseCategory, admin.site._registry)
 
@@ -81,7 +96,7 @@ class ExpenseCategoryApiTests(TestCase):
         self.assertEqual(response.data["data"]["receipt"], f"/api/expenses/{response.data['data']['id']}/receipt/")
         self.assertTrue(Expense.objects.filter(description="Taxi to client").exists())
 
-    def test_submission_without_receipt_above_threshold_is_rejected(self):
+    def test_task_p16_001_submission_without_receipt_above_threshold_is_allowed(self):
         self.authenticate(self.admin)
 
         response = self.client.post("/api/expenses/", {
@@ -89,8 +104,8 @@ class ExpenseCategoryApiTests(TestCase):
             "description": "Office equipment", "action": "submit",
         }, format="multipart")
 
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("receipt", response.data)
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["data"]["status"], "pending_approval")
 
     def test_forged_receipt_is_rejected_task_sec_001(self):
         self.authenticate(self.admin)

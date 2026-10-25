@@ -16,9 +16,10 @@ from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from organizations.services import get_organization_access, get_project_context, has_permission, membership_role_code
+from organizations.services import apply_data_scope, get_organization_access, get_project_context, has_permission, membership_role_code
 
 from leads.models import Lead, Sitevisit
+from leads.views import _leads_for_access, _site_visits_for_access
 from documents.models import CustomerDocument
 
 from .models import (Agreement, AgreementSignedDocument, Block, Installment, InstallmentPayment, Payment, PaymentAdjustment,
@@ -101,6 +102,7 @@ def _plots_for_access(access, project=None, include_active_hold=False):
     )
     if project is not None:
         queryset = queryset.filter(project=project)
+    queryset = apply_data_scope(queryset, access, module="plots", user_lookups=("created_by",))
     if include_active_hold:
         queryset = queryset.prefetch_related(
             Prefetch(
@@ -121,7 +123,9 @@ def _related_to_dict(instance, include_code=False):
 
 def _blocks_for_access(access, project=None):
     queryset = Block.objects.filter(organization=access.organization).select_related("organization")
-    return queryset.filter(project=project) if project is not None else queryset
+    if project is not None:
+        queryset = queryset.filter(project=project)
+    return apply_data_scope(queryset, access, module="plots", user_lookups=("plots__created_by",))
 
 
 def block_to_dict(block, detailed=False):
@@ -303,6 +307,13 @@ def _bookings_for_access(access, project=None):
     queryset = PlotBooking.objects.filter(organization=access.organization)
     if project is not None:
         queryset = queryset.filter(plot__project=project)
+    queryset = apply_data_scope(
+        queryset,
+        access,
+        module="plots",
+        membership_lookups=("lead__assigned_membership", "site_visit__executive_membership"),
+        user_lookups=("created_by",),
+    )
     return queryset.select_related(
         "organization", "lead", "plot", "plot__block", "site_visit", "created_by", "agreement"
     )
@@ -345,7 +356,7 @@ def booking_to_dict(booking, detailed=False):
     return data
 
 
-def _booking_payload(request, organization, *, plot_id=None):
+def _booking_payload(request, organization, access, *, plot_id=None):
     protected = set(request.data) & {"id", "organization", "organization_id", "created_by", "created_by_id", "status"}
     if protected:
         raise ValidationError({field: "This field cannot be supplied." for field in protected})
@@ -359,9 +370,11 @@ def _booking_payload(request, organization, *, plot_id=None):
     if selected_plot_id is None:
         raise ValidationError({"plot_id": "This field is required."})
     site_visit_id = _parse_positive_id(request.data, "site_visit_id")
-    lead = get_object_or_404(Lead.objects.filter(organization=organization), pk=lead_id)
-    plot = get_object_or_404(Plot.objects.filter(organization=organization), pk=selected_plot_id)
-    site_visit = get_object_or_404(Sitevisit.objects.filter(organization=organization), pk=site_visit_id) if site_visit_id else None
+    lead = get_object_or_404(_leads_for_access(access), pk=lead_id)
+    plot = get_object_or_404(_plots_for_access(access), pk=selected_plot_id)
+    site_visit = get_object_or_404(
+        _site_visits_for_access(access, _leads_for_access(access)).filter(pk=site_visit_id),
+    ) if site_visit_id else None
     return lead, plot, site_visit, str(request.data.get("notes", "")).strip()
 
 
@@ -632,7 +645,7 @@ def plot_select(request, organization_slug, plot_id):
     project = get_project_context(request, access)
     _require_inventory_management(access)
     try:
-        lead, plot, site_visit, notes = _booking_payload(request, access.organization, plot_id=plot_id)
+        lead, plot, site_visit, notes = _booking_payload(request, access.organization, access, plot_id=plot_id)
         if plot.project_id != project.id:
             raise ValidationError({"plot_id": "Plot does not belong to the active project."})
         booking = create_plot_booking(organization=access.organization, lead=lead, plot=plot, site_visit=site_visit, notes=notes, user=request.user)
@@ -649,7 +662,7 @@ def booking_list(request, organization_slug):
     if request.method == "POST":
         _require_inventory_management(access)
         try:
-            lead, plot, site_visit, notes = _booking_payload(request, access.organization)
+            lead, plot, site_visit, notes = _booking_payload(request, access.organization, access)
             if plot.project_id != project.id:
                 raise ValidationError({"plot_id": "Plot does not belong to the active project."})
             booking = create_plot_booking(organization=access.organization, lead=lead, plot=plot, site_visit=site_visit, notes=notes, user=request.user)
@@ -705,7 +718,7 @@ def booking_cancel(request, organization_slug, booking_id):
 def lead_bookings(request, organization_slug, lead_id):
     access = get_organization_access(request.user, organization_slug)
     project = get_project_context(request, access)
-    lead = get_object_or_404(Lead.objects.filter(organization=access.organization), pk=lead_id)
+    lead = get_object_or_404(_leads_for_access(access, project), pk=lead_id)
     try:
         return _booking_page_response(request, _filter_bookings(_bookings_for_access(access, project).filter(lead=lead), request.query_params, access.organization))
     except ValidationError as error:
@@ -717,7 +730,7 @@ def lead_bookings(request, organization_slug, lead_id):
 def plot_bookings(request, organization_slug, plot_id):
     access = get_organization_access(request.user, organization_slug)
     project = get_project_context(request, access)
-    plot = get_object_or_404(Plot.objects.filter(organization=access.organization), pk=plot_id)
+    plot = get_object_or_404(_plots_for_access(access, project), pk=plot_id)
     try:
         return _booking_page_response(request, _filter_bookings(_bookings_for_access(access, project).filter(plot=plot), request.query_params, access.organization))
     except ValidationError as error:
@@ -734,7 +747,14 @@ def _selection_to_dict(selection):
 
 
 def _selection_queryset(access):
-    return PlotSelection.objects.filter(organization=access.organization).select_related("plot", "lead", "site_visit", "selected_by")
+    queryset = PlotSelection.objects.filter(organization=access.organization).select_related("plot", "lead", "site_visit", "selected_by")
+    return apply_data_scope(
+        queryset,
+        access,
+        module="plots",
+        membership_lookups=("lead__assigned_membership", "site_visit__executive_membership"),
+        user_lookups=("selected_by",),
+    )
 
 
 def _selection_response(error):
@@ -744,10 +764,15 @@ def _selection_response(error):
     return _validation_response(error)
 
 
-def _validate_inventory_context(params, organization):
+def _validate_inventory_context(params, organization, access=None):
     lead_id, visit_id = _parse_positive_id(params, "lead_id"), _parse_positive_id(params, "site_visit_id")
-    lead = get_object_or_404(Lead.objects.filter(organization=organization), pk=lead_id) if lead_id else None
-    visit = get_object_or_404(Sitevisit.objects.filter(organization=organization), pk=visit_id) if visit_id else None
+    lead_queryset = _leads_for_access(access) if access else Lead.objects.filter(organization=organization)
+    lead = get_object_or_404(lead_queryset, pk=lead_id) if lead_id else None
+    if access:
+        visit_queryset = _site_visits_for_access(access, _leads_for_access(access))
+    else:
+        visit_queryset = Sitevisit.objects.filter(organization=organization)
+    visit = get_object_or_404(visit_queryset, pk=visit_id) if visit_id else None
     if lead and visit and visit.lead_id != lead.id: raise ValidationError({"site_visit_id": "Site visit must belong to the selected lead."})
     return lead, visit
 
@@ -757,7 +782,7 @@ def _validate_inventory_context(params, organization):
 def plot_inventory(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
     try:
-        _validate_inventory_context(request.query_params, access.organization)
+        _validate_inventory_context(request.query_params, access.organization, access)
         project = get_project_context(request, access)
         plots = _filter_plots(_plots_for_access(access, project, include_active_hold=True), request.query_params, access.organization, project)
         if facing := request.query_params.get("facing"): plots = plots.filter(facing__iexact=facing)
@@ -788,7 +813,7 @@ def plot_inventory_detail(request, organization_slug, plot_id):
 @permission_classes([IsAuthenticated])
 def plot_inventory_availability(request, organization_slug, plot_id):
     access = get_organization_access(request.user, organization_slug);
-    plot = get_object_or_404(Plot.objects.filter(organization=access.organization), pk=plot_id)
+    plot = get_object_or_404(_plots_for_access(access), pk=plot_id)
     available = is_plot_selectable(plot) and not _selection_queryset(access).filter(plot=plot, status=PlotSelection.Status.ACTIVE, expires_at__gt=timezone.now()).exists()
     data = {"plot_id": plot.id, "available": available, "status": plot.status}
     if not available: data.update({"reason": "Plot is no longer available.", "can_select_another": True})
@@ -800,7 +825,8 @@ def plot_inventory_availability(request, organization_slug, plot_id):
 def plot_inventory_select(request, organization_slug, plot_id):
     access = get_organization_access(request.user, organization_slug); _require_inventory_management(access)
     try:
-        lead, visit = _validate_inventory_context(request.data, access.organization)
+        lead, visit = _validate_inventory_context(request.data, access.organization, access)
+        get_object_or_404(_plots_for_access(access), pk=plot_id)
         selection = create_selection(organization=access.organization, plot_id=plot_id, lead=lead, site_visit=visit, user=request.user)
     except Plot.DoesNotExist: return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
     except (ValidationError, ValueError, TypeError) as error: return _selection_response(error)
@@ -866,6 +892,18 @@ def _sales_queryset(model, access, project=None):
     queryset = model.objects.filter(organization=access.organization)
     if project is not None:
         queryset = queryset.filter(booking__plot__project=project)
+    user_lookups = ["booking__created_by"]
+    if model in {Agreement, Registry, Possession}:
+        user_lookups.append("created_by")
+    if model is Payment:
+        user_lookups.append("received_by")
+    queryset = apply_data_scope(
+        queryset,
+        access,
+        module="payments" if model is Payment else "plots",
+        membership_lookups=("booking__lead__assigned_membership",),
+        user_lookups=tuple(user_lookups),
+    )
     return queryset.select_related("organization", "booking", "booking__lead", "booking__plot", "booking__plot__block")
 
 
@@ -881,6 +919,13 @@ def _payment_queryset(access, project=None):
             Q(booking__plot__project=project)
             | Q(payment_allocations__booking__plot__project=project)
         ).distinct()
+    queryset = apply_data_scope(
+        queryset,
+        access,
+        module="payments",
+        membership_lookups=("booking__lead__assigned_membership",),
+        user_lookups=("booking__created_by", "received_by"),
+    )
     return queryset.select_related("organization", "booking", "booking__lead", "booking__plot", "booking__plot__block", "received_by").prefetch_related("payment_allocations__booking__lead", "payment_allocations__booking__plot__block", "receipt", "refunds")
 
 
@@ -1220,7 +1265,7 @@ def possession_list(request, organization_slug):
 
 # Organization-level payment API.  The older inventory/payment routes above
 # remain available to existing clients.
-def _new_payment_payload(request, organization, project):
+def _new_payment_payload(request, organization, project, access):
     rows = request.data.get("booking_allocations") or request.data.get("allocations")
     # Backward-compatible single-booking shape used by older clients.
     if not rows and request.data.get("booking_id"):
@@ -1228,16 +1273,16 @@ def _new_payment_payload(request, organization, project):
     if not isinstance(rows, list) or not rows: raise ValidationError({"booking_allocations": "Provide at least one allocation."})
     parsed = []
     for row in rows:
-        booking = get_object_or_404(
-            PlotBooking.objects.filter(organization=organization, plot__project=project).select_related("plot"),
-            pk=_parse_positive_id(row, "booking_id"),
-        )
+        booking = get_object_or_404(_bookings_for_access(access, project), pk=_parse_positive_id(row, "booking_id"))
         installment = None
         charge = None
         if row.get("installment_id"):
-            installment = get_object_or_404(Installment.objects.filter(organization=organization), pk=_parse_positive_id(row, "installment_id"))
+            installment = get_object_or_404(_sales_queryset(Installment, access, project), pk=_parse_positive_id(row, "installment_id"))
         if row.get("registry_charge_id"):
-            charge = get_object_or_404(RegistryCharge.objects.filter(registry__organization=organization).select_related("registry__booking"), pk=_parse_positive_id(row, "registry_charge_id"))
+            charge = get_object_or_404(
+                RegistryCharge.objects.filter(registry__in=_registry_queryset(access, project)).select_related("registry__booking"),
+                pk=_parse_positive_id(row, "registry_charge_id"),
+            )
         parsed.append({"booking": booking, "installment": installment, "registry_charge": charge, "amount": _decimal(row, "amount")})
     return parsed
 
@@ -1255,7 +1300,7 @@ def managed_payments(request, organization_slug):
             if "payment_date" not in payload and "paymentDate" in payload: payload["payment_date"] = payload["paymentDate"]
             if "payment_mode" not in payload and "mode" in payload: payload["payment_mode"] = payload["mode"]
             request._full_data = payload
-            payment = create_allocated_payment(organization=access.organization, amount=_decimal(payload, "amount"), payment_method=payload.get("payment_mode") or payload.get("payment_method"), payment_date=_date(payload, "payment_date"), transaction_reference=payload.get("transaction_reference") or payload.get("reference_id"), notes=payload.get("remarks") or payload.get("notes"), user=request.user, allocations=_new_payment_payload(request, access.organization, project))
+            payment = create_allocated_payment(organization=access.organization, amount=_decimal(payload, "amount"), payment_method=payload.get("payment_mode") or payload.get("payment_method"), payment_date=_date(payload, "payment_date"), transaction_reference=payload.get("transaction_reference") or payload.get("reference_id"), notes=payload.get("remarks") or payload.get("notes"), user=request.user, allocations=_new_payment_payload(request, access.organization, project, access))
         except (ValidationError, ValueError, TypeError) as error: return _validation_response(error)
         log_audit(request=request, organization=access.organization, module="payments", action="payment_created", target=payment)
         return Response(payment_to_dict(_payment_queryset(access, project).get(pk=payment.pk), True), status=status.HTTP_201_CREATED)
@@ -1284,7 +1329,7 @@ def managed_payment_detail(request, organization_slug, payment_id):
 @permission_classes([IsAuthenticated])
 def managed_payment_summary(request, organization_slug):
     access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_permission(access, "payments.view")
-    bookings = PlotBooking.objects.filter(organization=access.organization, plot__project=project, status=PlotBooking.Status.CONFIRMED).select_related("plot")
+    bookings = _bookings_for_access(access, project).filter(status=PlotBooking.Status.CONFIRMED).select_related("plot")
     totals = [payment_totals(booking) for booking in bookings]
     total_dues = sum((item["final_price"] or Decimal("0") for item in totals), Decimal("0"))
     total_paid = sum((item["net_paid"] for item in totals), Decimal("0"))
@@ -1355,7 +1400,7 @@ def managed_payment_adjustment(request, organization_slug, payment_id):
 @permission_classes([IsAuthenticated])
 def customer_payment_history(request, organization_slug, customer_id):
     access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_permission(access, "payments.view")
-    get_object_or_404(Lead.objects.filter(organization=access.organization, project=project), pk=customer_id)
+    get_object_or_404(_leads_for_access(access, project), pk=customer_id)
     return _simple_page(request, _payment_queryset(access, project).filter(payment_allocations__booking__lead_id=customer_id).distinct(), payment_to_dict)
 
 
@@ -1363,8 +1408,8 @@ def customer_payment_history(request, organization_slug, customer_id):
 @permission_classes([IsAuthenticated])
 def customer_payment_ledger(request, organization_slug, customer_id):
     access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_permission(access, "payments.view")
-    customer = get_object_or_404(Lead.objects.filter(organization=access.organization, project=project), pk=customer_id)
-    bookings = PlotBooking.objects.filter(organization=access.organization, plot__project=project, lead=customer, status=PlotBooking.Status.CONFIRMED)
+    customer = get_object_or_404(_leads_for_access(access, project), pk=customer_id)
+    bookings = _bookings_for_access(access, project).filter(lead=customer, status=PlotBooking.Status.CONFIRMED)
     totals = [payment_totals(item) for item in bookings]
     due = sum((item["final_price"] or Decimal("0") for item in totals), Decimal("0")); paid = sum((item["net_paid"] for item in totals), Decimal("0"))
     entries = [{"date": p.payment_date.isoformat(), "type": "payment", "reference": p.payment_id, "credit": str(p.amount), "debit": "0.00"} for p in _payment_queryset(access, project).filter(payment_allocations__booking__lead=customer, status__in=[Payment.Status.SUCCESS, Payment.Status.REFUNDED]).distinct()]
@@ -1375,8 +1420,8 @@ def customer_payment_ledger(request, organization_slug, customer_id):
 @permission_classes([IsAuthenticated])
 def customer_dues(request, organization_slug, customer_id):
     access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_permission(access, "payments.view")
-    customer = get_object_or_404(Lead.objects.filter(organization=access.organization, project=project), pk=customer_id)
-    bookings = PlotBooking.objects.filter(organization=access.organization, plot__project=project, lead=customer, status=PlotBooking.Status.CONFIRMED).select_related("plot", "plot__block").prefetch_related("installments")
+    customer = get_object_or_404(_leads_for_access(access, project), pk=customer_id)
+    bookings = _bookings_for_access(access, project).filter(lead=customer, status=PlotBooking.Status.CONFIRMED).select_related("plot", "plot__block").prefetch_related("installments")
     rows = []
     for booking in bookings:
         summary = payment_totals(booking)
@@ -1393,6 +1438,13 @@ def _registry_queryset(access, project=None):
     queryset = Registry.objects.filter(organization=access.organization)
     if project is not None:
         queryset = queryset.filter(booking__plot__project=project)
+    queryset = apply_data_scope(
+        queryset,
+        access,
+        module="registry",
+        membership_lookups=("booking__lead__assigned_membership",),
+        user_lookups=("booking__created_by", "created_by"),
+    )
     return queryset.select_related("booking__lead", "booking__plot__block", "created_by").prefetch_related("charges", "status_history__changed_by")
 
 
