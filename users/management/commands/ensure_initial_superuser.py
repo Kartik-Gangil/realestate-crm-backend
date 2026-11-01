@@ -1,12 +1,27 @@
 import os
+import re
 
 from django.contrib.auth import get_user_model
+from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
 from django.core.validators import validate_email
 from django.core.management.base import BaseCommand, CommandError
 from django.db import IntegrityError, transaction
 
-from users.security import validate_password_policy
+
+
+def validate_initial_password(password):
+    validate_password(password)
+    if (
+        len(password) < 8
+        or not re.search(r"[A-Za-z]", password)
+        or not re.search(r"\d", password)
+        or not re.search(r"[^A-Za-z\d]", password)
+    ):
+        raise ValidationError(
+            "Password must be at least 8 characters and contain a letter, "
+            "a number, and a symbol."
+        )
 
 
 class Command(BaseCommand):
@@ -32,7 +47,7 @@ class Command(BaseCommand):
 
         try:
             validate_email(email)
-            validate_password_policy(password)
+            validate_initial_password(password)
         except ValidationError as error:
             raise CommandError("Initial superuser credentials are invalid: %s" % "; ".join(error.messages)) from error
 

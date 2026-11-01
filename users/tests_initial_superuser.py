@@ -1,5 +1,6 @@
 import io
 import os
+from pathlib import Path
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -17,6 +18,16 @@ class InitialSuperuserCommandTests(TestCase):
         "DJANGO_INITIAL_SUPERUSER_FIRST_NAME": "Owner",
         "DJANGO_INITIAL_SUPERUSER_LAST_NAME": "Account",
     }
+
+    def test_command_does_not_depend_on_untracked_user_security_module(self):
+        command_source = (
+            Path(__file__).parent
+            / "management"
+            / "commands"
+            / "ensure_initial_superuser.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn("from users.security import", command_source)
 
     def test_existing_superuser_is_not_changed_and_credentials_are_not_required(self):
         user_model = get_user_model()
