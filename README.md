@@ -21,6 +21,10 @@ This runs migrations first, then exits without user changes when any Django
 superuser already exists. It does not print the password, and it requires both
 variables only when creation is needed.
 
+For Vercel production, set `DATABASE_URL` to the Supabase PostgreSQL connection
+string. When this variable is present, Django uses PostgreSQL; without it, local
+development continues to use SQLite.
+
 ## Authentication
 
 Register or log in with email and password, then include the returned token in API requests.

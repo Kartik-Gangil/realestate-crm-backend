@@ -16,6 +16,7 @@ from pathlib import Path
 from corsheaders.defaults import default_headers
 from django.core.exceptions import ImproperlyConfigured
 
+from .database import database_config_from_url
 from .env import env_bool, env_list, env_str, load_env_file
 from core.crypto import decode_file_key
 
@@ -115,10 +116,12 @@ WSGI_APPLICATION = 'config.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 
+DATABASE_URL = env_str("DATABASE_URL")
 DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+    "default": database_config_from_url(DATABASE_URL)
+    or {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": BASE_DIR / "db.sqlite3",
     }
 }
 
