@@ -4,9 +4,22 @@
 
 ```powershell
 uv sync
-uv run python manage.py migrate
+uv run python manage.py initialize_backend
 uv run python manage.py runserver
 ```
+
+To initialize the backend and create the first platform superuser when needed,
+set the credentials through the process environment and run:
+
+```powershell
+$env:DJANGO_INITIAL_SUPERUSER_EMAIL = "admin@example.com"
+$env:DJANGO_INITIAL_SUPERUSER_PASSWORD = "Use-a-secret-password"
+uv run python manage.py initialize_backend
+```
+
+This runs migrations first, then exits without user changes when any Django
+superuser already exists. It does not print the password, and it requires both
+variables only when creation is needed.
 
 ## Authentication
 
