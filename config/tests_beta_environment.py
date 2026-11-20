@@ -279,6 +279,23 @@ class BetaSeedCommandTests(TestCase):
         self.assertTrue(all(value not in second_output.getvalue() for value in password_values))
 
     @override_settings(INTEGRATION_ENCRYPTION_KEY=Fernet.generate_key().decode())
+    def test_seed_includes_accounts_credentials_for_phase16_reimbursement_flow(self):
+        password_root = Path(__file__).resolve().parents[1]
+        password_file = password_root / "crm-beta-demo-passwords.txt"
+        password_file.unlink(missing_ok=True)
+        with patch("inventory.management.commands.seed_beta_demo.Path.home", return_value=password_root):
+            management.call_command("seed_beta_demo", organization="demo-beta-accounts", project="DEMO", stdout=StringIO())
+        credentials = password_file.read_text(encoding="utf-8")
+        password_file.unlink(missing_ok=True)
+
+        membership = OrganizationMembership.objects.get(
+            organization__slug="demo-beta-accounts",
+            user__username="accounts@demo-beta-accounts.invalid",
+        )
+        self.assertEqual(membership.organization_role.code, "accounts")
+        self.assertIn("accounts=", credentials)
+
+    @override_settings(INTEGRATION_ENCRYPTION_KEY=Fernet.generate_key().decode())
     def test_seed_creates_customer_document_categories_for_beta_flow(self):
         password_root = Path(__file__).resolve().parents[1]
         password_file = password_root / "crm-beta-demo-passwords.txt"

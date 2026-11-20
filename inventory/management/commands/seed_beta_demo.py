@@ -33,6 +33,7 @@ DEMO_ROLES = (
     ("manager", "Manager"),
     ("telecaller", "Telecaller"),
     ("site-visit-executive", "Site Visit Executive"),
+    ("accounts", "Accounts"),
 )
 
 
@@ -179,10 +180,10 @@ class Command(BaseCommand):
             membership, _ = OrganizationMembership.objects.get_or_create(
                 organization=organization,
                 user=user,
-                defaults={"role": code if code in {"admin", "manager", "telecaller"} else OrganizationMembership.Role.TELECALLER},
+                defaults={"role": code if code in {choice for choice, _ in OrganizationMembership.Role.choices} else OrganizationMembership.Role.TELECALLER},
             )
             membership.organization_role = roles[code]
-            membership.role = code if code in {"admin", "manager", "telecaller"} else OrganizationMembership.Role.TELECALLER
+            membership.role = code if code in {choice for choice, _ in OrganizationMembership.Role.choices} else OrganizationMembership.Role.TELECALLER
             membership.is_active = True
             membership.save(update_fields=["organization_role", "role", "is_active"])
             project.assigned_memberships.add(membership)

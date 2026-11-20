@@ -12,6 +12,7 @@ from core.tests.factories import make_member, make_organization, make_project
 from system_settings.models import AuditLog, SystemParameter
 from system_settings.parameters import PARAMETER_REGISTRY
 from system_settings.services import ensure_organization_parameter_defaults, validate_parameter_value
+from core.models import Notification
 
 from .hr_services import check_in, check_out, ensure_leave_balance, leave_days
 from .models import (
@@ -156,6 +157,36 @@ class GroupEPhase15Tests(TestCase):
         self.employee_client.post(f"{self.leave_url()}{leave.id}/cancel/", {}, format="json")
         balance.refresh_from_db()
         self.assertEqual(balance.used_days, 0)
+
+    def test_g0_leave_decision_creates_pending_in_app_notification(self):
+        leave = LeaveRequest.objects.create(
+            organization=self.organization,
+            employee=self.employee_membership,
+            leave_type="casual",
+            from_date=date(2026, 3, 9),
+            to_date=date(2026, 3, 9),
+            days=1,
+            reason="Appointment",
+        )
+        balance = ensure_leave_balance(
+            organization=self.organization,
+            employee=self.employee_membership,
+            leave_type="casual",
+            year=2026,
+        )
+        balance.allocated_days = 10
+        balance.save(update_fields=["allocated_days"])
+
+        response = self.manager_client.post(f"{self.leave_url()}{leave.id}/approve/", {}, format="json")
+
+        self.assertEqual(response.status_code, 200, response.data)
+        notification = Notification.objects.get(
+            recipient_membership=self.employee_membership,
+            type="leave_decision",
+            related_object_id=leave.id,
+        )
+        self.assertEqual(notification.status, Notification.Status.PENDING)
+        self.assertIn("approved", notification.title.lower())
 
     def test_fr_p15_01_salary_is_hidden_without_compensation_permission(self):
         hidden = self.employee_client.get(self.employee_url(self.employee_membership.id))

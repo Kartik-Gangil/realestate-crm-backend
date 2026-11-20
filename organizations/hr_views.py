@@ -163,7 +163,7 @@ def role_permissions(request, organization_slug, role_id):
     return Response(_role(role))
 
 
-@crm_endpoint(["GET"], scope="organization", permissions={"GET": "role.view"})
+@crm_endpoint(["GET"], scope="organization")
 def permissions(request, organization_slug):
     get_organization_access(request.user, organization_slug)
     return Response([{
