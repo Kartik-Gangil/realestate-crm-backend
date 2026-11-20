@@ -27,6 +27,7 @@ class ExpenseCategorySerializer(serializers.ModelSerializer):
 class ExpenseSerializer(serializers.ModelSerializer):
     submitted_by = serializers.SerializerMethodField()
     paid_by = serializers.SerializerMethodField()
+    reimbursed_by = serializers.SerializerMethodField()
     paid_by_id = serializers.PrimaryKeyRelatedField(
         source="paid_by", queryset=get_user_model().objects.all(), write_only=True, required=False
     )
@@ -43,11 +44,11 @@ class ExpenseSerializer(serializers.ModelSerializer):
             "id", "expense_id", "date", "category", "category_id", "amount", "description", "notes",
             "project_reference", "payment_method", "paid_by", "paid_by_id", "is_advance", "receipt", "status",
             "payment_status", "rejection_reason", "is_deleted", "submitted_by", "approval_steps", "activity",
-            "created_at", "updated_at",
+            "reimbursement_reference", "reimbursed_by", "reimbursed_at", "created_at", "updated_at",
         )
         read_only_fields = (
             "id", "expense_id", "category", "status", "payment_status", "rejection_reason", "is_deleted",
-            "submitted_by", "approval_steps", "activity", "created_at", "updated_at",
+            "submitted_by", "approval_steps", "activity", "reimbursed_by", "reimbursed_at", "created_at", "updated_at",
         )
 
     def get_submitted_by(self, obj):
@@ -55,6 +56,9 @@ class ExpenseSerializer(serializers.ModelSerializer):
 
     def get_paid_by(self, obj):
         return user_to_dict(obj.paid_by)
+
+    def get_reimbursed_by(self, obj):
+        return user_to_dict(obj.reimbursed_by)
 
     def get_approval_steps(self, obj):
         return [

@@ -143,13 +143,19 @@ def _employee_to_dict(employee, request=None, detailed=False):
         "is_active": employee.is_active,
         "date_of_joining": employee.date_of_joining.isoformat() if employee.date_of_joining else None,
     }
+    can_view_compensation = bool(
+        request
+        and (
+            is_organization_admin(get_organization_access(request.user, employee.organization.slug).membership)
+            or has_permission(request.user, employee.organization, "employees.view_compensation")
+        )
+    )
     if detailed:
         data.update({
             "address": employee.address,
             "date_of_birth": employee.date_of_birth.isoformat() if employee.date_of_birth else None,
             "gender": employee.gender,
             "employment_type": employee.employment_type,
-            "salary": str(employee.salary) if employee.salary is not None else None,
             "work_location": employee.work_location,
             "custom_scope_memberships": [
                 {"id": item.id, "employee_id": item.employee_id,
@@ -162,6 +168,8 @@ def _employee_to_dict(employee, request=None, detailed=False):
             ],
             "joined_at": employee.joined_at.isoformat() if employee.joined_at else None,
         })
+        if can_view_compensation:
+            data["salary"] = str(employee.salary) if employee.salary is not None else None
     return data
 
 

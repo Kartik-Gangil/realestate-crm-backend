@@ -10,7 +10,8 @@ AUDIT_MODEL_LABELS = {
     "organizations.Department", "organizations.Permission",
     "organizations.OrganizationRole", "organizations.ProjectAssignment",
     "organizations.OrganizationHoliday", "organizations.AttendanceRecord",
-    "organizations.LeaveRequest", "organizations.PlatformOrganizationAccess",
+    "organizations.LeaveRequest", "organizations.LeaveBalance",
+    "organizations.PlatformOrganizationAccess",
     "system_settings.OrganizationSettings", "system_settings.MasterDataCategory",
     "system_settings.MasterData", "system_settings.IntegrationConfiguration",
     "system_settings.SystemParameter", "system_settings.BackupRecord",
@@ -34,6 +35,7 @@ AUDIT_MODEL_LABELS = {
 EXCLUDED_MODEL_LABELS = {
     "core.TaskRecord", "core.Notification", "users.UserSession",
     "organizations.OrganizationActivity", "expenses.ActivityLog",
+    "organizations.PerformanceReview",
     "system_settings.AuditLog", "documents.CustomerDocumentVerificationHistory",
     "inventory.PlotStatusHistory", "inventory.PaymentStatusHistory",
     "inventory.RegistryStatusHistory", "inventory.PlotSelection",

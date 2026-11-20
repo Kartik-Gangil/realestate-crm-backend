@@ -36,6 +36,7 @@ urlpatterns = [
     path("organizations/<slug:organization_slug>/leaves/<int:leave_id>/approve/", hr_views.leave_approve, name="leave-approve"),
     path("organizations/<slug:organization_slug>/leaves/<int:leave_id>/reject/", hr_views.leave_reject, name="leave-reject"),
     path("organizations/<slug:organization_slug>/leaves/<int:leave_id>/cancel/", hr_views.leave_cancel, name="leave-cancel"),
+    path("organizations/<slug:organization_slug>/performance/<int:employee_id>/", hr_views.performance, name="performance-review"),
     path("organizations/<slug:organization_slug>/notifications/", notification_views.notification_list, name="notification-list"),
     path("organizations/<slug:organization_slug>/notifications/read-all/", notification_views.notification_mark_all_read, name="notification-read-all"),
     path("organizations/<slug:organization_slug>/notifications/<int:notification_id>/read/", notification_views.notification_mark_read, name="notification-read"),

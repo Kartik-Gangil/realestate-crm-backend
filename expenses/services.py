@@ -29,6 +29,10 @@ class ExpenseAlreadyPaid(Exception):
     """Raised when an authorized payment request targets an already-paid expense."""
 
 
+class ExpenseAlreadyReimbursed(Exception):
+    """Raised when an expense has already completed reimbursement."""
+
+
 def _has_any(user, organization, *permissions, project=None):
     return any(has_permission(user, organization, permission, project=project) for permission in permissions)
 
@@ -265,11 +269,44 @@ def mark_expense_paid(expense, actor, data):
     return payment
 
 
+@transaction.atomic
+def reimburse_expense(expense, actor, transaction_reference):
+    expense = Expense.objects.select_for_update().select_related("organization", "project", "submitted_by").get(pk=expense.pk)
+    if not can_process_reimbursement(actor, type("Reimbursement", (), {"expense": expense})()):
+        raise PermissionDenied("Only Accounts staff can process reimbursements.")
+    if expense.status == Expense.Status.REIMBURSED:
+        raise ExpenseAlreadyReimbursed
+    if expense.status != Expense.Status.APPROVED:
+        raise ValidationError({"status": "Only approved expenses can be reimbursed."})
+    transaction_reference = str(transaction_reference or "").strip()
+    if not transaction_reference:
+        raise ValidationError({"transaction_reference": "A transaction reference is required."})
+    payment = Payment.objects.filter(expense=expense).first()
+    if payment is None:
+        Payment.objects.create(
+            expense=expense,
+            payment_status=Expense.PaymentStatus.PAID,
+            payment_method=Expense.PaymentMethod.BANK_TRANSFER,
+            payment_date=timezone.localdate(),
+            reference_no=transaction_reference,
+            paid_by=actor,
+            paid_amount=expense.amount,
+        )
+    expense.status = Expense.Status.REIMBURSED
+    expense.payment_status = Expense.PaymentStatus.PAID
+    expense.reimbursement_reference = transaction_reference
+    expense.reimbursed_by = actor
+    expense.reimbursed_at = timezone.now()
+    expense.save(update_fields=["status", "payment_status", "reimbursement_reference", "reimbursed_by", "reimbursed_at", "updated_at"])
+    log_activity(expense, "Reimbursed", actor, {"transaction_reference": transaction_reference})
+    return expense
+
+
 def can_process_reimbursement(user, reimbursement):
     expense = reimbursement.expense
     return bool(
         expense
-        and _has_any(user, expense.organization, EXPENSE_PERMISSIONS["process_reimbursement"], "expenses.add", project=expense.project)
+        and _has_any(user, expense.organization, EXPENSE_PERMISSIONS["process_reimbursement"], "expenses.reimburse", project=expense.project)
     )
 
 

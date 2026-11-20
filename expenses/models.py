@@ -60,6 +60,7 @@ class Expense(models.Model):
         CHANGES_REQUESTED = "changes_requested", "Changes Requested"
         APPROVED = "approved", "Approved"
         REJECTED = "rejected", "Rejected"
+        REIMBURSED = "reimbursed", "Reimbursed"
         CANCELLED = "cancelled", "Cancelled"
 
     class PaymentStatus(models.TextChoices):
@@ -86,6 +87,15 @@ class Expense(models.Model):
     status = models.CharField(max_length=24, choices=Status.choices, default=Status.DRAFT)
     payment_status = models.CharField(max_length=12, choices=PaymentStatus.choices, default=PaymentStatus.UNPAID)
     rejection_reason = models.TextField(blank=True)
+    reimbursement_reference = models.CharField(max_length=100, blank=True)
+    reimbursed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="reimbursed_expenses",
+    )
+    reimbursed_at = models.DateTimeField(null=True, blank=True)
     is_deleted = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

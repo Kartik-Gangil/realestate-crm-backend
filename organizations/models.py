@@ -36,6 +36,8 @@ class OrganizationMembership(models.Model):
         ADMIN = "admin", "Organization admin"
         MANAGER = "manager", "Manager"
         TELECALLER = "telecaller", "Telecaller"
+        HR_ADMIN = "hr-admin", "HR Admin"
+        ACCOUNTS = "accounts", "Accounts"
 
     organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name="memberships")
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="organization_memberships")
@@ -217,6 +219,7 @@ class AttendanceRecord(models.Model):
         PRESENT = "present", "Present"
         LATE = "late", "Late"
         INCOMPLETE = "incomplete", "Incomplete"
+        ABSENT = "absent", "Absent"
 
     organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name="attendance_records")
     employee = models.ForeignKey(OrganizationMembership, on_delete=models.CASCADE, related_name="attendance_records")
@@ -247,7 +250,8 @@ class LeaveRequest(models.Model):
     class LeaveType(models.TextChoices):
         CASUAL = "casual", "Casual Leave"
         SICK = "sick", "Sick Leave"
-        EARNED = "earned", "Earned Leave"
+        PAID = "paid", "Paid Leave"
+        EARNED = "earned", "Earned Leave (legacy)"
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
         APPROVED = "approved", "Approved"
@@ -278,6 +282,74 @@ class LeaveRequest(models.Model):
             errors["employee"] = "Employee must belong to this organization."
         if self.to_date and self.from_date and self.to_date < self.from_date:
             errors["to_date"] = "To date cannot precede from date."
+        if errors:
+            raise ValidationError(errors)
+
+
+class LeaveBalance(models.Model):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name="leave_balances")
+    employee = models.ForeignKey(OrganizationMembership, on_delete=models.CASCADE, related_name="leave_balances")
+    leave_type = models.CharField(max_length=16)
+    year = models.PositiveSmallIntegerField()
+    allocated_days = models.PositiveSmallIntegerField(default=0)
+    used_days = models.PositiveSmallIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["year", "leave_type", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["employee", "leave_type", "year"],
+                name="employee_leave_balance_year_type_unique",
+            ),
+        ]
+
+    @property
+    def remaining_days(self):
+        return max(self.allocated_days - self.used_days, 0)
+
+    def clean(self):
+        errors = {}
+        if self.employee_id and self.employee.organization_id != self.organization_id:
+            errors["employee"] = "Employee must belong to this organization."
+        if self.used_days > self.allocated_days:
+            errors["used_days"] = "Used leave days cannot exceed the allocated balance."
+        if errors:
+            raise ValidationError(errors)
+
+
+class PerformanceReview(models.Model):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name="performance_reviews")
+    employee = models.ForeignKey(OrganizationMembership, on_delete=models.CASCADE, related_name="performance_reviews")
+    quarter = models.CharField(max_length=7)
+    rating = models.PositiveSmallIntegerField()
+    comments = models.TextField(blank=True)
+    reviewer = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="performance_reviews_written",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-quarter", "-updated_at", "-id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["employee", "quarter"],
+                name="employee_performance_review_quarter_unique",
+            ),
+        ]
+
+    def clean(self):
+        errors = {}
+        if self.employee_id and self.employee.organization_id != self.organization_id:
+            errors["employee"] = "Employee must belong to this organization."
+        if not (1 <= self.rating <= 5):
+            errors["rating"] = "Rating must be between 1 and 5."
+        if not __import__("re").fullmatch(r"\d{4}-Q[1-4]", self.quarter or ""):
+            errors["quarter"] = "Quarter must use YYYY-Qn format."
         if errors:
             raise ValidationError(errors)
 

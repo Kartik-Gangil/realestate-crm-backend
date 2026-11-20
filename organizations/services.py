@@ -108,6 +108,8 @@ def ensure_default_roles(organization):
         ("manager", "Manager"),
         ("telecaller", "Telecaller"),
         ("site-visit-executive", "Site Visit Executive"),
+        ("hr-admin", "HR Admin"),
+        ("accounts", "Accounts"),
     ):
         roles[code], created[code] = OrganizationRole.objects.get_or_create(
             organization=organization,
@@ -183,6 +185,19 @@ def ensure_default_roles(organization):
                 Permission.objects.filter(module=module, action__in=actions)
             )
         roles["site-visit-executive"].permissions.set(site_visit_executive_permissions)
+    if created["hr-admin"]:
+        hr_admin_permissions = list(
+            Permission.objects.filter(
+                module__in=["dashboard", "employees", "attendance", "leave"],
+                action__in=["view", "view_team", "add", "edit", "manage", "approve", "view_compensation"],
+            )
+        )
+        roles["hr-admin"].permissions.set(hr_admin_permissions)
+    if created["accounts"]:
+        accounts_permissions = list(
+            Permission.objects.filter(module="expenses", action__in=["view", "view_team", "process_reimbursement", "reimburse"])
+        )
+        roles["accounts"].permissions.set(accounts_permissions)
     return roles
 
 

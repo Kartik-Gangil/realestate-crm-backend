@@ -38,8 +38,10 @@ from .services import (
     can_view,
     cancel_expense,
     ExpenseAlreadyPaid,
+    ExpenseAlreadyReimbursed,
     log_activity,
     mark_expense_paid,
+    reimburse_expense,
     reject_expense,
     reject_reimbursement,
     request_expense_changes,
@@ -435,20 +437,13 @@ def expense_mark_paid(request, expense_id):
 @permission_classes([IsAuthenticated])
 def expense_reimburse(request, expense_id):
     expense, _, _ = _get_scoped_expense(request, expense_id)
-    if not can_process_reimbursement(request.user, type("R", (), {"expense": expense})()):
-        raise PermissionDenied("Only Accounts staff can process reimbursements.")
-    amount = request.data.get("amount", expense.amount)
     try:
-        reimbursement = ReimbursementRequest.objects.create(
-            employee=expense.submitted_by,
-            expense=expense,
-            amount=Decimal(str(amount)),
-            transaction_reference=str(request.data.get("transaction_reference", "")).strip(),
-        )
-    except (ValueError, TypeError, ArithmeticError) as error:
-        raise ValidationError({"amount": "Use a valid amount."}) from error
-    log_activity(expense, "Reimbursement Requested", request.user, {"transaction_reference": reimbursement.transaction_reference})
-    return Response(_envelope(_reimbursement_dict(reimbursement), request=request), status=status.HTTP_201_CREATED)
+        expense = reimburse_expense(expense, request.user, request.data.get("transaction_reference"))
+    except ExpenseAlreadyReimbursed:
+        return Response({"detail": "This expense has already been reimbursed.", "code": "expense_already_reimbursed"}, status=status.HTTP_409_CONFLICT)
+    except (ValidationError, DjangoValidationError) as error:
+        return Response(error.message_dict if hasattr(error, "message_dict") else {"detail": error.messages}, status=status.HTTP_400_BAD_REQUEST)
+    return Response(_envelope(_serialize_expense(expense, request, detailed=True), request=request))
 
 
 def _reimbursement_dict(item):

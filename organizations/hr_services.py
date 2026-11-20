@@ -1,11 +1,13 @@
 from datetime import datetime, timedelta
 
-from django.core.exceptions import ValidationError
+from django.core.exceptions import ValidationError, PermissionDenied
 from django.db import transaction
 from django.utils import timezone
 
-from .models import AttendanceRecord, LeaveRequest, OrganizationActivity, OrganizationHoliday
+from .models import AttendanceRecord, LeaveBalance, LeaveRequest, OrganizationActivity, OrganizationHoliday
 from .services import is_organization_admin
+from core.notifications import notify
+from system_settings.services import ensure_organization_parameter_defaults, get_system_parameter
 
 
 def log_activity(*, organization, employee, action, actor, module, details=None):
@@ -18,7 +20,7 @@ def attendance_status(employee, checked_in, checked_out=None):
     if not checked_in:
         return AttendanceRecord.Status.INCOMPLETE
     if not employee.shift_start_time:
-        raise ValidationError({"shift_start_time": "This employee needs a configured shift start time before attendance can be marked."})
+        return AttendanceRecord.Status.PRESENT
     local_in = timezone.localtime(checked_in)
     return AttendanceRecord.Status.LATE if local_in.time() > employee.shift_start_time else AttendanceRecord.Status.PRESENT
 
@@ -71,7 +73,34 @@ def leave_days(organization, from_date, to_date):
         raise ValidationError({"to_date": "To date cannot precede from date."})
     holidays = set(OrganizationHoliday.objects.filter(organization=organization, holiday_date__range=(from_date, to_date)).values_list("holiday_date", flat=True))
     return sum(1 for offset in range((to_date - from_date).days + 1)
-               if (day := from_date + timedelta(days=offset)).weekday() < 5 and day not in holidays)
+               if (day := from_date + timedelta(days=offset)).weekday() < 6 and day not in holidays)
+
+
+LEAVE_PARAMETER_KEYS = {
+    LeaveRequest.LeaveType.CASUAL: "leave_casual_days_per_year",
+    LeaveRequest.LeaveType.SICK: "leave_sick_days_per_year",
+    LeaveRequest.LeaveType.PAID: "leave_paid_days_per_year",
+    LeaveRequest.LeaveType.EARNED: "leave_paid_days_per_year",
+}
+
+
+def canonical_leave_type(leave_type):
+    return LeaveRequest.LeaveType.PAID if leave_type == LeaveRequest.LeaveType.EARNED else leave_type
+
+
+def ensure_leave_balance(*, organization, employee, leave_type, year):
+    leave_type = canonical_leave_type(leave_type)
+    ensure_organization_parameter_defaults(organization)
+    parameter_key = LEAVE_PARAMETER_KEYS[leave_type]
+    allocated = int(get_system_parameter(organization, parameter_key))
+    balance, _ = LeaveBalance.objects.get_or_create(
+        organization=organization,
+        employee=employee,
+        leave_type=leave_type,
+        year=year,
+        defaults={"allocated_days": allocated},
+    )
+    return balance
 
 
 def decide_leave(*, leave, actor_membership, actor, approved, rejection_reason=""):
@@ -83,10 +112,21 @@ def decide_leave(*, leave, actor_membership, actor, approved, rejection_reason="
             raise ValidationError({"approval": "Employees cannot approve or reject their own leave."})
         is_manager = leave.employee.reporting_manager_id == getattr(actor_membership, "id", None)
         is_admin = is_organization_admin(actor_membership)
-        if not (is_manager or is_admin):
-            raise ValidationError({"approval": "Only the reporting manager or an organization admin can decide this leave request."})
+        if not (is_manager or is_admin or has_hr_admin_role(actor_membership)):
+            raise PermissionDenied("Only the reporting manager or an HR Admin can decide this leave request.")
         if not approved and not rejection_reason.strip():
             raise ValidationError({"rejection_reason": "A rejection reason is required."})
+        if approved:
+            balance = ensure_leave_balance(
+                organization=leave.organization,
+                employee=leave.employee,
+                leave_type=leave.leave_type,
+                year=leave.from_date.year,
+            )
+            if balance.remaining_days < leave.days:
+                raise ValidationError({"balance": "Insufficient leave balance."})
+            balance.used_days += leave.days
+            balance.save(update_fields=["used_days", "updated_at"])
         leave.status = LeaveRequest.Status.APPROVED if approved else LeaveRequest.Status.REJECTED
         leave.approved_by = actor
         leave.approved_at = timezone.now()
@@ -95,4 +135,34 @@ def decide_leave(*, leave, actor_membership, actor, approved, rejection_reason="
         log_activity(organization=leave.organization, employee=leave.employee,
                      action="leave_approved" if approved else "leave_rejected", actor=actor, module="leave",
                      details={"leave_id": leave.id})
+        notify(
+            leave.employee,
+            "leave_decision",
+            "Leave request approved" if approved else "Leave request rejected",
+            "Your leave request has been approved." if approved else f"Your leave request was rejected: {leave.rejection_reason}",
+            related=leave,
+        )
         return leave
+
+
+def has_hr_admin_role(membership):
+    return bool(membership and membership.is_active and membership.organization_role and membership.organization_role.code == "hr-admin")
+
+
+@transaction.atomic
+def cancel_leave(*, leave, actor_membership, actor):
+    leave = LeaveRequest.objects.select_for_update().select_related("employee").get(pk=leave.pk)
+    if leave.employee_id != getattr(actor_membership, "id", None):
+        raise PermissionDenied("Only the requesting employee can cancel this leave.")
+    if leave.status not in {LeaveRequest.Status.PENDING, LeaveRequest.Status.APPROVED}:
+        raise ValidationError({"status": "Only pending or approved leave can be cancelled."})
+    if leave.status == LeaveRequest.Status.APPROVED:
+        balance = LeaveBalance.objects.select_for_update().get(
+            employee=leave.employee, leave_type=canonical_leave_type(leave.leave_type), year=leave.from_date.year
+        )
+        balance.used_days = max(balance.used_days - leave.days, 0)
+        balance.save(update_fields=["used_days", "updated_at"])
+    leave.status = LeaveRequest.Status.CANCELLED
+    leave.save(update_fields=["status", "updated_at"])
+    log_activity(organization=leave.organization, employee=leave.employee, action="leave_cancelled", actor=actor, module="leave", details={"leave_id": leave.id})
+    return leave

@@ -10,10 +10,10 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from .employee_views import _employees_for_access, _page_url, _paginate, _validation_response
-from .hr_services import check_in, check_out, decide_leave, leave_days, log_activity
+from .hr_services import cancel_leave, check_in, check_out, decide_leave, ensure_leave_balance, leave_days, log_activity
 from .models import (AttendanceRecord, LeaveRequest, OrganizationHoliday, OrganizationMembership,
-                     OrganizationRole, Permission)
-from .services import get_organization_access, has_permission
+                     OrganizationRole, Permission, PerformanceReview)
+from .services import get_organization_access, has_permission, is_organization_admin
 from core.endpoint import crm_endpoint
 from core.audit_context import set_audit_action
 from system_settings.audit import log_audit
@@ -163,7 +163,7 @@ def role_permissions(request, organization_slug, role_id):
     return Response(_role(role))
 
 
-@crm_endpoint(["GET"], scope="organization")
+@crm_endpoint(["GET"], scope="organization", permissions={"GET": "role.view"})
 def permissions(request, organization_slug):
     get_organization_access(request.user, organization_slug)
     return Response([{
@@ -183,8 +183,7 @@ def _attendance(record):
             "status": record.status}
 
 
-@api_view(["GET"])
-@permission_classes([IsAuthenticated])
+@crm_endpoint(["GET"], scope="organization", permissions={"GET": "attendance.view"})
 def attendance(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
     query = AttendanceRecord.objects.filter(organization=access.organization).select_related("employee__user", "employee__department")
@@ -199,8 +198,7 @@ def attendance(request, organization_slug):
     return Response({"count": count, "next": _page_url(request, page + 1, size) if page * size < count else None, "previous": _page_url(request, page - 1, size) if page > 1 else None, "results": [_attendance(x) for x in rows]})
 
 
-@api_view(["POST"])
-@permission_classes([IsAuthenticated])
+@crm_endpoint(["POST"], scope="organization", permissions={"POST": "attendance.add"})
 def attendance_check_in(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
     employee_id = request.data.get("employee", access.membership.id if access.membership else None)
@@ -211,8 +209,7 @@ def attendance_check_in(request, organization_slug):
     return Response(_attendance(AttendanceRecord.objects.select_related("employee__user").get(pk=record.pk)), status=201)
 
 
-@api_view(["POST"])
-@permission_classes([IsAuthenticated])
+@crm_endpoint(["POST"], scope="organization", permissions={"POST": "attendance.edit"})
 def attendance_check_out(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
     employee_id = request.data.get("employee", access.membership.id if access.membership else None)
@@ -226,11 +223,11 @@ def attendance_check_out(request, organization_slug):
 def _leave(leave):
     return {"id": leave.id, "employee": _dict_employee(leave.employee), "leave_type": leave.leave_type,
             "from_date": leave.from_date, "to_date": leave.to_date, "days": leave.days, "reason": leave.reason,
-            "status": leave.status, "rejection_reason": leave.rejection_reason}
+            "total_days": leave.days, "status": leave.status, "rejection_reason": leave.rejection_reason,
+            "approved_by": leave.approved_by_id}
 
 
-@api_view(["GET", "POST"])
-@permission_classes([IsAuthenticated])
+@crm_endpoint(["GET", "POST"], scope="organization", permissions={"GET": "settings.view", "POST": "settings.edit"})
 def holidays(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
     query = OrganizationHoliday.objects.filter(organization=access.organization)
@@ -245,8 +242,7 @@ def holidays(request, organization_slug):
     return Response({"id": holiday.id, "name": holiday.name, "holiday_date": holiday.holiday_date, "source": holiday.source}, status=201)
 
 
-@api_view(["GET", "POST"])
-@permission_classes([IsAuthenticated])
+@crm_endpoint(["GET", "POST"], scope="organization", permissions={"GET": "leave.view", "POST": "leave.add"})
 def leaves(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
     query = LeaveRequest.objects.filter(organization=access.organization).select_related("employee__user", "employee__department", "approved_by")
@@ -264,15 +260,38 @@ def leaves(request, organization_slug):
     try:
         from_date, to_date = parse_date(str(request.data["from_date"])), parse_date(str(request.data["to_date"]))
         if not from_date or not to_date: raise ValidationError({"from_date": "Use ISO dates (YYYY-MM-DD)."})
+        leave_type = str(request.data["leave_type"]).strip().lower()
+        if leave_type == LeaveRequest.LeaveType.EARNED:
+            leave_type = LeaveRequest.LeaveType.PAID
+        if leave_type not in {LeaveRequest.LeaveType.CASUAL, LeaveRequest.LeaveType.SICK, LeaveRequest.LeaveType.PAID}:
+            raise ValidationError({"leave_type": "Use casual, sick, or paid."})
         days = leave_days(access.organization, from_date, to_date)
-        leave = LeaveRequest.objects.create(organization=access.organization, employee=employee, leave_type=request.data["leave_type"], from_date=from_date, to_date=to_date, days=days, reason=request.data["reason"])
+        if days <= 0:
+            raise ValidationError({"date_range": "The selected range contains no working days."})
+        overlap = LeaveRequest.objects.filter(
+            organization=access.organization,
+            employee=employee,
+            status__in=[LeaveRequest.Status.PENDING, LeaveRequest.Status.APPROVED],
+            from_date__lte=to_date,
+            to_date__gte=from_date,
+        ).exists()
+        if overlap:
+            raise ValidationError({"date_range": "This leave overlaps a pending or approved request."})
+        balance = ensure_leave_balance(
+            organization=access.organization,
+            employee=employee,
+            leave_type=leave_type,
+            year=from_date.year,
+        )
+        if balance.remaining_days < days:
+            raise ValidationError({"balance": "Insufficient leave balance."})
+        leave = LeaveRequest.objects.create(organization=access.organization, employee=employee, leave_type=leave_type, from_date=from_date, to_date=to_date, days=days, reason=request.data["reason"])
         log_activity(organization=access.organization, employee=employee, action="leave_applied", actor=request.user, module="leave", details={"leave_id": leave.id, "days": days})
     except (KeyError, ValidationError) as error: return _validation_response(error)
     return Response(_leave(LeaveRequest.objects.select_related("employee__user").get(pk=leave.pk)), status=201)
 
 
-@api_view(["GET", "PATCH"])
-@permission_classes([IsAuthenticated])
+@crm_endpoint(["GET", "PATCH"], scope="organization", permissions={"GET": "leave.view", "PATCH": "leave.edit"})
 def leave_detail(request, organization_slug, leave_id):
     access = get_organization_access(request.user, organization_slug)
     leave = get_object_or_404(
@@ -306,14 +325,11 @@ def _leave_action(request, slug, leave_id, approved):
     except ValidationError as error: return _validation_response(error)
     set_audit_action(request, None)
     return Response(_leave(LeaveRequest.objects.select_related("employee__user").get(pk=leave.pk)))
-@api_view(["POST"])
-@permission_classes([IsAuthenticated])
+@crm_endpoint(["POST"], scope="organization", permissions={"POST": "leave.approve"})
 def leave_approve(request, organization_slug, leave_id): return _leave_action(request, organization_slug, leave_id, True)
-@api_view(["POST"])
-@permission_classes([IsAuthenticated])
+@crm_endpoint(["POST"], scope="organization", permissions={"POST": "leave.approve"})
 def leave_reject(request, organization_slug, leave_id): return _leave_action(request, organization_slug, leave_id, False)
-@api_view(["POST"])
-@permission_classes([IsAuthenticated])
+@crm_endpoint(["POST"], scope="organization", permissions={"POST": "leave.edit"})
 def leave_cancel(request, organization_slug, leave_id):
     access = get_organization_access(request.user, organization_slug)
     leave = get_object_or_404(
@@ -323,5 +339,71 @@ def leave_cancel(request, organization_slug, leave_id):
         ),
         pk=leave_id,
     )
-    if leave.employee_id != getattr(access.membership, "id", None) or leave.status != LeaveRequest.Status.PENDING: raise PermissionDenied("Only a pending request can be cancelled by its employee.")
-    leave.status = LeaveRequest.Status.CANCELLED; leave.save(update_fields=["status", "updated_at"]); log_activity(organization=access.organization, employee=leave.employee, action="leave_cancelled", actor=request.user, module="leave", details={"leave_id": leave.id}); return Response(_leave(leave))
+    leave = cancel_leave(leave=leave, actor_membership=access.membership, actor=request.user)
+    return Response(_leave(LeaveRequest.objects.select_related("employee__user", "approved_by").get(pk=leave.pk)))
+
+
+def _review_dict(review):
+    return {
+        "id": review.id,
+        "employee_id": review.employee_id,
+        "quarter": review.quarter,
+        "rating": review.rating,
+        "comments": review.comments,
+        "reviewer_id": review.reviewer_id,
+        "created_at": review.created_at.isoformat() if review.created_at else None,
+        "updated_at": review.updated_at.isoformat() if review.updated_at else None,
+    }
+
+
+def _can_review(access, employee):
+    return bool(
+        access.is_platform
+        or is_organization_admin(access.membership)
+        or (access.membership and access.membership.organization_role and access.membership.organization_role.code == "hr-admin")
+        or (access.membership and employee.reporting_manager_id == access.membership.id)
+    )
+
+
+@crm_endpoint(["GET", "POST", "PATCH"], scope="organization", permissions={"GET": "employees.view", "POST": "employees.edit", "PATCH": "employees.edit"})
+def performance(request, organization_slug, employee_id):
+    access = get_organization_access(request.user, organization_slug)
+    employee = get_object_or_404(OrganizationMembership.objects.select_related("reporting_manager", "user"), organization=access.organization, pk=employee_id)
+    if request.method == "GET":
+        if employee.user_id != request.user.id and not _can_review(access, employee):
+            raise PermissionDenied("You can only view your own or your team's reviews.")
+        reviews = PerformanceReview.objects.filter(employee=employee).select_related("reviewer")
+        return Response({"results": [_review_dict(item) for item in reviews]})
+    if not _can_review(access, employee):
+        raise PermissionDenied("Only the reporting manager or HR Admin can submit reviews.")
+    review_id = request.data.get("review_id")
+    if review_id:
+        review = get_object_or_404(PerformanceReview, pk=review_id, employee=employee, organization=access.organization)
+        if review.reviewer_id != request.user.id and not (access.membership and access.membership.organization_role and access.membership.organization_role.code == "hr-admin") and not is_organization_admin(access.membership):
+            raise PermissionDenied("Only the reviewer or HR Admin can edit this review.")
+        before = _review_dict(review)
+        if "rating" in request.data:
+            review.rating = request.data["rating"]
+        if "comments" in request.data:
+            review.comments = str(request.data["comments"])
+        try:
+            review.full_clean()
+            review.save(update_fields=["rating", "comments", "updated_at"])
+        except ValidationError as error:
+            return _validation_response(error)
+        log_audit(request=request, organization=access.organization, module="performance_reviews", action="update", target=review, payload_before=before, payload_after=_review_dict(review))
+        return Response(_review_dict(review))
+    review = PerformanceReview(
+        organization=access.organization,
+        employee=employee,
+        quarter=str(request.data.get("quarter", "")),
+        rating=request.data.get("rating", request.data.get("overallRating", 0)),
+        comments=str(request.data.get("comments", request.data.get("feedback", ""))),
+        reviewer=request.user,
+    )
+    try:
+        review.full_clean()
+        review.save()
+    except (ValidationError, IntegrityError) as error:
+        return _validation_response(error)
+    return Response(_review_dict(review), status=201)

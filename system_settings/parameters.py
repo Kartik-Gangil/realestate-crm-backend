@@ -30,6 +30,9 @@ PARAMETER_REGISTRY = {
     "duplicate_score_phone_different_name": ParameterDefinition("duplicate_score_phone_different_name", "Duplicate score phone different name", SystemParameter.DataType.INTEGER, 90, "project", 0, 100),
     "duplicate_score_email_partial_phone": ParameterDefinition("duplicate_score_email_partial_phone", "Duplicate score email partial phone", SystemParameter.DataType.INTEGER, 80, "project", 0, 100),
     "expense_receipt_threshold": ParameterDefinition("expense_receipt_threshold", "Expense receipt threshold", SystemParameter.DataType.DECIMAL, 5000, "project"),
+    "leave_casual_days_per_year": ParameterDefinition("leave_casual_days_per_year", "Casual leave days per year", SystemParameter.DataType.INTEGER, 12, "organization", 0, 60),
+    "leave_sick_days_per_year": ParameterDefinition("leave_sick_days_per_year", "Sick leave days per year", SystemParameter.DataType.INTEGER, 6, "organization", 0, 60),
+    "leave_paid_days_per_year": ParameterDefinition("leave_paid_days_per_year", "Paid leave days per year", SystemParameter.DataType.INTEGER, 15, "organization", 0, 60),
 }
 
 

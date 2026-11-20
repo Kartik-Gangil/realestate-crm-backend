@@ -9,11 +9,13 @@ STANDARD_PERMISSION_ACTIONS = ("view", "add", "edit", "delete", "export", "appro
 ALLOWED_NAMED_PERMISSION_REQUIREMENTS = {
     "documents.view_team": "FR-P3-07",
     "employees.view_team": "FR-P3-07",
+    "employees.view_compensation": "FR-P15-01",
     "expenses.edit_own": "FR-P16-06",
     "expenses.manage_categories": "FR-P16-01",
     "expenses.mark_paid": "FR-P16-06",
     "expenses.process_payment": "FR-P16-06",
     "expenses.process_reimbursement": "FR-P16-06",
+    "expenses.reimburse": "FR-P16-06",
     "expenses.reject": "FR-P16-02",
     "expenses.submit": "FR-P16-02",
     "expenses.view_own": "FR-P16-06",

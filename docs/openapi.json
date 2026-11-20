@@ -687,6 +687,15 @@
             },
             "description": "Successful response"
           }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-crm-scope": "organization",
+        "x-permissions": {
+          "GET": "attendance.view"
         }
       }
     },
@@ -714,6 +723,15 @@
             },
             "description": "Successful response"
           }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-crm-scope": "organization",
+        "x-permissions": {
+          "POST": "attendance.add"
         }
       }
     },
@@ -741,6 +759,15 @@
             },
             "description": "Successful response"
           }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-crm-scope": "organization",
+        "x-permissions": {
+          "POST": "attendance.edit"
         }
       }
     },
@@ -2227,6 +2254,16 @@
             },
             "description": "Successful response"
           }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-crm-scope": "organization",
+        "x-permissions": {
+          "GET": "settings.view",
+          "POST": "settings.edit"
         }
       },
       "post": {
@@ -2252,6 +2289,16 @@
             },
             "description": "Successful response"
           }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-crm-scope": "organization",
+        "x-permissions": {
+          "GET": "settings.view",
+          "POST": "settings.edit"
         }
       }
     },
@@ -5752,6 +5799,16 @@
             },
             "description": "Successful response"
           }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-crm-scope": "organization",
+        "x-permissions": {
+          "GET": "leave.view",
+          "POST": "leave.add"
         }
       },
       "post": {
@@ -5777,6 +5834,16 @@
             },
             "description": "Successful response"
           }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-crm-scope": "organization",
+        "x-permissions": {
+          "GET": "leave.view",
+          "POST": "leave.add"
         }
       }
     },
@@ -5812,6 +5879,16 @@
             },
             "description": "Successful response"
           }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-crm-scope": "organization",
+        "x-permissions": {
+          "GET": "leave.view",
+          "PATCH": "leave.edit"
         }
       },
       "patch": {
@@ -5845,6 +5922,16 @@
             },
             "description": "Successful response"
           }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-crm-scope": "organization",
+        "x-permissions": {
+          "GET": "leave.view",
+          "PATCH": "leave.edit"
         }
       }
     },
@@ -5880,6 +5967,15 @@
             },
             "description": "Successful response"
           }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-crm-scope": "organization",
+        "x-permissions": {
+          "POST": "leave.approve"
         }
       }
     },
@@ -5915,6 +6011,15 @@
             },
             "description": "Successful response"
           }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-crm-scope": "organization",
+        "x-permissions": {
+          "POST": "leave.edit"
         }
       }
     },
@@ -5950,6 +6055,15 @@
             },
             "description": "Successful response"
           }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-crm-scope": "organization",
+        "x-permissions": {
+          "POST": "leave.approve"
         }
       }
     },
@@ -6822,6 +6936,140 @@
             },
             "description": "Successful response"
           }
+        }
+      }
+    },
+    "/api/v1/organizations/{organization_slug}/performance/{employee_id}/": {
+      "get": {
+        "operationId": "get_api_v1_organizations_organization_slug_performance_employee_id",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "organization_slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "employee_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "Successful response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-crm-scope": "organization",
+        "x-permissions": {
+          "GET": "employees.view",
+          "PATCH": "employees.edit",
+          "POST": "employees.edit"
+        }
+      },
+      "patch": {
+        "operationId": "patch_api_v1_organizations_organization_slug_performance_employee_id",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "organization_slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "employee_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "Successful response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-crm-scope": "organization",
+        "x-permissions": {
+          "GET": "employees.view",
+          "PATCH": "employees.edit",
+          "POST": "employees.edit"
+        }
+      },
+      "post": {
+        "operationId": "post_api_v1_organizations_organization_slug_performance_employee_id",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "organization_slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "employee_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "Successful response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-crm-scope": "organization",
+        "x-permissions": {
+          "GET": "employees.view",
+          "PATCH": "employees.edit",
+          "POST": "employees.edit"
         }
       }
     },
