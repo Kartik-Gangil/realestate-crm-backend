@@ -1,0 +1,19 @@
+[run]
+source =
+    core
+    users
+    organizations
+    leads
+    inventory
+    documents
+    expenses
+    system_settings
+omit =
+    */migrations/*
+    */tests/*
+    */.venv/*
+    .venv/*
+
+[report]
+exclude_also =
+    pragma: no cover

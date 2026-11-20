@@ -5,8 +5,8 @@ from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import transaction
 from django.utils import timezone
 
-from organizations.models import OrganizationMembership
-from organizations.services import has_permission, is_platform_admin, membership_role_code
+from organizations.models import OrganizationMembership, ProjectAssignment
+from organizations.services import has_permission, is_platform_admin
 from .models import ActivityLog, ApprovalStep, Expense, Payment, ReimbursementRequest
 
 
@@ -21,7 +21,7 @@ EXPENSE_PERMISSIONS = {
     "process_payment": "expenses.process_payment",
     "mark_paid": "expenses.mark_paid",
     "process_reimbursement": "expenses.process_reimbursement",
-    "reports": "expenses.reports",
+    "reports": "reports.view",
 }
 
 
@@ -29,11 +29,11 @@ class ExpenseAlreadyPaid(Exception):
     """Raised when an authorized payment request targets an already-paid expense."""
 
 
-def _has_any(user, organization, *permissions):
-    return any(has_permission(user, organization, permission) for permission in permissions)
+def _has_any(user, organization, *permissions, project=None):
+    return any(has_permission(user, organization, permission, project=project) for permission in permissions)
 
 
-def can_create(user, organization):
+def can_create(user, organization, project=None):
     return _has_any(
         user,
         organization,
@@ -41,17 +41,18 @@ def can_create(user, organization):
         EXPENSE_PERMISSIONS["submit"],
         "expenses.add",
         EXPENSE_PERMISSIONS["manage_categories"],
+        project=project,
     )
 
 
 def can_view(user, expense):
     if not expense or not expense.organization_id or expense.is_deleted:
         return False
-    if _has_any(user, expense.organization, EXPENSE_PERMISSIONS["view_team"], "expenses.view"):
+    if _has_any(user, expense.organization, EXPENSE_PERMISSIONS["view_team"], "expenses.view", project=expense.project):
         return True
     return (
         expense.submitted_by_id == user.id
-        and _has_any(user, expense.organization, EXPENSE_PERMISSIONS["view_own"], EXPENSE_PERMISSIONS["edit_own"], "expenses.edit")
+        and _has_any(user, expense.organization, EXPENSE_PERMISSIONS["view_own"], EXPENSE_PERMISSIONS["edit_own"], "expenses.edit", project=expense.project)
     )
 
 
@@ -61,25 +62,18 @@ def can_edit(user, expense):
         and not expense.is_deleted
         and expense.status in {Expense.Status.DRAFT, Expense.Status.CHANGES_REQUESTED}
         and expense.submitted_by_id == user.id
-        and _has_any(user, expense.organization, EXPENSE_PERMISSIONS["edit_own"], EXPENSE_PERMISSIONS["submit"], "expenses.edit", "expenses.add")
+        and _has_any(user, expense.organization, EXPENSE_PERMISSIONS["edit_own"], EXPENSE_PERMISSIONS["submit"], "expenses.edit", "expenses.add", project=expense.project)
     )
 
 
 def can_approve(user, expense):
     if not expense or expense.is_deleted or expense.status != Expense.Status.PENDING_APPROVAL:
         return False
-    if not _has_any(user, expense.organization, EXPENSE_PERMISSIONS["approve"], "expenses.edit"):
+    if not _has_any(user, expense.organization, EXPENSE_PERMISSIONS["approve"], project=expense.project):
         return False
     if is_platform_admin(user):
         return True
-    membership = OrganizationMembership.objects.filter(
-        organization=expense.organization, user=user, is_active=True
-    ).select_related("organization_role").first()
-    return membership_role_code(membership) in {
-        OrganizationMembership.Role.ADMIN,
-        OrganizationMembership.Role.MANAGER,
-        "finance",
-    }
+    return True
 
 
 def can_reject(user, expense):
@@ -87,7 +81,7 @@ def can_reject(user, expense):
         expense
         and not expense.is_deleted
         and expense.status == Expense.Status.PENDING_APPROVAL
-        and _has_any(user, expense.organization, EXPENSE_PERMISSIONS["reject"])
+        and _has_any(user, expense.organization, EXPENSE_PERMISSIONS["reject"], project=expense.project)
     )
 
 
@@ -223,7 +217,7 @@ def can_process_payment(user, expense):
         and not expense.is_deleted
         and expense.status == Expense.Status.APPROVED
         and expense.payment_status == Expense.PaymentStatus.UNPAID
-        and _has_any(user, expense.organization, EXPENSE_PERMISSIONS["mark_paid"])
+        and _has_any(user, expense.organization, EXPENSE_PERMISSIONS["mark_paid"], project=expense.project)
     )
 
 
@@ -239,7 +233,7 @@ def _organization_user(user_id, organization):
 @transaction.atomic
 def mark_expense_paid(expense, actor, data):
     expense = Expense.objects.select_for_update().get(pk=expense.pk)
-    if not expense or expense.is_deleted or expense.status != Expense.Status.APPROVED or not _has_any(actor, expense.organization, EXPENSE_PERMISSIONS["mark_paid"]):
+    if not expense or expense.is_deleted or expense.status != Expense.Status.APPROVED or not _has_any(actor, expense.organization, EXPENSE_PERMISSIONS["mark_paid"], project=expense.project):
         raise PermissionDenied("Only Finance or an authorized admin can mark an expense paid.")
     if expense.payment_status == Expense.PaymentStatus.PAID:
         raise ExpenseAlreadyPaid
@@ -275,7 +269,7 @@ def can_process_reimbursement(user, reimbursement):
     expense = reimbursement.expense
     return bool(
         expense
-        and _has_any(user, expense.organization, EXPENSE_PERMISSIONS["process_reimbursement"], "expenses.add")
+        and _has_any(user, expense.organization, EXPENSE_PERMISSIONS["process_reimbursement"], "expenses.add", project=expense.project)
     )
 
 
@@ -323,7 +317,7 @@ def reject_reimbursement(reimbursement, actor):
 def cancel_expense(expense, actor):
     if expense.is_deleted or expense.status == Expense.Status.CANCELLED or expense.payment_status == Expense.PaymentStatus.PAID:
         raise ValidationError("This expense cannot be cancelled.")
-    if expense.status == Expense.Status.APPROVED and not is_platform_admin(actor) and not has_permission(actor, expense.organization, "expenses.manage_categories"):
+    if expense.status == Expense.Status.APPROVED and not is_platform_admin(actor) and not has_permission(actor, expense.organization, "expenses.manage_categories", project=expense.project):
         raise PermissionDenied("Only an Admin can cancel an approved expense.")
     if expense.status != Expense.Status.APPROVED and expense.submitted_by_id != actor.id and not can_approve(actor, expense):
         raise PermissionDenied("You cannot cancel this expense.")

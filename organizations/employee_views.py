@@ -3,6 +3,7 @@ from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.db.models import Q
+from django.http import Http404
 from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
@@ -12,8 +13,15 @@ from rest_framework.response import Response
 from core.files import private_file_response
 
 from .employee_serializers import DepartmentSerializer, EmployeeCreateSerializer, EmployeeUpdateSerializer
-from .models import Department, Organization, OrganizationActivity, OrganizationMembership, OrganizationRole
-from .services import effective_tab_permissions, ensure_default_roles, get_organization_access, has_permission, membership_permission_codes
+from .models import Department, Organization, OrganizationActivity, OrganizationMembership, OrganizationRole, ProjectAssignment
+from .services import (can_manage_account, effective_tab_permissions, ensure_default_roles,
+                       get_organization_access, has_permission, is_organization_admin,
+                       membership_permission_codes)
+from inventory.models import Project
+from core.endpoint import crm_endpoint
+from core.audit_context import reset_audit_signal_suppression, set_audit_action, suppress_audit_signals
+from system_settings.audit import log_audit, log_bulk_audit
+from users.security import is_developer
 
 
 def _validation_response(error):
@@ -26,21 +34,29 @@ def _validation_response(error):
     return Response(details, status=status.HTTP_400_BAD_REQUEST)
 
 
-def _require_employee_management(access):
-    if not access.is_platform and not has_permission(access.membership.user, access.organization, "employees.edit"):
+def _require_employee_management(access, permission="employees.edit"):
+    if not access.is_platform and not has_permission(access.membership.user, access.organization, permission):
         raise PermissionDenied("Only organization admins, managers, and authorized platform users can manage employees.")
 
 
 def _require_role_management(access):
-    if not access.is_platform and not has_permission(access.membership.user, access.organization, "settings.edit"):
+    if not access.is_platform and not has_permission(access.membership.user, access.organization, "role.edit"):
         raise PermissionDenied("Only organization admins and authorized platform users can change employee roles or access scopes.")
 
 
 def _employees_for_access(access):
-    queryset = OrganizationMembership.objects.filter(organization=access.organization).select_related(
+    queryset = OrganizationMembership.objects.filter(
+        organization=access.organization,
+        user__developer_account__isnull=True,
+    ).select_related(
         "user", "department", "reporting_manager__user", "organization", "organization_role"
-    )
-    if access.is_platform or access.membership.access_scope == OrganizationMembership.AccessScope.ALL:
+    ).prefetch_related("assigned_projects")
+    if (
+        access.is_platform
+        or is_organization_admin(access.membership)
+        or access.membership.access_scope == OrganizationMembership.AccessScope.ALL
+        or has_permission(access.membership.user, access.organization, "employees.view_team")
+    ):
         return queryset
     if access.membership.access_scope == OrganizationMembership.AccessScope.OWN:
         return queryset.filter(pk=access.membership.pk)
@@ -53,15 +69,52 @@ def _employees_for_access(access):
     return queryset.filter(Q(pk=access.membership.pk) | Q(pk__in=custom_ids) | Q(department_id__in=department_ids))
 
 
+def _assert_account_level(request, access, target_user):
+    if is_developer(target_user):
+        raise PermissionDenied({"code": "account_level_forbidden", "detail": "Developer accounts cannot be changed through this API."})
+    if not can_manage_account(request.user, target_user, access.organization):
+        raise PermissionDenied({"code": "account_level_forbidden", "detail": "You cannot change an account above your level."})
+
+
+def _assert_developer_mutation_forbidden(access, employee_id):
+    if OrganizationMembership.objects.filter(
+        pk=employee_id,
+        organization=access.organization,
+        user__developer_account__isnull=False,
+    ).exists() or (
+        not OrganizationMembership.objects.filter(pk=employee_id, organization=access.organization).exists()
+        and get_user_model().objects.filter(pk=employee_id, developer_account__isnull=False).exists()
+    ):
+        raise PermissionDenied({"code": "account_level_forbidden", "detail": "Developer accounts cannot be changed here."})
+
+
+def _developer_user_dict(user, organization):
+    return {
+        "id": user.id,
+        "user_id": user.id,
+        "employee_id": None,
+        "name": "Developer",
+        "first_name": "Developer",
+        "last_name": "",
+        "email": user.email,
+        "role": "Developer",
+        "role_id": None,
+        "role_name": "Developer",
+        "status": "Active" if user.is_active else "Inactive",
+        "is_active": user.is_active,
+        "is_developer": True,
+        "organization": organization.slug,
+        "assigned_projects": [],
+        "project_ids": [],
+    }
+
+
 def _employee_to_dict(employee, request=None, detailed=False):
     photo = f"/api/organizations/{employee.organization.slug}/employees/{employee.id}/photo/" if employee.profile_photo else None
     name_first = employee.first_name or employee.user.first_name
     name_last = employee.last_name or employee.user.last_name
-    role_code = (employee.organization_role.code if employee.organization_role_id else employee.role or "").strip().lower()
     permission_codes = {f"{module}.{action}" for module, action in membership_permission_codes(employee)}
-    can_process_expense_payment = role_code in {"admin", "manager", "finance"} or bool(
-        permission_codes & {"expenses.mark_paid", "expenses.process_payment"}
-    )
+    can_process_expense_payment = bool(permission_codes & {"expenses.mark_paid", "expenses.process_payment"})
     data = {
         "id": employee.id,
         "user_id": employee.user_id,
@@ -85,6 +138,7 @@ def _employee_to_dict(employee, request=None, detailed=False):
         "role_code": employee.organization_role.code if employee.organization_role_id else employee.role,
         "can_process_expense_payment": can_process_expense_payment,
         "access_scope": employee.access_scope,
+        "project_ids": list(employee.assigned_projects.values_list("id", flat=True)),
         "status": "active" if employee.is_active else "inactive",
         "is_active": employee.is_active,
         "date_of_joining": employee.date_of_joining.isoformat() if employee.date_of_joining else None,
@@ -246,31 +300,68 @@ def _resolve_relations(data, organization, employee=None):
         if len(selected) != len(ids):
             raise ValidationError({"custom_scope_departments": "Use departments in this organization."})
         resolved["custom_scope_departments"] = selected
+    if "project_ids" in data:
+        ids = data["project_ids"]
+        if len(ids) != len(set(ids)):
+            raise ValidationError({"project_ids": "Project IDs must not contain duplicates."})
+        selected = list(Project.objects.filter(pk__in=ids, organization=organization))
+        if len(selected) != len(ids):
+            raise ValidationError({"project_ids": "Use projects in this organization."})
+        resolved["project_ids"] = selected
     return resolved
 
 
-def _assert_role_change_allowed(access, role):
-    if access.is_platform or has_permission(access.membership.user, access.organization, "settings.edit"):
+def _sync_project_assignments(employee, projects, assigned_by, request=None):
+    project_ids = {project.id for project in projects}
+    removed = list(ProjectAssignment.objects.filter(membership=employee).exclude(project_id__in=project_ids))
+    if removed:
+        token = suppress_audit_signals()
+        try:
+            ProjectAssignment.objects.filter(pk__in=[item.pk for item in removed]).delete()
+        finally:
+            reset_audit_signal_suppression(token)
+        log_bulk_audit(
+            request=request, module="employees", action="bulk_delete", instances=removed,
+            organization=employee.organization, changed_values={"deleted": True},
+        )
+    if not employee.organization_role_id:
         return
-    if role != OrganizationMembership.Role.TELECALLER:
-        raise PermissionDenied("Managers may only create employees with the telecaller role.")
+    for project in projects:
+        ProjectAssignment.objects.update_or_create(
+            membership=employee,
+            project=project,
+            defaults={"role": employee.organization_role, "assigned_by": assigned_by},
+        )
 
 
-@api_view(["GET", "POST"])
-@permission_classes([IsAuthenticated])
+def _assert_role_change_allowed(access, role):
+    if access.is_platform or role is None or has_permission(access.membership.user, access.organization, "role.edit"):
+        return
+    raise PermissionDenied("Role assignment requires role.edit.")
+
+
+@crm_endpoint(["GET", "POST"], scope="organization", permissions={"GET": "employees.view", "POST": "employees.add"})
 def employee_list(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
     if request.method == "GET":
         try:
             employees = _filter_employees(_employees_for_access(access), request.query_params, access.organization)
             count, page, page_size, results = _paginate(employees, request.query_params)
+            results = list(results)
         except ValidationError as error:
             return _validation_response(error)
+        developers = []
+        if request.path.rstrip("/").endswith("/users"):
+            developers = [
+                _developer_user_dict(user, access.organization)
+                for user in get_user_model().objects.filter(developer_account__isnull=False)
+            ]
         return Response({"count": count, "next": _page_url(request, page + 1, page_size) if page * page_size < count else None,
                          "previous": _page_url(request, page - 1, page_size) if page > 1 else None,
-                         "results": [_employee_to_dict(item, request) for item in results]})
+                         "results": [item if isinstance(item, dict) else _employee_to_dict(item, request) for item in results],
+                         "developers": developers})
 
-    _require_employee_management(access)
+    _require_employee_management(access, "employees.add")
     serializer = EmployeeCreateSerializer(data=request.data, context={"organization": access.organization})
     serializer.is_valid(raise_exception=True)
     data = serializer.validated_data
@@ -282,20 +373,28 @@ def employee_list(request, organization_slug):
         if assigned_role is None:
             return Response({"role_id": ["Use a role from this organization."]}, status=status.HTTP_400_BAD_REQUEST)
         data.pop("role_id")
-    _assert_role_change_allowed(access, assigned_role.code if assigned_role else data["role"])
+    _assert_role_change_allowed(access, assigned_role)
     if not access.is_platform and not has_permission(access.membership.user, access.organization, "settings.edit"):
-        if data["access_scope"] != OrganizationMembership.AccessScope.ALL or data.get("custom_scope_memberships") or data.get("custom_scope_departments"):
+        if data["access_scope"] != OrganizationMembership.AccessScope.ALL or data.get("custom_scope_memberships") or data.get("custom_scope_departments") or data.get("project_ids") is not None:
             raise PermissionDenied("Only organization admins can assign employee access scopes.")
     try:
         with transaction.atomic():
             organization = Organization.objects.select_for_update().get(pk=access.organization.pk)
             relations = _resolve_relations(data, organization)
             user = data["user"]
+            user_was_created = user is None
             if user is None:
-                user = get_user_model().objects.create_user(
-                    username=data["email"], email=data["email"], password=data["temporary_password"],
-                    first_name=data["first_name"], last_name=data.get("last_name", ""),
-                )
+                token = suppress_audit_signals()
+                try:
+                    user = get_user_model().objects.create_user(
+                        username=data["email"], email=data["email"], password=data["temporary_password"],
+                        first_name=data["first_name"], last_name=data.get("last_name", ""),
+                        is_staff=False, is_superuser=False,
+                    )
+                finally:
+                    reset_audit_signal_suppression(token)
+            else:
+                _assert_account_level(request, access, user)
             # The counter is locked with the organization row.  The loop also
             # tolerates legacy employee IDs that pre-date this counter.
             organization.employee_sequence += 1
@@ -318,14 +417,22 @@ def employee_list(request, organization_slug):
                 if field in data:
                     setattr(employee, field, data[field])
             for field, value in relations.items():
-                if field not in {"custom_scope_memberships", "custom_scope_departments"}:
+                if field not in {"custom_scope_memberships", "custom_scope_departments", "project_ids"}:
                     setattr(employee, field, value)
             employee.full_clean()
             employee.save()
+            if user_was_created:
+                log_audit(
+                    request=request, organization=organization, module="users", action="create", target=user,
+                    payload_before={}, payload_after={"username": user.username, "email": user.email},
+                )
             if "custom_scope_memberships" in relations:
                 employee.custom_scope_memberships.set(relations["custom_scope_memberships"])
             if "custom_scope_departments" in relations:
                 employee.custom_scope_departments.set(relations["custom_scope_departments"])
+            if "project_ids" in relations:
+                employee.assigned_projects.set(relations["project_ids"])
+                _sync_project_assignments(employee, relations["project_ids"], request.user, request=request)
             _activity(employee=employee, action="employee_created", actor=request.user, details={"employee_id": employee.employee_id})
             _activity(employee=employee, action="role_assigned", actor=request.user, details={"role": employee.role})
     except (ValidationError, IntegrityError) as error:
@@ -334,14 +441,27 @@ def employee_list(request, organization_slug):
     return Response(_employee_to_dict(employee, request, detailed=True), status=status.HTTP_201_CREATED)
 
 
-@api_view(["GET", "PATCH", "PUT"])
-@permission_classes([IsAuthenticated])
+@crm_endpoint(["GET", "PATCH", "PUT"], scope="organization", permissions={"GET": "employees.view", "PATCH": "employees.edit", "PUT": "employees.edit"})
 def employee_detail(request, organization_slug, employee_id):
     access = get_organization_access(request.user, organization_slug)
-    employee = get_object_or_404(_employees_for_access(access), pk=employee_id)
+    developer_membership = OrganizationMembership.objects.filter(
+        pk=employee_id,
+        organization=access.organization,
+        user__developer_account__isnull=False,
+    ).exists()
+    legacy_developer_id = (
+        not OrganizationMembership.objects.filter(pk=employee_id, organization=access.organization).exists()
+        and get_user_model().objects.filter(pk=employee_id, developer_account__isnull=False).exists()
+    )
+    if developer_membership or legacy_developer_id:
+        raise PermissionDenied({"code": "account_level_forbidden", "detail": "Developer accounts cannot be changed here."})
+    employee = _employees_for_access(access).filter(pk=employee_id).first()
+    if employee is None:
+        raise Http404
     if request.method == "GET":
         return Response(_employee_to_dict(employee, request, detailed=True))
     _require_employee_management(access)
+    _assert_account_level(request, access, employee.user)
     serializer = EmployeeUpdateSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     data = serializer.validated_data
@@ -350,7 +470,7 @@ def employee_detail(request, organization_slug, employee_id):
     protected = set(request.data) - set(serializer.fields)
     if protected:
         return Response({field: ["This field cannot be updated."] for field in protected}, status=status.HTTP_400_BAD_REQUEST)
-    role_or_scope = {"role", "role_id", "access_scope", "custom_scope_memberships"} & set(data)
+    role_or_scope = {"role", "role_id", "access_scope", "custom_scope_memberships", "project_ids"} & set(data)
     if role_or_scope:
         _require_role_management(access)
     assigned_role = None
@@ -379,7 +499,7 @@ def employee_detail(request, organization_slug, employee_id):
             relations = _resolve_relations(data, access.organization, employee)
             changed = []
             for field, value in data.items():
-                if field in {"department", "reporting_manager", "custom_scope_memberships", "custom_scope_departments"}:
+                if field in {"department", "reporting_manager", "custom_scope_memberships", "custom_scope_departments", "project_ids"}:
                     continue
                 if getattr(employee, field) != value:
                     setattr(employee, field, value)
@@ -391,17 +511,42 @@ def employee_detail(request, organization_slug, employee_id):
                 employee.organization_role = assigned_role
                 changed.append("organization_role")
             for field, value in relations.items():
-                if field != "custom_scope_memberships" and getattr(employee, field) != value:
+                if field not in {"custom_scope_memberships", "project_ids"} and getattr(employee, field) != value:
                     setattr(employee, field, value)
                     changed.append(field)
             employee.full_clean()
-            employee.save()
+            role_changed = bool({"role", "organization_role"} & set(changed))
+            previous_audit_action = getattr(request, "_audit_action", None)
+            if role_changed:
+                set_audit_action(request, "role_change")
+            try:
+                employee.save()
+            finally:
+                set_audit_action(request, previous_audit_action)
             if "custom_scope_memberships" in relations:
                 employee.custom_scope_memberships.set(relations["custom_scope_memberships"])
                 changed.append("custom_scope_memberships")
             if "custom_scope_departments" in relations:
                 employee.custom_scope_departments.set(relations["custom_scope_departments"])
                 changed.append("custom_scope_departments")
+            if "project_ids" in relations:
+                previous_project_ids = set(employee.assigned_projects.values_list("id", flat=True))
+                next_project_ids = {project.id for project in relations["project_ids"]}
+                employee.assigned_projects.set(relations["project_ids"])
+                _sync_project_assignments(employee, relations["project_ids"], request.user, request=request)
+                if previous_project_ids != next_project_ids:
+                    changed.append("project_ids")
+            if {"role", "organization_role"} & set(changed):
+                assignments = list(ProjectAssignment.objects.filter(membership=employee))
+                before = {str(item.pk): {"role_id": item.role_id, "assigned_by_id": item.assigned_by_id} for item in assignments}
+                if assignments:
+                    ProjectAssignment.objects.filter(pk__in=[item.pk for item in assignments]).update(role=employee.organization_role, assigned_by=request.user)
+                    after = {str(item.pk): {"role_id": employee.organization_role_id, "assigned_by_id": request.user.pk} for item in assignments}
+                    log_bulk_audit(
+                        request=request, module="employees", action="bulk_update", instances=assignments,
+                        organization=employee.organization, before=before, after=after,
+                        changed_values={"role_id": employee.organization_role_id, "assigned_by_id": request.user.pk},
+                    )
             if new_email is not None and employee.user.email.lower() != new_email:
                 old_email = employee.user.email
                 employee.user.email = new_email
@@ -438,12 +583,20 @@ def employee_photo(request, organization_slug, employee_id):
 def _set_employee_active(request, organization_slug, employee_id, active):
     access = get_organization_access(request.user, organization_slug)
     _require_employee_management(access)
+    _assert_developer_mutation_forbidden(access, employee_id)
     employee = get_object_or_404(_employees_for_access(access), pk=employee_id)
+    _assert_account_level(request, access, employee.user)
     if employee.is_active == active:
         return Response({"status": ["Employee is already active." if active else "Employee is already inactive."]}, status=status.HTTP_400_BAD_REQUEST)
-    employee.is_active = active
-    employee.save(update_fields=["is_active"])
-    _activity(employee=employee, action="employee_activated" if active else "employee_deactivated", actor=request.user)
+    with transaction.atomic():
+        employee.is_active = active
+        previous_audit_action = getattr(request, "_audit_action", None)
+        set_audit_action(request, "activate" if active else "deactivate")
+        try:
+            employee.save(update_fields=["is_active"])
+        finally:
+            set_audit_action(request, previous_audit_action)
+        _activity(employee=employee, action="employee_activated" if active else "employee_deactivated", actor=request.user)
     return Response(_employee_to_dict(employee, request, detailed=True))
 
 
@@ -465,13 +618,16 @@ def employee_reset_password(request, organization_slug, employee_id):
     """An organization admin can issue a new temporary password for an employee."""
     access = get_organization_access(request.user, organization_slug)
     _require_role_management(access)
+    _assert_developer_mutation_forbidden(access, employee_id)
     employee = get_object_or_404(_employees_for_access(access), pk=employee_id)
+    _assert_account_level(request, access, employee.user)
     temporary_password = request.data.get("temporary_password")
     if not isinstance(temporary_password, str) or len(temporary_password) < 8:
         return Response({"temporary_password": ["Use at least 8 characters."]}, status=status.HTTP_400_BAD_REQUEST)
-    employee.user.set_password(temporary_password)
-    employee.user.save(update_fields=["password"])
-    _activity(employee=employee, action="employee_password_reset", actor=request.user)
+    with transaction.atomic():
+        employee.user.set_password(temporary_password)
+        employee.user.save(update_fields=["password"])
+        _activity(employee=employee, action="employee_password_reset", actor=request.user)
     return Response(status=status.HTTP_204_NO_CONTENT)
 
 

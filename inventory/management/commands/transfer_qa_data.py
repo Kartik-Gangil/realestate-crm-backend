@@ -3,6 +3,10 @@ from collections import OrderedDict
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 
+from core.audit_context import reset_audit_signal_suppression, suppress_audit_signals
+from core.audit_signals import begin_deletion_audit, end_deletion_audit
+from system_settings.audit import log_bulk_audit, log_command_audit
+
 from inventory.models import (
     Block,
     Plot,
@@ -15,6 +19,7 @@ from inventory.models import (
 )
 from leads.models import FollowUpCall, Lead, Sitevisit
 from organizations.models import Organization, OrganizationMembership, OrganizationRole
+from system_settings.models import MasterData
 
 
 SOURCE_SLUG = "qa-demo-org"
@@ -97,6 +102,20 @@ class Command(BaseCommand):
             raise CommandError("Source organization contains an unrelated lead; refusing destructive transfer.")
         if Plot.objects.filter(organization=source).exclude(pk__in=[item.pk for item in plan["plots"]]).exists():
             raise CommandError("Source organization contains an unrelated plot; refusing destructive transfer.")
+        for lead in plan["leads"]:
+            for field_name in ("status", "source_item"):
+                item = getattr(lead, field_name, None)
+                if item is None:
+                    continue
+                if not MasterData.objects.filter(
+                    organization=target_project.organization,
+                    project=target_project,
+                    category_id=item.category_id,
+                    code=item.code,
+                ).exists():
+                    raise CommandError(
+                        f"Target project has no {field_name} master-data item with code '{item.code}'."
+                    )
         block_codes = {item.code for item in plan["blocks"]}
         if Block.objects.filter(organization=target_project.organization, project=target_project, code__in=block_codes).exists():
             raise CommandError("Target project already contains a QA block with the same code.")
@@ -111,6 +130,7 @@ class Command(BaseCommand):
     def _apply(self, plan):
         source = plan["source"]
         target = plan["target"]
+        source_project = plan["source_project"]
         target_project = plan["target_project"]
         block_map = {}
         for block in plan["blocks"]:
@@ -126,16 +146,31 @@ class Command(BaseCommand):
         for lead in plan["leads"]:
             lead.organization = target
             lead.project = target_project
+            if lead.status_id:
+                lead.status = MasterData.objects.get(
+                    organization=target,
+                    project=target_project,
+                    category_id=lead.status.category_id,
+                    code=lead.status.code,
+                )
+            if lead.source_item_id:
+                lead.source_item = MasterData.objects.get(
+                    organization=target,
+                    project=target_project,
+                    category_id=lead.source_item.category_id,
+                    code=lead.source_item.code,
+                )
             if lead.assigned_membership_id:
                 source_membership = OrganizationMembership.objects.get(pk=lead.assigned_membership_id)
                 lead.assigned_membership = OrganizationMembership.objects.filter(organization=target, user=source_membership.user).first()
-            lead.save(update_fields=["organization", "project", "assigned_membership", "updated_at"])
+            lead.save(update_fields=["organization", "project", "assigned_membership", "status", "source_item", "updated_at"])
         for item in plan["site_visits"]:
             item.organization = target
+            item.project = target_project
             if item.executive_membership_id:
                 source_membership = OrganizationMembership.objects.get(pk=item.executive_membership_id)
                 item.executive_membership = OrganizationMembership.objects.filter(organization=target, user=source_membership.user).first()
-            item.save(update_fields=["organization", "executive_membership", "updated_at"])
+            item.save(update_fields=["organization", "project", "executive_membership", "updated_at"])
         for item in plan["follow_up_calls"]:
             item.organization = target
             if item.telecaller_membership_id:
@@ -151,12 +186,59 @@ class Command(BaseCommand):
         for item in plan["recently_viewed"]:
             item.organization = target
             item.save(update_fields=["organization"])
+        deletion_token = begin_deletion_audit("project", source_project.pk)
+        try:
+            source_project.delete()
+        finally:
+            end_deletion_audit(deletion_token)
         # The source organization may have default roles protected by its
         # memberships. Remove only source-scoped access records after all
         # domain records have been re-parented, then remove the empty source.
-        OrganizationMembership.objects.filter(organization=source).delete()
-        OrganizationRole.objects.filter(organization=source).delete()
-        source.delete()
+        memberships = list(OrganizationMembership.objects.filter(organization=source))
+        roles = list(OrganizationRole.objects.filter(organization=source))
+        if memberships:
+            token = suppress_audit_signals()
+            try:
+                OrganizationMembership.objects.filter(pk__in=[item.pk for item in memberships]).delete()
+            finally:
+                reset_audit_signal_suppression(token)
+        if roles:
+            token = suppress_audit_signals()
+            try:
+                OrganizationRole.objects.filter(pk__in=[item.pk for item in roles]).delete()
+            finally:
+                reset_audit_signal_suppression(token)
+        token = suppress_audit_signals()
+        try:
+            source.delete()
+        finally:
+            reset_audit_signal_suppression(token)
+        log_command_audit(
+            module="organizations",
+            action="delete",
+            route="command:transfer_qa_data",
+            details={"deleted_organization_id": source.pk},
+        )
+        if memberships:
+            log_bulk_audit(
+                module="organizations",
+                action="bulk_delete",
+                instances=memberships,
+                record_ids=[item.pk for item in memberships],
+                changed_values={"deleted": True, "deleted_organization_id": source.pk},
+                organization=None,
+                route="command:transfer_qa_data",
+            )
+        if roles:
+            log_bulk_audit(
+                module="roles",
+                action="bulk_delete",
+                instances=roles,
+                record_ids=[item.pk for item in roles],
+                changed_values={"deleted": True, "deleted_organization_id": source.pk},
+                organization=None,
+                route="command:transfer_qa_data",
+            )
         return plan
 
     def _write_report(self, plan):

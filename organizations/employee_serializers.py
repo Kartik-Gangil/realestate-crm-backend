@@ -9,7 +9,7 @@ EMPLOYEE_PROFILE_FIELDS = {
     "first_name", "last_name", "profile_photo", "mobile_number", "address",
     "date_of_birth", "gender", "department", "designation", "reporting_manager",
     "date_of_joining", "employment_type", "salary", "work_location", "access_scope",
-    "custom_scope_memberships",
+    "custom_scope_memberships", "project_ids",
 }
 
 
@@ -41,9 +41,10 @@ class EmployeeCreateSerializer(serializers.Serializer):
     work_location = serializers.CharField(max_length=150, required=False, allow_blank=True)
     shift_start_time = serializers.TimeField(required=False, allow_null=True)
     shift_end_time = serializers.TimeField(required=False, allow_null=True)
-    access_scope = serializers.ChoiceField(choices=OrganizationMembership.AccessScope.choices, default=OrganizationMembership.AccessScope.ALL)
+    access_scope = serializers.ChoiceField(choices=OrganizationMembership.AccessScope.choices, default=OrganizationMembership.AccessScope.OWN)
     custom_scope_memberships = serializers.ListField(child=serializers.IntegerField(min_value=1), required=False, allow_empty=True)
     custom_scope_departments = serializers.ListField(child=serializers.IntegerField(min_value=1), required=False, allow_empty=True)
+    project_ids = serializers.ListField(child=serializers.IntegerField(min_value=1), required=False, allow_empty=True)
 
     def validate_email(self, value):
         return value.lower()
@@ -82,3 +83,4 @@ class EmployeeUpdateSerializer(serializers.Serializer):
     access_scope = serializers.ChoiceField(choices=OrganizationMembership.AccessScope.choices, required=False)
     custom_scope_memberships = serializers.ListField(child=serializers.IntegerField(min_value=1), required=False, allow_empty=True)
     custom_scope_departments = serializers.ListField(child=serializers.IntegerField(min_value=1), required=False, allow_empty=True)
+    project_ids = serializers.ListField(child=serializers.IntegerField(min_value=1), required=False, allow_empty=True)

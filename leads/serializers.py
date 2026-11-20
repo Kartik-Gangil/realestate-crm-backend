@@ -1,14 +1,16 @@
-from .models import FollowUpCall, Lead , Sitevisit , SitevisitReschedule
+from .constants import LEAD_STATUS_ALIASES, LEAD_STATUS_LABELS
+from .models import FollowUpCall, Lead, LeadAssignmentHistory, LeadStatusHistory, LeadTag, Sitevisit, SitevisitReschedule
 
 
 def membership_to_dict(membership):
     if not membership:
         return None
+    display_name = membership.user.get_full_name().strip() or membership.user.email or membership.role
     return {
         "id": membership.id,
         "user_id": membership.user_id,
         "email": membership.user.email,
-        "name": membership.user.get_full_name(),
+        "name": display_name,
         "role": membership.role,
     }
 
@@ -123,8 +125,13 @@ def reschedule_sitevisit_to_dict(
 
 
 def lead_to_dict(lead: Lead, include_follow_ups=False , latest_follow_up_status=None) -> dict:
+    source_code = lead.source_item.code if lead.source_item_id else lead.source
+    lifecycle_status = getattr(lead, "lifecycle_status", None) or (lead.status.code if lead.status_id else None)
+    status_code = latest_follow_up_status if latest_follow_up_status is not None else lifecycle_status
+    status_code = LEAD_STATUS_ALIASES.get(status_code, status_code)
     data = {
         "id": lead.id,
+        "lead_code": lead.lead_code,
         "organization": lead.organization.slug,
         "project": {"id": lead.project_id, "name": lead.project.name, "code": lead.project.code} if lead.project_id else None,
         "first_name": lead.first_name,
@@ -132,16 +139,45 @@ def lead_to_dict(lead: Lead, include_follow_ups=False , latest_follow_up_status=
         "full_name": lead.full_name,
         "email": lead.email,
         "phone": lead.phone,
-        "source": lead.source,
+        "source": source_code,
+        "source_id": lead.source_item_id,
         "alt_phone": lead.alt_phone,
         "occupation": lead.occupation,
         "address": lead.address,
-        "status": latest_follow_up_status,
+        "status": status_code,
+        "status_label": LEAD_STATUS_LABELS.get(status_code, status_code.replace("_", " ").title() if status_code else "New"),
+        "lifecycle_status": LEAD_STATUS_ALIASES.get(lifecycle_status, lifecycle_status),
+        "status_id": lead.status_id,
+        "owner_id": lead.assigned_membership_id,
         # return only the membership name (or None)
         "assigned_membership": (membership_to_dict(lead.assigned_membership) or {}).get("name"),
         "created_at": lead.created_at.isoformat(),
         "updated_at": lead.updated_at.isoformat(),
+        "tags": list(lead.tags.values_list("tag_name", flat=True)) if hasattr(lead, "tags") else [],
+        "needs_reassignment": bool(lead.assigned_membership_id and not lead.assigned_membership.is_active),
     }
+    data["assignment_history"] = [
+        {
+            "id": item.id,
+            "assigned_from": item.assigned_from_id,
+            "assigned_to": item.assigned_to_id,
+            "assigned_to_name": membership_to_dict(item.assigned_to).get("name") if item.assigned_to_id else None,
+            "reason": item.reason,
+            "assigned_by": item.assigned_by_id,
+            "created_at": item.created_at.isoformat(),
+        }
+        for item in lead.assignment_history.select_related("assigned_to__user").all()
+    ]
+    data["status_history"] = [
+        {
+            "id": item.id,
+            "old_status": LEAD_STATUS_LABELS.get(item.old_status, item.old_status),
+            "new_status": LEAD_STATUS_LABELS.get(item.new_status, item.new_status),
+            "changed_by": item.changed_by_id,
+            "created_at": item.created_at.isoformat(),
+        }
+        for item in lead.status_history.all()
+    ]
     if include_follow_ups:
         data["follow_up_calls"] = [
             follow_up_to_dict(call)

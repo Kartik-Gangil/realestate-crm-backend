@@ -3,11 +3,13 @@ from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
+from django.core.files.uploadedfile import SimpleUploadedFile
 
+from documents.models import CustomerDocument, DocumentCategory
 from leads.models import Lead
 from organizations.models import Organization, OrganizationMembership
 
-from .models import Block, Plot, PlotBooking, Project, Registry
+from .models import Agreement, AgreementSignedDocument, Block, Payment, PaymentAllocation, Plot, PlotBooking, Project, Registry
 from .phase5_services import transition_registry
 
 
@@ -49,6 +51,47 @@ class RegistryPlotStatusTests(TestCase):
             final_price=Decimal("1000.00"),
             created_by=self.user,
         )
+        identity_category = DocumentCategory.objects.create(
+            organization=self.organization, name="Identity", code="identity"
+        )
+        CustomerDocument.objects.create(
+            organization=self.organization,
+            customer=lead,
+            document_category=identity_category,
+            document_name="Identity",
+            file=SimpleUploadedFile("identity.pdf", b"verified identity", content_type="application/pdf"),
+            file_name="identity.pdf",
+            file_size=len(b"verified identity"),
+            content_type="application/pdf",
+            version=1,
+            status=CustomerDocument.Status.VERIFIED,
+            verified_by=self.user,
+        )
+        agreement = Agreement.objects.create(
+            organization=self.organization,
+            booking=booking,
+            status=Agreement.Status.SIGNED,
+            created_by=self.user,
+        )
+        AgreementSignedDocument.objects.create(
+            agreement=agreement,
+            file=SimpleUploadedFile("signed.pdf", b"signed agreement", content_type="application/pdf"),
+            original_filename="signed.pdf",
+            content_type="application/pdf",
+            file_size_bytes=len(b"signed agreement"),
+            uploaded_by=self.user,
+        )
+        payment = Payment.objects.create(
+            organization=self.organization,
+            booking=booking,
+            payment_id="REG-TEST-1",
+            amount=Decimal("1000.00"),
+            payment_method=Payment.Method.CASH,
+            status=Payment.Status.SUCCESS,
+            payment_date=date.today(),
+            received_by=self.user,
+        )
+        PaymentAllocation.objects.create(payment=payment, booking=booking, amount=Decimal("1000.00"))
         self.plot = plot
         self.registry = Registry.objects.create(
             organization=self.organization,

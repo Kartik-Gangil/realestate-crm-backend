@@ -1,8 +1,24 @@
-from django.core.exceptions import ValidationError
-from django.db import transaction
-from django.utils import timezone
+import hashlib
+import json
+from decimal import Decimal, InvalidOperation
 
-from .models import Plot, PlotBooking, PlotHold, PlotStatusHistory
+from django.core.exceptions import ValidationError
+from django.db import OperationalError, transaction
+from django.utils import timezone
+from datetime import timedelta
+
+from core.exceptions import is_database_busy_error
+
+from .models import (
+    BookingIdempotencyKey,
+    BookingReceiptSequence,
+    Customer,
+    CustomerCodeSequence,
+    Plot,
+    PlotBooking,
+    PlotHold,
+    PlotStatusHistory,
+)
 
 
 STATUS_TRANSITIONS = {
@@ -17,9 +33,12 @@ STATUS_TRANSITIONS = {
 REASON_REQUIRED_FOR = {Plot.Status.BLOCKED, Plot.Status.HOLD, Plot.Status.CANCELLED}
 
 BOOKING_TRANSITIONS = {
-    PlotBooking.Status.PENDING: {PlotBooking.Status.CONFIRMED, PlotBooking.Status.CANCELLED},
+    PlotBooking.Status.CREATED: {PlotBooking.Status.PENDING, PlotBooking.Status.CANCELLED, PlotBooking.Status.EXPIRED},
+    PlotBooking.Status.PENDING: {PlotBooking.Status.PARTIALLY_PAID, PlotBooking.Status.CONFIRMED, PlotBooking.Status.CANCELLED, PlotBooking.Status.EXPIRED},
+    PlotBooking.Status.PARTIALLY_PAID: {PlotBooking.Status.CONFIRMED, PlotBooking.Status.CANCELLED, PlotBooking.Status.EXPIRED},
     PlotBooking.Status.CONFIRMED: {PlotBooking.Status.CANCELLED},
     PlotBooking.Status.CANCELLED: set(),
+    PlotBooking.Status.EXPIRED: set(),
 }
 
 
@@ -28,6 +47,10 @@ class BookingDocumentValidationError(ValidationError):
     def __init__(self, document_validation):
         super().__init__({"detail": "Customer documents are incomplete."})
         self.document_validation = document_validation
+
+
+class PlotAvailabilityConflict(ValidationError):
+    code = "plot_conflict"
 
 
 def validate_booking_transition(old_status, new_status):
@@ -58,7 +81,14 @@ def create_plot_booking(*, organization, lead, plot, site_visit, notes, user):
         _validate_booking_relationships(
             organization=organization, lead=lead, plot=locked_plot, site_visit=site_visit
         )
-        if locked_plot.status != Plot.Status.AVAILABLE:
+        if locked_plot.status == Plot.Status.HOLD:
+            owner_hold = locked_plot.hold_records.filter(
+                action_type=PlotHold.ActionType.HOLD,
+                released_at__isnull=True,
+            ).order_by("-created_at", "-id").first()
+            if not owner_hold or owner_hold.created_by_id != user.id:
+                raise ValidationError({"plot_id": "Only an available plot or your own active hold can be selected for booking."})
+        elif locked_plot.status != Plot.Status.AVAILABLE:
             raise ValidationError({"plot_id": "Only an available plot can be selected for booking."})
         if PlotBooking.objects.filter(
             organization=organization, plot=locked_plot,
@@ -71,10 +101,142 @@ def create_plot_booking(*, organization, lead, plot, site_visit, notes, user):
         )
         booking.full_clean()
         booking.save()
-        # This re-locks within the enclosing transaction and remains the only status authority.
-        change_plot_status(
-            plot=locked_plot, new_status=Plot.Status.HOLD,
-            reason="Plot selected for booking", user=user, notes=booking.notes,
+        # An available plot becomes held for the pending booking. An existing hold
+        # owned by this user is already in the required state and is preserved.
+        if locked_plot.status == Plot.Status.AVAILABLE:
+            change_plot_status(
+                plot=locked_plot, new_status=Plot.Status.HOLD,
+                reason="Plot selected for booking", user=user, notes=booking.notes,
+            )
+        return booking
+
+
+def _next_project_number(sequence_model, project):
+    locked_project = project.__class__.objects.select_for_update().get(pk=project.pk)
+    sequence, _ = sequence_model.objects.get_or_create(project=locked_project, defaults={"next_number": 1})
+    sequence = sequence_model.objects.select_for_update().get(pk=sequence.pk)
+    number = sequence.next_number
+    sequence.next_number += 1
+    sequence.save(update_fields=["next_number"])
+    return number
+
+
+def _customer_for_booking(*, organization, project, lead):
+    customer = Customer.objects.filter(organization=organization, project=project, lead=lead).first()
+    if customer:
+        return customer
+    number = _next_project_number(CustomerCodeSequence, project)
+    return Customer.objects.create(
+        organization=organization,
+        project=project,
+        lead=lead,
+        customer_code=f"{project.code}-C-{number:06d}",
+        full_name=lead.full_name,
+        phone=lead.phone or "",
+        email=lead.email or "",
+        address=lead.address or "",
+    )
+
+
+def _booking_receipt_number(project):
+    number = _next_project_number(BookingReceiptSequence, project)
+    return f"{project.code}-BR-{number:06d}"
+
+
+def create_idempotent_booking(*, organization, project, lead, plot, user, idempotency_key, body=None, site_visit=None, notes="", initial_payment="0", payment_mode=None, transaction_reference=""):
+    """Create the Phase 9 booking in one serialized transaction."""
+    key = (idempotency_key or "").strip()
+    if not key:
+        raise ValidationError({"idempotency_key": "X-Idempotency-Key is required."})
+    payload = body or {"lead_id": lead.pk, "plot_id": plot.pk, "initial_payment": str(initial_payment), "notes": notes}
+    request_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    with transaction.atomic():
+        existing = BookingIdempotencyKey.objects.select_for_update().filter(
+            organization=organization, project=project, key=key
+        ).first()
+        if existing:
+            if existing.request_hash != request_hash:
+                error = ValidationError({"idempotency_key": "The same key was already used with a different request."})
+                error.code = "idempotency_conflict"
+                raise error
+            return existing.booking
+
+        try:
+            amount = Decimal(str(initial_payment or "0"))
+        except (InvalidOperation, TypeError, ValueError) as error:
+            raise ValidationError({"initial_payment": "Use a valid decimal amount."}) from error
+        if not amount.is_finite() or amount < 0:
+            raise ValidationError({"initial_payment": "Initial payment cannot be negative."})
+
+        locked_plot = Plot.objects.select_for_update().get(pk=plot.pk, organization=organization, project=project)
+        locked_lead = lead.__class__.objects.select_for_update().get(pk=lead.pk, organization=organization)
+        if locked_lead.lifecycle_status not in PlotBooking.allowed_lead_statuses():
+            raise ValidationError({"lead_id": "A completed site visit is required before creating a booking."})
+        if locked_plot.status == Plot.Status.HOLD:
+            active_hold = locked_plot.hold_records.filter(released_at__isnull=True).order_by("-created_at", "-id").first()
+            if not active_hold or active_hold.created_by_id != user.id:
+                raise PlotAvailabilityConflict({"plot_id": "Only an available plot or your own active hold can be booked."})
+        elif locked_plot.status != Plot.Status.AVAILABLE:
+            raise PlotAvailabilityConflict({"plot_id": "Only an available plot can be booked."})
+        if PlotBooking.objects.filter(
+            organization=organization, plot=locked_plot,
+            status__in=[PlotBooking.Status.CREATED, PlotBooking.Status.PENDING, PlotBooking.Status.PARTIALLY_PAID, PlotBooking.Status.CONFIRMED],
+        ).exists():
+            raise PlotAvailabilityConflict({"plot_id": "This plot already has an active booking."})
+
+        customer = _customer_for_booking(organization=organization, project=project, lead=locked_lead)
+        total = locked_plot.total_price or Decimal("0")
+        from system_settings.parameters import PARAMETER_REGISTRY
+        from system_settings.services import UnknownSystemParameter, get_system_parameter
+        try:
+            booking_hold_days = int(get_system_parameter(organization, "booking_hold_days", project=project))
+        except UnknownSystemParameter:
+            booking_hold_days = int(PARAMETER_REGISTRY["booking_hold_days"].default)
+        try:
+            grace_minutes = int(get_system_parameter(organization, "payment_pending_grace_minutes", project=project))
+        except UnknownSystemParameter:
+            grace_minutes = int(PARAMETER_REGISTRY["payment_pending_grace_minutes"].default)
+        try:
+            minimum_percent = Decimal(str(get_system_parameter(organization, "booking_minimum_payment_percent", project=project)))
+        except UnknownSystemParameter:
+            minimum_percent = Decimal(str(PARAMETER_REGISTRY["booking_minimum_payment_percent"].default))
+        minimum_amount = (total * minimum_percent / Decimal("100")).quantize(Decimal("0.01"))
+        now = timezone.now()
+        booking = PlotBooking.objects.create(
+            organization=organization,
+            project=project,
+            customer=customer,
+            lead=locked_lead,
+            plot=locked_plot,
+            site_visit=site_visit,
+            booking_code=f"{project.code}-BK-{timezone.now().strftime('%Y%m%d%H%M%S')}-{locked_plot.pk}",
+            status=PlotBooking.Status.PENDING,
+            notes=(notes or "").strip(),
+            final_price=total,
+            total_amount=total,
+            net_amount=total,
+            booking_receipt_number=_booking_receipt_number(project),
+            created_by=user,
+        )
+        booking.full_clean()
+        change_plot_status(plot=locked_plot, new_status=Plot.Status.BOOKED, reason="Booking created", user=user)
+        from .phase5_services import payment_totals, record_initial_booking_payment
+        if amount:
+            record_initial_booking_payment(
+                booking=booking, amount=amount, payment_method=payment_mode,
+                transaction_reference=transaction_reference, user=user,
+            )
+        paid = payment_totals(booking)["net_paid"]
+        booking.booking_amount_paid = paid
+        if paid > 0:
+            booking.status = PlotBooking.Status.PARTIALLY_PAID
+        if paid <= 0:
+            booking.hold_expires_at = now + timedelta(minutes=grace_minutes)
+        elif paid < minimum_amount:
+            booking.hold_expires_at = now + timedelta(days=booking_hold_days)
+        booking.save(update_fields=["status", "hold_expires_at", "updated_at"])
+        BookingIdempotencyKey.objects.create(
+            organization=organization, project=project, key=key, request_hash=request_hash, booking=booking
         )
         return booking
 
@@ -91,14 +253,21 @@ def confirm_plot_booking(*, booking, user):
         validation = validate_customer_documents_for_booking(locked_booking.lead)
         if not validation["allowed"]:
             raise BookingDocumentValidationError(validation)
-        if locked_plot.status != Plot.Status.HOLD:
-            raise ValidationError({"plot": "Only a held plot can have its pending booking confirmed."})
-        change_plot_status(
-            plot=locked_plot, new_status=Plot.Status.BOOKED,
-            reason="Booking confirmed", user=user,
-        )
+        if locked_plot.status == Plot.Status.HOLD:
+            change_plot_status(plot=locked_plot, new_status=Plot.Status.BOOKED, reason="Booking confirmed", user=user)
+        elif locked_plot.status != Plot.Status.BOOKED:
+            raise ValidationError({"plot": "Only a held or booked plot can have its booking confirmed."})
         locked_booking.status = PlotBooking.Status.CONFIRMED
         locked_booking.save(update_fields=["status", "updated_at"])
+        if locked_booking.lead.lifecycle_status == "site_visit_completed":
+            from leads.views import _record_lead_status_transition
+            _record_lead_status_transition(
+                lead=locked_booking.lead,
+                status_value="converted",
+                user=user,
+                reason="Booking confirmed",
+                system=True,
+            )
         return locked_booking
 
 
@@ -113,9 +282,11 @@ def cancel_plot_booking(*, booking, reason, user):
         )
         previous_status = locked_booking.status
         validate_booking_transition(previous_status, PlotBooking.Status.CANCELLED)
-        if previous_status == PlotBooking.Status.PENDING:
-            if locked_plot.status != Plot.Status.HOLD:
-                raise ValidationError({"plot": "Pending booking cancellation requires the plot to be on hold."})
+        if previous_status in {PlotBooking.Status.CREATED, PlotBooking.Status.PENDING, PlotBooking.Status.PARTIALLY_PAID}:
+            if locked_plot.status not in {Plot.Status.HOLD, Plot.Status.BOOKED}:
+                raise ValidationError({"plot": "Active booking cancellation requires the plot to be held or booked."})
+            if locked_plot.status == Plot.Status.BOOKED:
+                change_plot_status(plot=locked_plot, new_status=Plot.Status.CANCELLED, reason=reason, user=user)
             change_plot_status(plot=locked_plot, new_status=Plot.Status.AVAILABLE, reason=reason, user=user)
         else:
             if locked_plot.status != Plot.Status.BOOKED:
@@ -149,8 +320,13 @@ def _validate_hold_range(from_datetime, to_datetime):
         raise ValidationError({"to_datetime": "Must be later than from_datetime."})
 
 
-def _close_active_holds(plot, now):
-    plot.hold_records.filter(released_at__isnull=True).update(released_at=now)
+def _close_active_holds(plot, now, request=None):
+    active = list(plot.hold_records.filter(released_at__isnull=True))
+    plot.hold_records.filter(pk__in=[item.pk for item in active]).update(released_at=now)
+    if active:
+        from system_settings.audit import log_bulk_audit
+        log_bulk_audit(request=request, module="inventory", action="bulk_update", instances=active, organization=plot.organization,
+                       project=plot.project, changed_values={"released_at": now.isoformat()})
 
 
 def _create_hold_record(plot, new_status, reason, user, from_datetime, to_datetime, notes):
@@ -165,19 +341,31 @@ def _create_hold_record(plot, new_status, reason, user, from_datetime, to_dateti
         )
     if active_holds.exists():
         raise ValidationError({"plot": "An overlapping active block or hold already exists for this plot."})
+    expires_at = to_datetime
+    if expires_at is None:
+        from system_settings.parameters import PARAMETER_REGISTRY
+        from system_settings.services import UnknownSystemParameter, get_system_parameter
+        try:
+            hold_hours = int(get_system_parameter(plot.organization, "plot_hold_hours", project=plot.project))
+        except UnknownSystemParameter:
+            hold_hours = int(PARAMETER_REGISTRY["plot_hold_hours"].default)
+        expires_at = timezone.now() + timedelta(hours=hold_hours)
     PlotHold.objects.create(
         plot=plot,
         action_type=PlotHold.ActionType.BLOCK if new_status == Plot.Status.BLOCKED else PlotHold.ActionType.HOLD,
         reason=reason,
         from_datetime=from_datetime,
         to_datetime=to_datetime,
+        expires_at=expires_at,
         notes=notes or "",
         created_by=user,
     )
 
 
-def _change_locked_plot_status(plot, new_status, reason, user, from_datetime=None, to_datetime=None, notes=""):
+def _change_locked_plot_status(plot, new_status, reason, user, from_datetime=None, to_datetime=None, notes="", request=None):
     reason = (reason or "").strip()
+    if new_status in {Plot.Status.HOLD, Plot.Status.BLOCKED} and plot.status == Plot.Status.BOOKED:
+        raise PlotAvailabilityConflict({"status": "The plot has already been booked."})
     validate_status_transition(plot.status, new_status)
     _validate_reason(new_status, reason)
     if (from_datetime or to_datetime or notes) and new_status not in {Plot.Status.BLOCKED, Plot.Status.HOLD}:
@@ -186,7 +374,7 @@ def _change_locked_plot_status(plot, new_status, reason, user, from_datetime=Non
     old_status = plot.status
     now = timezone.now()
     if old_status in {Plot.Status.BLOCKED, Plot.Status.HOLD}:
-        _close_active_holds(plot, now)
+        _close_active_holds(plot, now, request=request)
     if new_status in {Plot.Status.BLOCKED, Plot.Status.HOLD}:
         _create_hold_record(plot, new_status, reason, user, from_datetime, to_datetime, notes)
 
@@ -198,13 +386,19 @@ def _change_locked_plot_status(plot, new_status, reason, user, from_datetime=Non
     return plot
 
 
-def change_plot_status(*, plot, new_status, reason, user, from_datetime=None, to_datetime=None, notes=""):
+def change_plot_status(*, plot, new_status, reason, user, from_datetime=None, to_datetime=None, notes="", request=None):
     """Atomically lock a plot, transition it, and write immutable audit records."""
-    with transaction.atomic():
-        locked_plot = Plot.objects.select_for_update().get(pk=plot.pk, organization=plot.organization)
-        return _change_locked_plot_status(
-            locked_plot, new_status, reason, user, from_datetime, to_datetime, notes
-        )
+    try:
+        with transaction.atomic():
+            locked_plot = Plot.objects.select_for_update().get(pk=plot.pk, organization=plot.organization)
+            return _change_locked_plot_status(
+                locked_plot, new_status, reason, user, from_datetime, to_datetime, notes, request
+            )
+    except OperationalError as error:
+        if is_database_busy_error(error):
+            error.code = "database_busy"
+            error.status_code = 503
+        raise
 
 
 def block_plot(*, plot, reason, user, from_datetime=None, to_datetime=None, notes=""):
@@ -221,16 +415,18 @@ def hold_plot(*, plot, reason, user, from_datetime=None, to_datetime=None, notes
     )
 
 
-def release_plot(*, plot, reason, user):
+def release_plot(*, plot, reason, user, request=None):
     if plot.status not in {Plot.Status.BLOCKED, Plot.Status.HOLD}:
         raise ValidationError({"status": "Only blocked or held plots can be released."})
-    return change_plot_status(plot=plot, new_status=Plot.Status.AVAILABLE, reason=reason, user=user)
+    return change_plot_status(plot=plot, new_status=Plot.Status.AVAILABLE, reason=reason, user=user, request=request)
 
 
 def bulk_change_plot_status(*, plots, new_status, reason, user):
     plot_ids = sorted({plot.pk for plot in plots})
     if not plot_ids:
         raise ValidationError({"plot_ids": "Provide at least one plot ID."})
+    if len(plot_ids) > 500:
+        raise ValidationError({"plot_ids": "A bulk plot-status update may contain at most 500 plots."})
     organization_id = plots[0].organization_id
     with transaction.atomic():
         locked_plots = list(

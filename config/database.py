@@ -25,6 +25,7 @@ def database_config_from_url(database_url):
         if key in {"sslmode", "connect_timeout", "application_name"} and values
     }
     options.setdefault("sslmode", "require")
+    options.setdefault("options", "-c lock_timeout=5000")
 
     return {
         "ENGINE": "django.db.backends.postgresql",
@@ -34,4 +35,17 @@ def database_config_from_url(database_url):
         "HOST": parsed.hostname,
         "PORT": port or "",
         "OPTIONS": options,
+        "CONN_HEALTH_CHECKS": True,
+    }
+
+
+def sqlite_database_config(name):
+    return {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": name,
+        "OPTIONS": {
+            "transaction_mode": "IMMEDIATE",
+            "timeout": 20,
+            "init_command": "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL",
+        },
     }

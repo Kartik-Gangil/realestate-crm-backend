@@ -38,6 +38,7 @@ class QaFlowSeedCommandTests(TestCase):
         block = Block.objects.create(organization=organization, project=project, name="Existing Block", code="EXISTING-A")
         lead = Lead.objects.create(
             organization=organization,
+            project=project,
             first_name="Existing",
             last_name="Lead",
             email="existing@example.com",

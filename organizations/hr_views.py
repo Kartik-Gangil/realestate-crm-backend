@@ -14,10 +14,13 @@ from .hr_services import check_in, check_out, decide_leave, leave_days, log_acti
 from .models import (AttendanceRecord, LeaveRequest, OrganizationHoliday, OrganizationMembership,
                      OrganizationRole, Permission)
 from .services import get_organization_access, has_permission
+from core.endpoint import crm_endpoint
+from core.audit_context import set_audit_action
+from system_settings.audit import log_audit
 
 
 def _manage(access):
-    if not access.is_platform and not has_permission(access.membership.user, access.organization, "settings.edit"):
+    if not access.is_platform and not has_permission(access.membership.user, access.organization, "role.edit"):
         raise PermissionDenied("Only organization admins and authorized platform users can manage this resource.")
 
 
@@ -27,7 +30,7 @@ def _dict_employee(employee):
 
 
 def _role(role):
-    return {"id": role.id, "name": role.name, "code": role.code, "is_system": role.is_system,
+    return {"id": role.id, "name": role.name, "code": role.code, "description": role.description, "is_system": role.is_system,
             "permission_ids": list(role.permissions.values_list("id", flat=True)),
             "permissions": [item.code for item in role.permissions.all()]}
 
@@ -55,14 +58,38 @@ def _validated_permission_ids(raw_permission_ids):
     return permission_ids, None
 
 
-@api_view(["GET", "POST"])
-@permission_classes([IsAuthenticated])
+def _permission_codes(role):
+    return sorted(
+        f"{permission.module}.{permission.action}"
+        for permission in role.permissions.all()
+    )
+
+
+def _permission_change_audit(request, organization, role, before, after):
+    before_set, after_set = set(before), set(after)
+    log_audit(
+        request=request,
+        organization=organization,
+        module="roles",
+        action="permissions",
+        details={
+            "added": sorted(after_set - before_set),
+            "removed": sorted(before_set - after_set),
+        },
+        target=role,
+        payload_before={"permissions": sorted(before)},
+        payload_after={"permissions": sorted(after)},
+    )
+
+
+@crm_endpoint(["GET", "POST"], scope="organization", permissions={"GET": "role.view", "POST": "role.add"})
 def roles(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
     if request.method == "GET":
         return Response([_role(item) for item in OrganizationRole.objects.filter(organization=access.organization).prefetch_related("permissions")])
     _manage(access)
     name, code = str(request.data.get("name", "")).strip(), str(request.data.get("code", "")).strip().lower()
+    description = str(request.data.get("description", "")).strip()
     permission_ids = request.data.get("permission_ids", [])
     permission_ids, permission_error = _validated_permission_ids(permission_ids)
     if permission_error:
@@ -74,7 +101,7 @@ def roles(request, organization_slug):
         return Response({"permission_ids": "Use valid unique permission IDs."}, status=400)
     try:
         with transaction.atomic():
-            role = OrganizationRole.objects.create(organization=access.organization, name=name, code=code)
+            role = OrganizationRole.objects.create(organization=access.organization, name=name, code=code, description=description)
             role.permissions.set(permissions)
             employee = access.membership or access.organization.memberships.first()
             if employee: log_activity(organization=access.organization, employee=employee, action="role_created", actor=request.user, module="roles", details={"role": code})
@@ -83,29 +110,34 @@ def roles(request, organization_slug):
     return Response(_role(role), status=201)
 
 
-@api_view(["GET", "PATCH", "PUT", "DELETE"])
-@permission_classes([IsAuthenticated])
+@crm_endpoint(["GET", "PATCH", "PUT", "DELETE"], scope="organization", permissions={"GET": "role.view", "PATCH": "role.edit", "PUT": "role.edit", "DELETE": "role.delete"})
 def role_detail(request, organization_slug, role_id):
     access = get_organization_access(request.user, organization_slug)
     role = get_object_or_404(OrganizationRole.objects.filter(organization=access.organization).prefetch_related("permissions"), pk=role_id)
     if request.method == "GET": return Response(_role(role))
     _manage(access)
+    if role.is_system and role.code == "admin" and (
+        request.method == "DELETE" or any(field in request.data for field in ("name", "code", "permission_ids"))
+    ):
+        return Response({"code": "system_role_locked", "detail": "The system Admin role is locked."}, status=403)
     if request.method == "DELETE":
         if access.organization.memberships.filter(organization_role=role).exists():
             return Response({"role": "Reassign employees before deleting this role."}, status=409)
         if not request.data.get("confirmation"):
             return Response({"code": "confirmation_required"}, status=409)
-        role.delete(); 
+        role.delete()
         return Response(status=204)
-    for field in ("name", "code"):
+    for field in ("name", "code", "description"):
         if field in request.data: setattr(role, field, str(request.data[field]).strip())
     if "permission_ids" in request.data:
+        before_permissions = _permission_codes(role)
         permission_ids, permission_error = _validated_permission_ids(request.data["permission_ids"])
         if permission_error:
             return Response({"permission_ids": permission_error}, status=400)
         selected = list(Permission.objects.filter(pk__in=permission_ids))
         if len(selected) != len(permission_ids): return Response({"permission_ids": "Use valid unique permission IDs."}, status=400)
         role.permissions.set(selected)
+        _permission_change_audit(request, access.organization, role, before_permissions, _permission_codes(role))
     try: role.save()
     except IntegrityError: return Response({"name": "Role name and code must be unique within this organization."}, status=400)
     employee = access.membership or access.organization.memberships.first()
@@ -113,8 +145,25 @@ def role_detail(request, organization_slug, role_id):
     return Response(_role(role))
 
 
-@api_view(["GET"])
-@permission_classes([IsAuthenticated])
+@crm_endpoint(["PUT"], scope="organization", permissions={"PUT": "role.edit"})
+def role_permissions(request, organization_slug, role_id):
+    access = get_organization_access(request.user, organization_slug)
+    role = get_object_or_404(OrganizationRole.objects.filter(organization=access.organization).prefetch_related("permissions"), pk=role_id)
+    if role.is_system and role.code == "admin":
+        return Response({"code": "system_role_locked", "detail": "The system Admin role is locked."}, status=403)
+    permission_ids, permission_error = _validated_permission_ids(request.data.get("permission_ids", []))
+    if permission_error:
+        return Response({"permission_ids": permission_error}, status=400)
+    selected = list(Permission.objects.filter(pk__in=permission_ids))
+    if len(selected) != len(permission_ids):
+        return Response({"permission_ids": "Use valid unique permission IDs."}, status=400)
+    before_permissions = _permission_codes(role)
+    role.permissions.set(selected)
+    _permission_change_audit(request, access.organization, role, before_permissions, _permission_codes(role))
+    return Response(_role(role))
+
+
+@crm_endpoint(["GET"], scope="organization")
 def permissions(request, organization_slug):
     get_organization_access(request.user, organization_slug)
     return Response([{
@@ -123,6 +172,7 @@ def permissions(request, organization_slug):
         "action": item.action,
         "code": item.code,
         "name": item.name,
+        "scope": item.scope,
         "actions": [item.action],
     } for item in Permission.objects.all()])
 
@@ -155,7 +205,7 @@ def attendance_check_in(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
     employee_id = request.data.get("employee", access.membership.id if access.membership else None)
     employee = get_object_or_404(_employees_for_access(access), pk=employee_id)
-    if not access.is_platform and employee != access.membership and access.membership.role not in {"admin", "manager"}: raise PermissionDenied("You can only check in for yourself.")
+    if not access.is_platform and employee != access.membership and not has_permission(request.user, access.organization, "attendance.edit"): raise PermissionDenied("You can only check in for yourself.")
     try: record = check_in(organization=access.organization, employee=employee, actor=request.user)
     except ValidationError as error: return _validation_response(error)
     return Response(_attendance(AttendanceRecord.objects.select_related("employee__user").get(pk=record.pk)), status=201)
@@ -167,7 +217,7 @@ def attendance_check_out(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
     employee_id = request.data.get("employee", access.membership.id if access.membership else None)
     employee = get_object_or_404(_employees_for_access(access), pk=employee_id)
-    if not access.is_platform and employee != access.membership and access.membership.role not in {"admin", "manager"}: raise PermissionDenied("You can only check out for yourself.")
+    if not access.is_platform and employee != access.membership and not has_permission(request.user, access.organization, "attendance.edit"): raise PermissionDenied("You can only check out for yourself.")
     try: record = check_out(organization=access.organization, employee=employee, actor=request.user)
     except ValidationError as error: return _validation_response(error)
     return Response(_attendance(AttendanceRecord.objects.select_related("employee__user").get(pk=record.pk)))
@@ -210,7 +260,7 @@ def leaves(request, organization_slug):
         except ValidationError as error: return _validation_response(error)
         return Response({"count": count, "next": _page_url(request, page + 1, size) if page * size < count else None, "previous": _page_url(request, page - 1, size) if page > 1 else None, "results": [_leave(x) for x in rows]})
     employee = get_object_or_404(_employees_for_access(access), pk=request.data.get("employee", access.membership.id if access.membership else None))
-    if not access.is_platform and employee != access.membership and access.membership.role not in {"admin", "manager"}: raise PermissionDenied("You can only apply for your own leave.")
+    if not access.is_platform and employee != access.membership and not has_permission(request.user, access.organization, "leave.edit"): raise PermissionDenied("You can only apply for your own leave.")
     try:
         from_date, to_date = parse_date(str(request.data["from_date"])), parse_date(str(request.data["to_date"]))
         if not from_date or not to_date: raise ValidationError({"from_date": "Use ISO dates (YYYY-MM-DD)."})
@@ -250,8 +300,11 @@ def _leave_action(request, slug, leave_id, approved):
         ),
         pk=leave_id,
     )
-    try: leave = decide_leave(leave=leave, actor_membership=access.membership, actor=request.user, approved=approved, rejection_reason=str(request.data.get("rejection_reason", "")))
+    try:
+        set_audit_action(request, "approve" if approved else "reject")
+        leave = decide_leave(leave=leave, actor_membership=access.membership, actor=request.user, approved=approved, rejection_reason=str(request.data.get("rejection_reason", "")))
     except ValidationError as error: return _validation_response(error)
+    set_audit_action(request, None)
     return Response(_leave(LeaveRequest.objects.select_related("employee__user").get(pk=leave.pk)))
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])

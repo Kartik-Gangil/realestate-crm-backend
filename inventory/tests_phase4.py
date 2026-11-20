@@ -1,38 +1,57 @@
 from decimal import Decimal
 
-from django.contrib.auth import get_user_model
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from django.urls import reverse
 from rest_framework.test import APIClient
 
+from core.tests.factories import make_member, make_organization, make_project, project_request_kwargs
+from documents.models import CustomerDocument, DocumentCategory
 from leads.models import Lead, Sitevisit
-from organizations.models import Organization, OrganizationMembership
 
-from .models import Block, Plot, PlotBooking, PlotStatusHistory, Project
+from .models import Block, Plot, PlotBooking, PlotStatusHistory
 
 
 class PlotBookingApiTests(TestCase):
     def setUp(self):
-        user_model = get_user_model()
-        self.manager = user_model.objects.create_user(username="manager", password="password123")
-        self.viewer = user_model.objects.create_user(username="viewer", password="password123")
-        self.other_user = user_model.objects.create_user(username="other", password="password123")
-        self.organization = Organization.objects.create(name="Acme", slug="acme")
-        self.other_organization = Organization.objects.create(name="Other", slug="other")
-        OrganizationMembership.objects.create(organization=self.organization, user=self.manager, role=OrganizationMembership.Role.MANAGER)
-        OrganizationMembership.objects.create(organization=self.organization, user=self.viewer, role=OrganizationMembership.Role.TELECALLER)
-        OrganizationMembership.objects.create(organization=self.other_organization, user=self.other_user, role=OrganizationMembership.Role.MANAGER)
-        self.project = Project.objects.create(organization=self.organization, name="Green", code="G")
+        self.organization = make_organization("acme")
+        self.other_organization = make_organization("other")
+        self.project = make_project(self.organization, "G")
         self.block = Block.objects.create(organization=self.organization, project=self.project, name="A", code="A")
-        self.other_project = Project.objects.create(organization=self.other_organization, name="Other", code="O")
+        self.other_project = make_project(self.other_organization, "O")
         self.other_block = Block.objects.create(organization=self.other_organization, project=self.other_project, name="B", code="B")
-        self.lead = Lead.objects.create(organization=self.organization, first_name="Ada", last_name="Lovelace", phone="111")
-        self.other_lead = Lead.objects.create(organization=self.other_organization, first_name="Grace", phone="222")
-        self.visit = Sitevisit.objects.create(organization=self.organization, lead=self.lead, site="Green")
-        self.other_visit = Sitevisit.objects.create(organization=self.organization, lead=Lead.objects.create(organization=self.organization, first_name="Other", phone="333"))
+        self.manager_membership = make_member(self.organization, role="manager", projects=[self.project])
+        self.viewer_membership = make_member(self.organization, role="telecaller", projects=[self.project])
+        self.other_membership = make_member(self.other_organization, role="manager", projects=[self.other_project])
+        self.manager = self.manager_membership.user
+        self.viewer = self.viewer_membership.user
+        self.other_user = self.other_membership.user
+        self.lead = Lead.objects.create(
+            organization=self.organization,
+            project=self.project,
+            first_name="Ada",
+            last_name="Lovelace",
+            phone="9000000103",
+            lifecycle_status="site_visit_completed",
+        )
+        self.other_lead = Lead.objects.create(organization=self.other_organization, project=self.other_project, first_name="Grace", phone="9000000104")
+        self.visit = Sitevisit.objects.create(
+            organization=self.organization,
+            project=self.project,
+            lead=self.lead,
+            site="Green",
+            status=Sitevisit.Status.COMPLETED,
+        )
+        self.other_visit = Sitevisit.objects.create(
+            organization=self.organization,
+            project=self.project,
+            lead=Lead.objects.create(organization=self.organization, project=self.project, first_name="Other", phone="9000000105"),
+        )
         self.client = APIClient()
         self.client.force_authenticate(self.manager)
-        self.client.defaults["HTTP_X_PROJECT_ID"] = str(self.project.id)
+
+    def headers(self, project=None):
+        return project_request_kwargs(project or self.project)
 
     def plot(self, number="A-101", status=Plot.Status.AVAILABLE, organization=None):
         organization = organization or self.organization
@@ -49,7 +68,8 @@ class PlotBookingApiTests(TestCase):
     def create_booking(self, plot, **extra):
         payload = {"lead_id": self.lead.id, "plot_id": plot.id, "site_visit_id": self.visit.id, "notes": "Interested"}
         payload.update(extra)
-        return self.client.post(self.booking_url(), payload, format="json")
+        key = payload.pop("idempotency_key", f"phase4-{plot.id}-{PlotBooking.objects.count()}")
+        return self.client.post(self.booking_url(), payload, format="json", HTTP_X_IDEMPOTENCY_KEY=key, **self.headers())
 
     def test_create_booking_selects_plot_and_writes_history(self):
         plot = self.plot()
@@ -58,18 +78,18 @@ class PlotBookingApiTests(TestCase):
         booking = PlotBooking.objects.get()
         self.assertEqual(booking.status, PlotBooking.Status.PENDING)
         plot.refresh_from_db()
-        self.assertEqual(plot.status, Plot.Status.HOLD)
-        self.assertTrue(PlotStatusHistory.objects.filter(plot=plot, old_status="available", new_status="hold").exists())
+        self.assertEqual(plot.status, Plot.Status.BOOKED)
+        self.assertTrue(PlotStatusHistory.objects.filter(plot=plot, old_status="available", new_status="booked").exists())
 
     def test_select_endpoint_and_relationship_validation(self):
         plot = self.plot()
         url = reverse("inventory:plot-select", args=[self.organization.slug, plot.id])
-        response = self.client.post(url, {"lead_id": self.lead.id, "site_visit_id": self.visit.id}, format="json")
+        response = self.client.post(url, {"lead_id": self.lead.id, "site_visit_id": self.visit.id}, format="json", HTTP_X_IDEMPOTENCY_KEY="plot-select-1", **self.headers())
         self.assertEqual(response.status_code, 201, response.data)
         plot = self.plot("A-102")
         response = self.create_booking(plot, site_visit_id=self.other_visit.id)
         self.assertEqual(response.status_code, 400)
-        self.assertIn("site_visit_id", response.data)
+        self.assertIn("site_visit", response.data)
 
     def test_cross_organization_and_unavailable_plots_are_rejected(self):
         own_plot = self.plot()
@@ -77,16 +97,17 @@ class PlotBookingApiTests(TestCase):
         foreign_plot = self.plot("O-1", organization=self.other_organization)
         self.assertEqual(self.create_booking(foreign_plot).status_code, 404)
         unavailable = self.plot("A-102", status=Plot.Status.BLOCKED)
-        self.assertEqual(self.create_booking(unavailable).status_code, 400)
+        self.assertEqual(self.create_booking(unavailable).status_code, 409)
 
     def test_only_one_active_booking_and_cancelled_booking_can_be_replaced(self):
         plot = self.plot()
         response = self.create_booking(plot)
         self.assertEqual(response.status_code, 201)
-        self.assertEqual(self.create_booking(plot).status_code, 400)
+        self.assertEqual(self.create_booking(plot).status_code, 409)
         booking = PlotBooking.objects.get(plot=plot)
         cancel = reverse("inventory:booking-cancel", args=[self.organization.slug, booking.id])
-        self.assertEqual(self.client.post(cancel, {"reason": "Changed mind"}, format="json").status_code, 200)
+        cancel_response = self.client.post(cancel, {"reason": "Changed mind"}, format="json", **self.headers())
+        self.assertEqual(cancel_response.status_code, 200, cancel_response.data)
         plot.refresh_from_db()
         self.assertEqual(plot.status, Plot.Status.AVAILABLE)
         self.assertEqual(self.create_booking(plot).status_code, 201)
@@ -95,24 +116,40 @@ class PlotBookingApiTests(TestCase):
         plot = self.plot()
         self.create_booking(plot)
         booking = PlotBooking.objects.get(plot=plot)
+        category = DocumentCategory.objects.create(
+            organization=self.organization, name="Identity", code="identity"
+        )
+        CustomerDocument.objects.create(
+            organization=self.organization,
+            customer=self.lead,
+            document_category=category,
+            document_name="Identity",
+            file=SimpleUploadedFile("identity.pdf", b"verified identity", content_type="application/pdf"),
+            file_name="identity.pdf",
+            file_size=len(b"verified identity"),
+            content_type="application/pdf",
+            version=1,
+            status=CustomerDocument.Status.VERIFIED,
+            verified_by=self.manager,
+        )
         confirm = reverse("inventory:booking-confirm", args=[self.organization.slug, booking.id])
-        self.assertEqual(self.client.post(confirm, {}, format="json").status_code, 200)
+        self.assertEqual(self.client.post(confirm, {}, format="json", **self.headers()).status_code, 200)
         plot.refresh_from_db(); booking.refresh_from_db()
         self.assertEqual((booking.status, plot.status), (PlotBooking.Status.CONFIRMED, Plot.Status.BOOKED))
         cancel = reverse("inventory:booking-cancel", args=[self.organization.slug, booking.id])
-        self.assertEqual(self.client.post(cancel, {"reason": "Financing failed"}, format="json").status_code, 200)
+        self.assertEqual(self.client.post(cancel, {"reason": "Financing failed"}, format="json", **self.headers()).status_code, 200)
         plot.refresh_from_db(); booking.refresh_from_db()
         self.assertEqual((booking.status, plot.status), (PlotBooking.Status.CANCELLED, Plot.Status.AVAILABLE))
-        self.assertEqual(PlotStatusHistory.objects.filter(plot=plot).count(), 4)
-        self.assertEqual(self.client.post(confirm, {}, format="json").status_code, 400)
+        self.assertEqual(PlotStatusHistory.objects.filter(plot=plot).count(), 3)
+        self.assertEqual(self.client.post(confirm, {}, format="json", **self.headers()).status_code, 400)
 
     def test_lists_isolation_and_read_only_permission(self):
         plot = self.plot()
         self.create_booking(plot)
         booking = PlotBooking.objects.get()
-        self.assertEqual(self.client.get(reverse("inventory:lead-bookings", args=[self.organization.slug, self.lead.id])).status_code, 200)
-        self.assertEqual(self.client.get(reverse("inventory:plot-bookings", args=[self.organization.slug, plot.id])).status_code, 200)
+        self.assertEqual(self.client.get(reverse("inventory:lead-bookings", args=[self.organization.slug, self.lead.id]), **self.headers()).status_code, 200)
+        self.assertEqual(self.client.get(reverse("inventory:plot-bookings", args=[self.organization.slug, plot.id]), **self.headers()).status_code, 200)
         viewer = APIClient(); viewer.force_authenticate(self.viewer)
-        self.assertEqual(viewer.get(self.booking_url()).status_code, 200)
-        self.assertEqual(viewer.post(reverse("inventory:booking-confirm", args=[self.organization.slug, booking.id]), {}, format="json").status_code, 403)
-        self.assertEqual(self.client.get(reverse("inventory:booking-detail", args=[self.organization.slug, booking.id + 999])).status_code, 404)
+        self.assertEqual(viewer.get(self.booking_url(), **self.headers()).status_code, 200)
+        self.assertEqual(viewer.post(reverse("inventory:booking-confirm", args=[self.organization.slug, booking.id]), {}, format="json", **self.headers()).status_code, 403)
+        self.assertEqual(self.client.get(reverse("inventory:booking-detail", args=[self.organization.slug, booking.id + 999]), **self.headers()).status_code, 404)

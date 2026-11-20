@@ -49,6 +49,7 @@ urlpatterns = [
     path("inventory/bookings/<int:booking_id>/", views.booking_detail, name="booking-detail"),
     path("inventory/bookings/<int:booking_id>/confirm/", views.booking_confirm, name="booking-confirm"),
     path("inventory/bookings/<int:booking_id>/cancel/", views.booking_cancel, name="booking-cancel"),
+    path("inventory/bookings/<int:booking_id>/receipt/", views.booking_receipt, name="booking-receipt"),
     path("inventory/leads/<int:lead_id>/bookings/", views.lead_bookings, name="lead-bookings"),
     path("inventory/bookings/<int:booking_id>/payments/", views.booking_payments, name="booking-payments"),
     path("inventory/payments/", views.payment_list, name="payments"),

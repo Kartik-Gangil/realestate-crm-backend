@@ -1,6 +1,7 @@
 from django.urls import path
 
 from . import employee_views, hr_views, views
+from core import notification_views
 
 urlpatterns = [
     path("v1/organizations/<slug:organization_slug>/users/", employee_views.employee_list, name="v1-user-list"),
@@ -24,6 +25,7 @@ urlpatterns = [
     path("organizations/<slug:organization_slug>/departments/<int:department_id>/", employee_views.department_detail, name="department-detail"),
     path("organizations/<slug:organization_slug>/roles/", hr_views.roles, name="role-list"),
     path("organizations/<slug:organization_slug>/roles/<int:role_id>/", hr_views.role_detail, name="role-detail"),
+    path("organizations/<slug:organization_slug>/roles/<int:role_id>/permissions/", hr_views.role_permissions, name="role-permissions"),
     path("organizations/<slug:organization_slug>/permissions/", hr_views.permissions, name="permission-list"),
     path("organizations/<slug:organization_slug>/holidays/", hr_views.holidays, name="holiday-list"),
     path("organizations/<slug:organization_slug>/attendance/", hr_views.attendance, name="attendance-list"),
@@ -34,4 +36,7 @@ urlpatterns = [
     path("organizations/<slug:organization_slug>/leaves/<int:leave_id>/approve/", hr_views.leave_approve, name="leave-approve"),
     path("organizations/<slug:organization_slug>/leaves/<int:leave_id>/reject/", hr_views.leave_reject, name="leave-reject"),
     path("organizations/<slug:organization_slug>/leaves/<int:leave_id>/cancel/", hr_views.leave_cancel, name="leave-cancel"),
+    path("organizations/<slug:organization_slug>/notifications/", notification_views.notification_list, name="notification-list"),
+    path("organizations/<slug:organization_slug>/notifications/read-all/", notification_views.notification_mark_all_read, name="notification-read-all"),
+    path("organizations/<slug:organization_slug>/notifications/<int:notification_id>/read/", notification_views.notification_mark_read, name="notification-read"),
 ]

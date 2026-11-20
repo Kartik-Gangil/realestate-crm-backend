@@ -3,26 +3,43 @@ import io
 from datetime import datetime, timedelta
 
 from django.core.exceptions import ValidationError
-from django.db import transaction
+from django.db import OperationalError, transaction
 from django.db.models import Avg, Count, Q, OuterRef, Subquery
 from django.shortcuts import get_object_or_404
+from django.http import FileResponse
 from django.utils.dateparse import parse_date, parse_datetime, parse_time
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import PermissionDenied
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
-from organizations.models import OrganizationMembership
+from organizations.models import Organization, OrganizationMembership
 from organizations.services import apply_data_scope, get_organization_access, get_project_context, has_permission
-from .models import FollowUpCall, Lead , Sitevisit , SitevisitReschedule
+from system_settings.models import MasterData
+from system_settings.services import UnknownSystemParameter, get_system_parameter
+from .models import FollowUpCall, Lead, LeadAssignmentHistory, LeadImportBatch, LeadStatusHistory, LeadTag, Sitevisit, SitevisitReschedule
+from .constants import (
+    CONVERTED_LEAD_IMMUTABLE_FIELDS,
+    LEAD_AUTOMATIC_TRANSITIONS,
+    LEAD_STATUS_ALIASES,
+    LEAD_STATUS_LABELS,
+    LEAD_STATUS_NEW,
+    LEAD_STATUS_ORDER,
+    LEAD_STATUS_TRANSITIONS,
+)
 from .serializers import (
     follow_up_to_dict,
     lead_to_dict,
     reschedule_sitevisit_to_dict,
     site_visit_to_dict,
 )
-from .services import assign_leads_round_robin
+from .services import assign_leads_round_robin, delete_leads_with_history
+from .duplicate import score_duplicates
+from .merge import MERGE_FIELDS, merge_into_existing
+from .phone import normalize_phone
+from system_settings.audit import log_bulk_audit
+from core.endpoint import crm_endpoint
 from django.db.models import OuterRef, Subquery
 from django.utils import timezone
 
@@ -122,7 +139,7 @@ def _site_visits_for_access(access, leads=None, project=None):
     )
 
 
-def _schedule_validation(visit_date, visit_time):
+def _schedule_validation(visit_date, visit_time, organization, project):
     errors = {}
     if visit_date is None:
         errors["visit_date"] = "This field is required."
@@ -130,12 +147,37 @@ def _schedule_validation(visit_date, visit_time):
         errors["visit_time"] = "This field is required."
     if visit_date:
         today = timezone.localdate()
+        try:
+            max_days_ahead = int(get_system_parameter(
+                organization, "site_visit_max_days_ahead", project=project
+            ))
+        except UnknownSystemParameter:
+            max_days_ahead = 90
         if visit_date < today:
             errors["visit_date"] = "A site visit cannot be scheduled in the past."
-        elif visit_date > today + timedelta(days=90):
-            errors["visit_date"] = "A site visit cannot be scheduled more than 90 days ahead."
+        elif visit_date > today + timedelta(days=max_days_ahead):
+            errors["visit_date"] = f"A site visit cannot be scheduled more than {max_days_ahead} days ahead."
     if errors:
         raise ValidationError(errors)
+
+
+def _ensure_executive_is_available(executive, visit_date, visit_time, duration_minutes, exclude_id=None):
+    """Reject overlapping non-terminal visits for the same executive."""
+    requested_start = datetime.combine(visit_date, visit_time)
+    requested_end = requested_start + timedelta(minutes=duration_minutes)
+    visits = Sitevisit.objects.filter(
+        executive_membership=executive,
+        visit_date=visit_date,
+    ).exclude(status__in=[Sitevisit.Status.CANCELLED, Sitevisit.Status.NO_SHOW])
+    if exclude_id is not None:
+        visits = visits.exclude(pk=exclude_id)
+    for existing in visits:
+        if not existing.visit_time:
+            continue
+        existing_start = datetime.combine(existing.visit_date, existing.visit_time)
+        existing_end = existing_start + timedelta(minutes=existing.duration_minutes or 60)
+        if requested_start < existing_end and existing_start < requested_end:
+            raise ValidationError({"executive": "The selected executive has a conflicting site visit."})
 
 
 def _active_executive(organization, user):
@@ -153,12 +195,27 @@ def _active_executive(organization, user):
     return executive
 
 
+def _active_executive_membership(organization, membership_id):
+    try:
+        membership_id = int(membership_id)
+    except (TypeError, ValueError):
+        membership_id = None
+    executive = OrganizationMembership.objects.filter(
+        organization=organization,
+        pk=membership_id,
+        is_active=True,
+    ).select_related("user").first()
+    if executive is None:
+        raise ValidationError({"executive": "Select an active organization executive."})
+    return executive
+
+
 def _reschedule_site_visit(site_visit, new_date, new_time, reason=None):
     if site_visit.status in {
         Sitevisit.Status.COMPLETED, Sitevisit.Status.CANCELLED, Sitevisit.Status.NO_SHOW,
     }:
         raise ValidationError({"status": "Completed, cancelled, and no-show visits cannot be rescheduled."})
-    _schedule_validation(new_date, new_time)
+    _schedule_validation(new_date, new_time, site_visit.organization, site_visit.project)
     reschedule = SitevisitReschedule(
         site_visit=site_visit,
         old_date=site_visit.visit_date,
@@ -179,57 +236,58 @@ def _leads_for_access(access, project=None):
     leads = Lead.objects.filter(organization=access.organization).select_related("organization", "assigned_membership__user")
     if project is not None:
         leads = leads.filter(project=project)
-    if not access.can_view_all_leads:
-        leads = leads.filter(assigned_membership=access.membership)
     return apply_data_scope(leads, access, module="leads", membership_lookups=("assigned_membership",))
 
 
-def _require_lead_management(access):
-    if not access.is_platform and not has_permission(access.membership.user, access.organization, "leads.edit"):
-        raise PermissionDenied("Only managers, organization admins, and authorized platform users can manage leads.")
+def _can_edit_leads(access, project):
+    user = access.membership.user if access.membership else None
+    return access.is_platform or has_permission(user, access.organization, "leads.edit", project=project)
+
+
+def _duplicate_matches_for_access(access, project, payload):
+    matches = score_duplicates(access.organization, project, payload)
+    if _can_edit_leads(access, project):
+        return matches
+    visible_ids = set(_leads_for_access(access, project).values_list("id", flat=True))
+    limited_fields = {"score", "rule", "lead_code"}
+    return [
+        match if match.get("id") in visible_ids else {field: match[field] for field in limited_fields if field in match}
+        for match in matches
+    ]
+
+
+def _require_lead_management(access, permission="leads.edit", project=None):
+    user = access.membership.user if access.membership else None
+    if not access.is_platform and not has_permission(user, access.organization, permission, project=project):
+        raise PermissionDenied(f"Permission denied for {permission}.")
 
 
 def _normalise_phone(value):
     return "".join(character for character in str(value or "") if character.isdigit())
 
 
-@api_view(["POST"])
-@permission_classes([IsAuthenticated])
+@crm_endpoint(["POST"], scope="project", permissions={"POST": "leads.add"})
 def check_duplicate_lead(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
     project = get_project_context(request, access)
-    phone = _normalise_phone(request.data.get("phone"))
-    email = str(request.data.get("email") or "").strip().lower()
-    if not phone and not email:
-        return Response({"matches": []})
-
-    # Duplicate detection is project-scoped and must include leads owned by
-    # another caller; otherwise a newly entered lead can bypass the warning.
-    leads = Lead.objects.filter(organization=access.organization, project=project).order_by("id")
-    matches = []
-    for lead in leads:
-        phone_match = bool(phone and _normalise_phone(lead.phone) == phone)
-        email_match = bool(email and lead.email and lead.email.strip().lower() == email)
-        if phone_match or email_match:
-            matches.append({
-                "id": lead.id,
-                "name": lead.full_name,
-                "full_name": lead.full_name,
-                "phone": lead.phone,
-                "email": lead.email,
-                "confidence": 95 if phone_match else 80,
-            })
-    return Response({"matches": matches})
+    try:
+        return Response({"matches": _duplicate_matches_for_access(access, project, request.data)})
+    except ValidationError as error:
+        return _validation_response(error)
 
 
-def _apply_payload(lead, payload, organization, partial=False, save=True):
-    allowed = {"first_name", "last_name", "email", "phone", "source", "assigned_membership" , "alt_phone", "address" , "occupation"}
+def _apply_payload(lead, payload, organization, partial=False, save=True, project=None):
+    allowed = {"first_name", "last_name", "email", "phone", "source", "assigned_membership", "alt_phone", "address", "occupation", "score", "budget_range", "preferred_location", "external_source", "external_id"}
     if not partial:
         missing = [field for field in ("first_name", "phone", "source") if field not in payload]
         if missing:
             raise ValidationError({field: "This field is required." for field in missing})
     for field in allowed & payload.keys():
         value = payload[field]
+        if field in {"phone", "alt_phone"} and value:
+            value = normalize_phone(value)
+            if value is None:
+                raise ValidationError({field: "Phone number cannot be normalized."})
         if field == "assigned_membership":
             value = OrganizationMembership.objects.filter(pk=value, organization=organization, is_active=True).first() if value else None
             if payload[field] and value is None:
@@ -237,10 +295,143 @@ def _apply_payload(lead, payload, organization, partial=False, save=True):
             field = "assigned_membership"
         setattr(lead, field, value)
     lead.organization = organization
+    if project is not None:
+        lead.project = project
     lead.full_clean()
     if save:
         lead.save()
     return lead
+
+
+def _active_lead_master_data(project, field, code=None, default_code=None):
+    requested_code = str(code if code is not None else default_code or "").strip()
+    if not requested_code:
+        raise ValidationError({field: "This field is required."})
+    category_code = "lead_source" if field == "source" else "lead_stage"
+    item = MasterData.objects.filter(
+        organization_id=project.organization_id,
+        project=project,
+        category__code=category_code,
+        code=requested_code,
+        is_active=True,
+    ).first()
+    if item is None:
+        raise ValidationError({field: f"Use an active {category_code.replace('_', ' ')} from this project."})
+    return item
+
+
+@crm_endpoint(["POST"], scope="project", permissions={"POST": "leads.add"})
+def manual_lead_create(request, organization_slug):
+    access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
+    _require_lead_management(access, permission="leads.add", project=project)
+    payload = dict(request.data)
+    resolution = payload.pop("resolution", None)
+    merge_into = payload.pop("merge_into", None)
+    if not str(payload.get("phone") or "").strip():
+        return Response({"phone": ["This field is required."]}, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        can_edit = _can_edit_leads(access, project)
+        if not can_edit and access.membership is not None:
+            payload["assigned_membership"] = access.membership.id
+        source_item = _active_lead_master_data(project, "source", payload.get("source"))
+        status_item = _active_lead_master_data(project, "status", payload.get("status"), LEAD_STATUS_NEW)
+        matches = _duplicate_matches_for_access(access, project, payload)
+        if matches and resolution not in {"create_anyway", "merge"}:
+            return Response({"matches": matches}, status=status.HTTP_409_CONFLICT)
+        with transaction.atomic():
+            if resolution == "merge":
+                if not merge_into:
+                    return Response({"merge_into": ["This field is required."]}, status=status.HTTP_400_BAD_REQUEST)
+                if not can_edit:
+                    target_is_visible = _leads_for_access(access, project).filter(pk=merge_into).exists()
+                    if not target_is_visible:
+                        return Response({"detail": "You cannot merge into a lead outside your data scope."}, status=status.HTTP_403_FORBIDDEN)
+                existing = get_object_or_404(
+                    Lead.objects.select_for_update(),
+                    pk=merge_into,
+                    organization=access.organization,
+                    project=project,
+                )
+                lead = merge_into_existing(existing=existing, payload=payload, request=request)
+                return Response(lead_to_dict(lead), status=status.HTTP_200_OK)
+            lead = _apply_payload(Lead(project=project), payload, access.organization, project=project, save=False)
+            lead.source = source_item.code
+            lead.source_item = source_item
+            lead.status = status_item
+            lead.save()
+            lead.save()
+            if not can_edit and access.membership is not None:
+                _create_pending_follow_up(lead, access.membership)
+            log_bulk_audit(
+                request=request,
+                module="leads",
+                action="create",
+                instances=[lead],
+                organization=access.organization,
+                project=project,
+                changed_values={"fields": ["lead_code", "phone", "source"]},
+            )
+        return Response(lead_to_dict(lead), status=status.HTTP_201_CREATED)
+    except (ValidationError, ValueError, TypeError) as error:
+        return _validation_response(error)
+
+
+@crm_endpoint(["POST"], scope="public")
+def meta_webhook(request, organization_slug):
+    from .connectors import receive_meta
+    organization = get_object_or_404(Organization, slug=organization_slug)
+    return receive_meta(request, organization)
+
+
+@crm_endpoint(["POST"], scope="public")
+def google_webhook(request, organization_slug):
+    from .connectors import receive_google
+    organization = get_object_or_404(Organization, slug=organization_slug)
+    return receive_google(request, organization)
+
+
+@crm_endpoint(["POST"], scope="project", permissions={"POST": "leads.sync"})
+def sync_connector(request, organization_slug, connector):
+    access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
+    _require_lead_management(access, permission="leads.sync", project=project)
+    from .connectors import sync
+    integration_type = "meta_ads" if connector == "meta" else "google_ads"
+    return sync(request, access.organization, integration_type, project)
+
+
+@crm_endpoint(["POST"], scope="project", permissions={"POST": "leads.add"})
+def merge_leads(request, organization_slug):
+    access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
+    _require_lead_management(access, permission="leads.add", project=project)
+    source_id = request.data.get("source_lead_id")
+    target_id = request.data.get("target_lead_id")
+    if not source_id or not target_id or str(source_id) == str(target_id):
+        return Response({"detail": "Provide two different lead IDs."}, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        with transaction.atomic():
+            source = get_object_or_404(
+                Lead.objects.filter(organization=access.organization, project=project),
+                pk=source_id,
+            )
+            target = get_object_or_404(
+                Lead.objects.select_for_update().filter(organization=access.organization, project=project),
+                pk=target_id,
+            )
+            payload = {field: getattr(source, field) for field in MERGE_FIELDS}
+            payload["assigned_membership"] = source.assigned_membership_id
+            delete_leads_with_history(
+                leads=[source],
+                request=request,
+                organization=access.organization,
+                project=project,
+            )
+            target = merge_into_existing(existing=target, payload=payload, request=request)
+    except ValidationError as error:
+        return _validation_response(error)
+    return Response(lead_to_dict(target), status=status.HTTP_200_OK)
 
 
 def _validation_response(error):
@@ -292,18 +483,36 @@ def remove_assignment_of_lead(request ,organization_slug):
     """Remove current assignments from all assigned leads."""
     access = get_organization_access(request.user, organization_slug)
     project = get_project_context(request, access)
-    _require_lead_management(access)
+    _require_lead_management(access, project=project)
+    reason = str(request.data.get("reason", "")).strip()
+    if len(reason) < 3:
+        return Response({"reason": ["A reason of at least 3 characters is required."]}, status=status.HTTP_400_BAD_REQUEST)
 
     leads = _leads_for_access(access, project).filter(assigned_membership__isnull=False)
-
-    updated_count = leads.update(
-        assigned_membership=None,
-        updated_at=timezone.now(),
-    )
+    with transaction.atomic():
+        affected = list(leads.select_for_update())
+        for lead in affected:
+            previous_membership = lead.assigned_membership
+            lead.assigned_membership = None
+            lead.save(update_fields=["assigned_membership", "updated_at"])
+            LeadAssignmentHistory.objects.create(
+                lead=lead,
+                organization=access.organization,
+                assigned_from=previous_membership,
+                assigned_to=None,
+                reason=reason,
+                assigned_by=request.user,
+            )
+        if affected:
+            log_bulk_audit(
+                request=request, module="leads", action="bulk_update", instances=affected,
+                organization=access.organization, project=project,
+                changed_values={"assigned_membership": None, "reason": reason},
+            )
 
     return Response({
         "message": "Lead assignments reset successfully.",
-        "updated_count": updated_count,
+        "updated_count": len(affected),
     }, status=status.HTTP_200_OK)
 
 
@@ -316,9 +525,12 @@ def assign_lead(request, organization_slug, lead_id):
     project = get_project_context(request, access)
     _require_lead_management(access)
     lead = get_object_or_404(_leads_for_access(access, project), pk=lead_id)
-    membership_id = request.data.get("telecaller_membership")
+    membership_id = request.data.get("telecaller_membership", request.data.get("assigned_membership"))
+    reason = str(request.data.get("reason", "")).strip()
     if not membership_id:
         return Response({"telecaller_membership": ["This field is required."]}, status=status.HTTP_400_BAD_REQUEST)
+    if len(reason) < 3:
+        return Response({"reason": ["A reason is required."]}, status=status.HTTP_400_BAD_REQUEST)
     telecaller = OrganizationMembership.objects.filter(
         pk=membership_id,
         organization=access.organization,
@@ -327,11 +539,142 @@ def assign_lead(request, organization_slug, lead_id):
     ).select_related("user").first()
     if telecaller is None:
         return Response({"telecaller_membership": ["Use an active telecaller membership in this organization."]}, status=status.HTTP_400_BAD_REQUEST)
-    lead.assigned_membership = telecaller
-    lead.full_clean()
-    lead.save(update_fields=["assigned_membership", "updated_at"])
-    _create_pending_follow_up(lead, telecaller)
+    with transaction.atomic():
+        previous_membership = lead.assigned_membership
+        lead.assigned_membership = telecaller
+        lead.full_clean()
+        lead.save(update_fields=["assigned_membership", "updated_at"])
+        LeadAssignmentHistory.objects.create(
+            lead=lead,
+            organization=access.organization,
+            assigned_from=previous_membership,
+            assigned_to=telecaller,
+            reason=reason,
+            assigned_by=request.user,
+        )
+        _create_pending_follow_up(lead, telecaller)
     return Response(lead_to_dict(lead))
+
+
+def _canonical_lead_status(value):
+    normalized = str(value or "").strip().lower().replace(" ", "_")
+    normalized = LEAD_STATUS_ALIASES.get(normalized, normalized)
+    if normalized not in LEAD_STATUS_TRANSITIONS:
+        raise ValidationError({"status": "Use a valid lead status."})
+    return normalized
+
+
+def _record_lead_status_transition(*, lead, status_value, user, reason="", system=False):
+    status_value = _canonical_lead_status(status_value)
+    call = None
+    with transaction.atomic():
+        locked_lead = Lead.objects.select_for_update().select_related("organization", "assigned_membership").get(pk=lead.pk)
+        previous_status = LEAD_STATUS_ALIASES.get(locked_lead.lifecycle_status or "new", locked_lead.lifecycle_status or "new")
+        if system and previous_status == "lost":
+            return None
+        if system and previous_status in LEAD_STATUS_ORDER and status_value in LEAD_STATUS_ORDER:
+            if LEAD_STATUS_ORDER.index(previous_status) >= LEAD_STATUS_ORDER.index(status_value):
+                return None
+        allowed_statuses = LEAD_STATUS_TRANSITIONS.get(previous_status, set())
+        if system and previous_status in LEAD_AUTOMATIC_TRANSITIONS.get(status_value, set()):
+            allowed_statuses = allowed_statuses | {status_value}
+        if status_value not in allowed_statuses:
+            raise ValidationError({"status": f"Cannot change lead status from '{previous_status}'."})
+        locked_lead.lifecycle_status = status_value
+        locked_lead.save(update_fields=["lifecycle_status", "updated_at"])
+        LeadStatusHistory.objects.create(
+            lead=locked_lead,
+            organization=locked_lead.organization,
+            old_status=previous_status,
+            new_status=status_value,
+            changed_by=user,
+        )
+        if not system:
+            call = FollowUpCall.objects.create(
+                organization=locked_lead.organization,
+                lead=locked_lead,
+                telecaller_membership=locked_lead.assigned_membership,
+                note=str(reason or "").strip(),
+                outcome=FollowUpCall.Outcome.CONNECTED,
+                status={"interested": FollowUpCall.Status.QUALIFIED, "site_visit_scheduled": FollowUpCall.Status.SITE_VISIT, "converted": FollowUpCall.Status.WON}.get(status_value, status_value),
+                called_at=timezone.now(),
+            )
+    return call
+
+
+@crm_endpoint(["POST"], scope="project", permissions={"POST": "leads.edit"})
+def transition_lead_status(request, organization_slug, lead_id):
+    access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
+    _require_lead_management(access, project=project)
+    lead = get_object_or_404(_leads_for_access(access, project), pk=lead_id)
+    try:
+        call = _record_lead_status_transition(
+            lead=lead,
+            status_value=str(request.data.get("status", "")).strip(),
+            user=request.user,
+            reason=request.data.get("reason", ""),
+        )
+    except (ValidationError, ValueError, TypeError) as error:
+        return _validation_response(error)
+    return Response(follow_up_to_dict(call), status=status.HTTP_201_CREATED)
+
+
+@crm_endpoint(["POST"], scope="project", permissions={"POST": "leads.edit"})
+def bulk_lead_action(request, organization_slug):
+    access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
+    _require_lead_management(access, project=project)
+    lead_ids = request.data.get("lead_ids")
+    action = str(request.data.get("action", "")).strip()
+    if not isinstance(lead_ids, list) or not lead_ids:
+        return Response({"lead_ids": ["Provide a non-empty list of lead IDs."]}, status=status.HTTP_400_BAD_REQUEST)
+    leads = list(_leads_for_access(access, project).filter(pk__in=lead_ids))
+    if len(leads) != len(set(lead_ids)):
+        return Response({"lead_ids": ["One or more leads are not in the active project."]}, status=status.HTTP_404_NOT_FOUND)
+    if action in {"assign", "delete"} and not access.is_platform and access.membership and access.membership.role not in {OrganizationMembership.Role.ADMIN, OrganizationMembership.Role.MANAGER}:
+        raise PermissionDenied("Only Managers and Admins may perform this bulk action.")
+    if action == "export":
+        if not access.is_platform and not has_permission(request.user, access.organization, "leads.export", project=project):
+            raise PermissionDenied("Permission denied for leads.export.")
+        return Response({"count": len(leads), "results": [lead_to_dict(lead) for lead in leads]})
+    try:
+        with transaction.atomic():
+            if action == "delete":
+                deleted = delete_leads_with_history(
+                    leads=leads,
+                    request=request,
+                    organization=access.organization,
+                    project=project,
+                )
+                return Response({"updated": deleted, "deleted": deleted})
+            if action == "add_tag":
+                tag_name = str(request.data.get("value", "")).strip()
+                if not tag_name:
+                    raise ValidationError({"value": "A tag is required."})
+                for lead in leads:
+                    LeadTag.objects.get_or_create(lead=lead, tag_name=tag_name)
+                return Response({"updated": len(leads), "tag": tag_name})
+            if action == "assign":
+                membership_id = request.data.get("value")
+                reason = str(request.data.get("reason", "")).strip()
+                if len(reason) < 3 or not membership_id:
+                    raise ValidationError({"reason": "A reason and assignee are required."})
+                assignee = OrganizationMembership.objects.filter(pk=membership_id, organization=access.organization, role=OrganizationMembership.Role.TELECALLER, is_active=True).first()
+                if assignee is None:
+                    raise ValidationError({"value": "Use an active telecaller membership."})
+                for lead in leads:
+                    previous_membership = lead.assigned_membership
+                    lead.assigned_membership = assignee
+                    lead.save(update_fields=["assigned_membership", "updated_at"])
+                    LeadAssignmentHistory.objects.create(lead=lead, organization=access.organization, assigned_from=previous_membership, assigned_to=assignee, reason=reason, assigned_by=request.user)
+                return Response({"updated": len(leads), "assigned_to": assignee.id})
+            if action != "status":
+                raise ValidationError({"action": "Use assign, status, add_tag, export, or delete."})
+            calls = [_record_lead_status_transition(lead=lead, status_value=str(request.data.get("value", "")).strip(), user=request.user, reason="Bulk status update") for lead in leads]
+    except (ValidationError, ValueError, TypeError) as error:
+        return _validation_response(error)
+    return Response({"updated": len(calls), "results": [follow_up_to_dict(call) for call in calls]})
 
 
 @api_view(["GET"])
@@ -339,8 +682,8 @@ def assign_lead(request, organization_slug, lead_id):
 def assigned_leads(request, organization_slug):
     """Return leads assigned to the authenticated organization member."""
     access = get_organization_access(request.user, organization_slug)
-    if access.membership is None or access.membership.role != OrganizationMembership.Role.TELECALLER:
-        raise PermissionDenied("Only telecallers can view their assigned leads.")
+    if access.membership is None or not has_permission(request.user, access.organization, "assigned_leads.view"):
+        raise PermissionDenied("The assigned-leads permission is required.")
     leads = Lead.objects.filter(
         organization=access.organization,
         assigned_membership=access.membership,
@@ -349,10 +692,11 @@ def assigned_leads(request, organization_slug):
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
-def import_leads_csv(request, organization_slug):
+def import_leads_csv_legacy(request, organization_slug):
     """Atomically import leads from CSV/XLS/XLSX upload."""
 
     access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
     _require_lead_management(access)
 
     upload = request.FILES.get("file")
@@ -419,14 +763,14 @@ def import_leads_csv(request, organization_slug):
             continue
 
         try:
-            leads.append(
-                _apply_payload(
-                    Lead(),
-                    _csv_row_payload(row),
-                    access.organization,
-                    save=False,
-                )
+            imported_lead = _apply_payload(
+                Lead(),
+                _csv_row_payload(row),
+                access.organization,
+                save=False,
+                project=project,
             )
+            leads.append(imported_lead)
         except (ValidationError, ValueError, TypeError) as error:
             details = (
                 error.message_dict
@@ -454,6 +798,11 @@ def import_leads_csv(request, organization_slug):
 
     with transaction.atomic():
         Lead.objects.bulk_create(leads)
+        log_bulk_audit(
+            request=request, module="leads", action="bulk_create", instances=leads,
+            organization=access.organization, project=project,
+            changed_values={"fields": ["first_name", "phone", "source"]},
+        )
 
     return Response(
         {
@@ -463,17 +812,81 @@ def import_leads_csv(request, organization_slug):
         status=status.HTTP_201_CREATED,
     )
 
+@crm_endpoint(["POST"], scope="project", permissions={"POST": "leads.import"})
+def import_leads_csv(request, organization_slug):
+    access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
+    _require_lead_management(access, permission="leads.import", project=project)
+    upload = request.FILES.get("file")
+    if upload is None:
+        return Response({"file": ["Upload a file using the 'file' field."]}, status=status.HTTP_400_BAD_REQUEST)
+    if upload.size > 5 * 1024 * 1024:
+        return Response({"file": ["The file must not exceed 5 MB."]}, status=status.HTTP_400_BAD_REQUEST)
+    if not str(upload.name).lower().endswith((".csv", ".xlsx", ".xls")):
+        return Response({"file": ["Only .csv, .xlsx and .xls files are supported."]}, status=status.HTTP_400_BAD_REQUEST)
+    import_duplicates = str(request.data.get("import_duplicates", "false")).lower() in {"1", "true", "yes", "on"}
+    with transaction.atomic():
+        batch = LeadImportBatch.objects.create(
+            organization=access.organization,
+            project=project,
+            file_name=upload.name,
+            upload=upload,
+            import_duplicates=import_duplicates,
+            created_by=request.user,
+        )
+        from .tasks import process_lead_import
+        result = process_lead_import.enqueue(batch.id)
+        batch.task_id = result.id
+        batch.save(update_fields=["task_id", "updated_at"])
+    return Response({"batch_id": batch.id, "status": batch.status}, status=status.HTTP_202_ACCEPTED)
+
+
+def _import_batch_access(request, organization_slug, batch_id):
+    access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
+    batch = get_object_or_404(LeadImportBatch, pk=batch_id, organization=access.organization, project=project)
+    allowed = batch.created_by_id == request.user.id or has_permission(request.user, access.organization, "leads.import", project=project)
+    if not allowed:
+        raise PermissionDenied("Permission denied for leads.import.")
+    return access, project, batch
+
+
+@crm_endpoint(["GET"], scope="project", permissions={"GET": "leads.import"})
+def import_batch_progress(request, organization_slug, batch_id):
+    _, _, batch = _import_batch_access(request, organization_slug, batch_id)
+    return Response({
+        "id": batch.id,
+        "status": batch.status,
+        "file_name": batch.file_name,
+        "total_rows": batch.total_rows,
+        "imported_rows": batch.imported_rows,
+        "skipped_rows": batch.skipped_rows,
+        "current_chunk": batch.current_chunk,
+    })
+
+
+@crm_endpoint(["GET"], scope="project", permissions={"GET": "leads.import"})
+def import_batch_error_report(request, organization_slug, batch_id):
+    _, _, batch = _import_batch_access(request, organization_slug, batch_id)
+    if not batch.error_report:
+        return Response({"detail": "Error report is not available."}, status=status.HTTP_404_NOT_FOUND)
+    response = FileResponse(batch.error_report.storage.open(batch.error_report.name, "rb"), content_type="text/csv")
+    response["Content-Disposition"] = f'attachment; filename="{batch.file_name.rsplit(".", 1)[0]}-errors.csv"'
+    return response
+
+
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def lead_list(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
     project = get_project_context(request, access)
     if request.method == "POST":
-        _require_lead_management(access)
+        _require_lead_management(access, permission="leads.add", project=project)
         try:
-            lead = _apply_payload(Lead(), request.data, access.organization)
-            lead.project = project
-            lead.save()
+            lead = Lead(project=project)
+            lead = _apply_payload(lead, request.data, access.organization)
+            with transaction.atomic():
+                lead.save()
         except (ValidationError, ValueError, TypeError) as error:
             return _validation_response(error)
         if lead.assigned_membership_id:
@@ -481,6 +894,7 @@ def lead_list(request, organization_slug):
         return Response(lead_to_dict(lead), status=status.HTTP_201_CREATED)
 
     leads = _leads_for_access(access, project)
+    leads = leads.order_by("-created_at", "-id")
     latest_follow_up = FollowUpCall.objects.filter(lead=OuterRef("pk")).order_by("-created_at")
     # Add latest follow-up status to every lead
     leads = leads.annotate(
@@ -492,10 +906,10 @@ def lead_list(request, organization_slug):
         )
     )
     if status_filter := request.query_params.get("status"):
-        leads = leads.filter(
-            latest_follow_up_status=status_filter,
-            latest_follow_up_id__isnull=False
-        )
+        try:
+            leads = leads.filter(lifecycle_status=_canonical_lead_status(status_filter))
+        except ValidationError as error:
+            return _validation_response(error)
     if source := request.query_params.get("source"):
         leads = leads.filter(source=source)
     if search := request.query_params.get("search"):
@@ -505,8 +919,47 @@ def lead_list(request, organization_slug):
             Q(email__icontains=search) |
             Q(phone__icontains=search)
         )
+    if owner := request.query_params.get("owner"):
+        if owner.lower() in {"unassigned", "none"}:
+            leads = leads.filter(assigned_membership__isnull=True)
+        else:
+            leads = leads.filter(assigned_membership_id=owner)
+    if city := request.query_params.get("city"):
+        leads = leads.filter(preferred_location__icontains=city)
+    if tag := request.query_params.get("tag"):
+        leads = leads.filter(tags__tag_name__iexact=tag)
+    try:
+        if request.query_params.get("min_score"):
+            leads = leads.filter(score__gte=int(request.query_params["min_score"]))
+        if request.query_params.get("max_score"):
+            leads = leads.filter(score__lte=int(request.query_params["max_score"]))
+    except (TypeError, ValueError):
+        return Response({"score": ["Score filters must be integers."]}, status=status.HTTP_400_BAD_REQUEST)
+    if date_from := request.query_params.get("date_from"):
+        parsed_date = parse_date(date_from)
+        if parsed_date is None:
+            return Response({"date_from": ["Use YYYY-MM-DD."]}, status=status.HTTP_400_BAD_REQUEST)
+        leads = leads.filter(created_at__date__gte=parsed_date)
+    if date_to := request.query_params.get("date_to"):
+        parsed_date = parse_date(date_to)
+        if parsed_date is None:
+            return Response({"date_to": ["Use YYYY-MM-DD."]}, status=status.HTTP_400_BAD_REQUEST)
+        leads = leads.filter(created_at__date__lte=parsed_date)
+    ordering = request.query_params.get("ordering", "-created_at")
+    ordering_map = {"score": "score", "-score": "-score", "date": "created_at", "-date": "-created_at", "name": "first_name", "-name": "-first_name"}
+    leads = leads.order_by(ordering_map.get(ordering, "-created_at"), "-id").distinct()
+    total_count = leads.count()
+    try:
+        page_size = max(1, min(100, int(request.query_params.get("page_size", 50))))
+        page_number = max(1, int(request.query_params.get("page", 1)))
+    except (TypeError, ValueError):
+        return Response({"page": ["Page and page_size must be integers."]}, status=status.HTTP_400_BAD_REQUEST)
+    leads = leads[(page_number - 1) * page_size: page_number * page_size]
     return Response({
-        "count": leads.count(),
+        "count": total_count,
+        "page": page_number,
+        "page_size": page_size,
+        "total_pages": max(1, (total_count + page_size - 1) // page_size),
         "results": [
             lead_to_dict(
                 lead,
@@ -529,7 +982,15 @@ def lead_detail(request, organization_slug, lead_id):
 
     if request.method == "DELETE":
         _require_lead_management(access)
-        lead.delete()
+        try:
+            delete_leads_with_history(
+                leads=[lead],
+                request=request,
+                organization=access.organization,
+                project=project,
+            )
+        except ValidationError as error:
+            return _validation_response(error)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     # PATCH / PUT
@@ -540,22 +1001,29 @@ def lead_detail(request, organization_slug, lead_id):
         # Telecaller can edit only their assigned leads
         if (
             access.membership is None
-            or access.membership.role != OrganizationMembership.Role.TELECALLER
+            or not has_permission(request.user, access.organization, "leads.edit")
             or lead.assigned_membership != access.membership
         ):
             raise PermissionDenied(
                 "You can only edit your assigned leads."
             )
 
+    if any(field in request.data for field in {"assigned_membership", "assigned_membership_id", "assignee_id"}):
+        return Response({"detail": "Use the assign action; a reason is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+    if lead.lifecycle_status == "converted" and any(field in request.data for field in CONVERTED_LEAD_IMMUTABLE_FIELDS):
+        return Response({"detail": "Converted lead identity and deal fields are immutable."}, status=status.HTTP_400_BAD_REQUEST)
+
     try:
         previous_assignee_id = lead.assigned_membership_id
 
-        lead = _apply_payload(
-            lead,
-            request.data,
-            access.organization,
-            partial=request.method == "PATCH",
-        )
+        with transaction.atomic():
+            lead = _apply_payload(
+                lead,
+                request.data,
+                access.organization,
+                partial=request.method == "PATCH",
+            )
 
     except (ValidationError, ValueError, TypeError) as error:
         return _validation_response(error)
@@ -643,9 +1111,16 @@ def sitevisit_dashboard(request, organization_slug):
             site_visits = _filter_site_visits(_site_visits_for_access(access, project=project), request.query_params)
         except ValidationError as exc:
             return _validation_response(exc)
+        try:
+            max_days_ahead = int(get_system_parameter(
+                access.organization, "site_visit_max_days_ahead", project=project
+            ))
+        except UnknownSystemParameter:
+            max_days_ahead = 90
         return Response({
             "organization": access.organization.slug,
             "count": site_visits.count(),
+            "max_days_ahead": max_days_ahead,
             "results": [site_visit_to_dict(sitevisit) for sitevisit in site_visits],
         })
     lead_id = request.data.get("lead")
@@ -655,26 +1130,41 @@ def sitevisit_dashboard(request, organization_slug):
         lead = leads.get(pk=lead_id)
     except (Lead.DoesNotExist, ValueError, TypeError):
         return Response({"error": "Lead not found or you don't have access to this lead."}, status=status.HTTP_404_NOT_FOUND)
+    if not access.organization.is_active or lead.lifecycle_status in {"converted", "lost"}:
+        return Response({"lead": "Only active, valid leads can be scheduled for a site visit."}, status=status.HTTP_400_BAD_REQUEST)
     try:
         visit_date = _parse_date(request.data.get("visit_date"), "visit_date")
         visit_time = _parse_time(request.data.get("visit_time"), "visit_time")
-        _schedule_validation(visit_date, visit_time)
-        executive = _active_executive(access.organization, request.user)
+        _schedule_validation(visit_date, visit_time, access.organization, project)
+        executive = _active_executive_membership(access.organization, request.data.get("executive"))
         if not str(request.data.get("site", "")).strip():
             raise ValidationError({"site": "This field is required."})
-        # if request.data.get("duration_minutes") is None:
-        #     raise ValidationError({"duration_minutes": "This field is required."})
-        # duration = int(request.data["duration_minutes"])
+        duration = int(request.data.get("duration_minutes") or 60)
+        if duration <= 0:
+            raise ValidationError({"duration_minutes": "Duration must be greater than zero."})
         with transaction.atomic():
+            executive = OrganizationMembership.objects.select_for_update().get(
+                pk=executive.pk, organization=access.organization, is_active=True
+            )
+            _ensure_executive_is_available(executive, visit_date, visit_time, duration)
             site_visit = Sitevisit(
                 organization=access.organization, project=project, lead=lead, executive_membership=executive,
-                visit_date=visit_date, visit_time=visit_time, duration_minutes=1,
+                visit_date=visit_date, visit_time=visit_time, duration_minutes=duration,
                 site=request.data.get("site"), location=request.data.get("location"),
                 customer_preference=request.data.get("customer_preference"), notes=request.data.get("notes"),
                 created_by=request.user, status=Sitevisit.Status.UPCOMING,
             )
             site_visit.full_clean()
             site_visit.save()
+            _record_lead_status_transition(
+                lead=lead,
+                status_value="site_visit_scheduled",
+                user=request.user,
+                reason="Automatic site-visit scheduling",
+                system=True,
+            )
+    except OperationalError:
+        return Response({"detail": "The database is busy; please retry."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
     except (ValidationError, ValueError, TypeError) as exc:
         return _validation_response(exc)
     return Response(site_visit_to_dict(site_visit), status=status.HTTP_201_CREATED)
@@ -712,7 +1202,7 @@ def rescheduledSitevisit(request, organization_slug):
     try:
         new_date = _parse_date(request.data.get("new_date"), "new_date")
         new_time = _parse_time(request.data.get("new_time"), "new_time")
-        _schedule_validation(new_date, new_time)
+        _schedule_validation(new_date, new_time, access.organization, project)
     except ValidationError as exc:
         return Response(exc.message_dict, status=status.HTTP_400_BAD_REQUEST)
     missing = {
@@ -733,6 +1223,18 @@ def rescheduledSitevisit(request, organization_slug):
             )
 
         try:
+            executive = OrganizationMembership.objects.select_for_update().get(
+                pk=site_visit.executive_membership_id,
+                organization=access.organization,
+                is_active=True,
+            )
+            _ensure_executive_is_available(
+                executive,
+                new_date,
+                new_time,
+                site_visit.duration_minutes or 60,
+                exclude_id=site_visit.pk,
+            )
             rescheduled_sitevisit = _reschedule_site_visit(
                 site_visit, new_date, new_time, request.data.get("reason")
             )
@@ -798,12 +1300,25 @@ def sitevisit_detail(request, organization_slug, site_visit_id):
         if unknown:
             return Response({field: "This field cannot be updated." for field in unknown}, status=status.HTTP_400_BAD_REQUEST)
         try:
+            target_executive = visit.executive_membership
+            if "executive" in payload:
+                if not access.is_platform and (not access.membership or access.membership.role not in {"manager", "admin"}):
+                    raise PermissionDenied("Only managers and admins may reassign site visits.")
+                target_executive = _active_executive_membership(access.organization, payload["executive"])
+            if any(field in payload for field in {"visit_date", "visit_time", "executive", "duration_minutes"}):
+                new_date = _parse_date(payload.get("visit_date", visit.visit_date.isoformat() if visit.visit_date else None), "visit_date")
+                new_time = _parse_time(payload.get("visit_time", visit.visit_time.isoformat() if visit.visit_time else None), "visit_time")
+                duration = int(payload.get("duration_minutes", visit.duration_minutes or 60) or 60)
+                target_executive = OrganizationMembership.objects.select_for_update().get(
+                    pk=target_executive.pk, organization=access.organization, is_active=True
+                )
+                _ensure_executive_is_available(target_executive, new_date, new_time, duration, exclude_id=visit.pk)
+                if "executive" in payload:
+                    visit.executive_membership = target_executive
             if "visit_date" in payload or "visit_time" in payload:
                 new_date = _parse_date(payload.get("visit_date", visit.visit_date.isoformat() if visit.visit_date else None), "visit_date")
                 new_time = _parse_time(payload.get("visit_time", visit.visit_time.isoformat() if visit.visit_time else None), "visit_time")
                 _reschedule_site_visit(visit, new_date, new_time, payload.get("reschedule_reason"))
-            if "executive" in payload:
-                visit.executive_membership = _active_executive(access.organization, payload["executive"])
             if "duration_minutes" in payload:
                 visit.duration_minutes = int(payload["duration_minutes"]) if payload["duration_minutes"] is not None else None
             for field in {"site", "location", "customer_preference", "notes"} & payload.keys():
@@ -826,12 +1341,20 @@ def sitevisit_reschedule(request, organization_slug, site_visit_id):
     try:
         new_date = _parse_date(request.data.get("new_date"), "new_date")
         new_time = _parse_time(request.data.get("new_time"), "new_time")
-        _schedule_validation(new_date, new_time)
+        _schedule_validation(new_date, new_time, access.organization, project)
     except ValidationError as exc:
         return _validation_response(exc)
     with transaction.atomic():
         visit = _get_site_visit_or_404(access, None, site_visit_id, for_update=True, project=project)
         try:
+            executive = OrganizationMembership.objects.select_for_update().get(
+                pk=visit.executive_membership_id,
+                organization=access.organization,
+                is_active=True,
+            )
+            _ensure_executive_is_available(
+                executive, new_date, new_time, visit.duration_minutes or 60, exclude_id=visit.pk
+            )
             history = _reschedule_site_visit(visit, new_date, new_time, request.data.get("reason"))
         except ValidationError as exc:
             return _validation_response(exc)
@@ -904,17 +1427,27 @@ def sitevisit_outcome(request, organization_slug, site_visit_id):
         interest_level = int(request.data.get("interest_level"))
     except (TypeError, ValueError):
         return Response({"interest_level": "Use an integer from 1 to 5."}, status=status.HTTP_400_BAD_REQUEST)
-    with transaction.atomic():
-        visit = _get_site_visit_or_404(access, None, site_visit_id, for_update=True, project=project)
-        try:
+    try:
+        with transaction.atomic():
+            visit = _get_site_visit_or_404(access, None, site_visit_id, for_update=True, project=project)
             visit.transition_to(Sitevisit.Status.COMPLETED)
             visit.outcome = outcome
             visit.interest_level = interest_level
             visit.remarks = request.data.get("remarks")
             visit.full_clean()
             visit.save(update_fields=["status", "outcome", "interest_level", "remarks", "updated_at"])
-        except ValidationError as exc:
-            return _validation_response(exc)
+            _record_lead_status_transition(
+                lead=visit.lead,
+                status_value="site_visit_completed",
+                user=request.user,
+                reason="Automatic site-visit completion",
+                system=True,
+            )
+            lead = Lead.objects.select_for_update().get(pk=visit.lead_id)
+            lead.score = (lead.score or 0) + 20
+            lead.save(update_fields=["score", "updated_at"])
+    except ValidationError as exc:
+        return _validation_response(exc)
     return Response(site_visit_to_dict(visit))
 
 

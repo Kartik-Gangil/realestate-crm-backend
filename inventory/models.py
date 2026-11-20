@@ -23,6 +23,11 @@ class Project(models.Model):
     name = models.CharField(max_length=150)
     code = models.CharField(max_length=50)
     description = models.TextField(blank=True)
+    assigned_memberships = models.ManyToManyField(
+        "organizations.OrganizationMembership",
+        blank=True,
+        related_name="assigned_projects",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -40,7 +45,7 @@ class Block(models.Model):
         "organizations.Organization", on_delete=models.CASCADE, related_name="inventory_blocks"
     )
     project = models.ForeignKey(
-        Project, null=True, blank=True, on_delete=models.CASCADE, related_name="blocks"
+        Project, on_delete=models.PROTECT, related_name="blocks"
     )
     name = models.CharField(max_length=100)
     code = models.CharField(max_length=50)
@@ -83,7 +88,7 @@ class Plot(models.Model):
         "organizations.Organization", on_delete=models.CASCADE, related_name="plots"
     )
     project = models.ForeignKey(
-        Project, null=True, blank=True, on_delete=models.CASCADE, related_name="plots"
+        Project, on_delete=models.PROTECT, related_name="plots"
     )
     block = models.ForeignKey(Block, on_delete=models.CASCADE, related_name="plots")
     plot_number = models.CharField(max_length=50)
@@ -176,6 +181,7 @@ class PlotHold(models.Model):
     reason = models.TextField()
     from_datetime = models.DateTimeField(null=True, blank=True)
     to_datetime = models.DateTimeField(null=True, blank=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
     notes = models.TextField(blank=True)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
@@ -210,13 +216,62 @@ class PlotHold(models.Model):
         return f"{self.plot} - {self.get_action_type_display()}"
 
 
+class Customer(models.Model):
+    """Minimal Phase 9 customer projection; Customer 360 remains Phase 10."""
+
+    organization = models.ForeignKey("organizations.Organization", on_delete=models.CASCADE, related_name="inventory_customers")
+    project = models.ForeignKey(Project, on_delete=models.PROTECT, related_name="customers")
+    lead = models.ForeignKey("leads.Lead", on_delete=models.PROTECT, related_name="customer_records")
+    customer_code = models.CharField(max_length=64)
+    full_name = models.CharField(max_length=255)
+    phone = models.CharField(max_length=64, blank=True)
+    email = models.EmailField(blank=True)
+    address = models.TextField(blank=True)
+    status = models.CharField(max_length=24, default="active")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["project", "customer_code"], name="inventory_customer_project_code_unique"),
+        ]
+        indexes = [models.Index(fields=["organization", "project", "lead"])]
+
+    def __str__(self):
+        return f"{self.customer_code} - {self.full_name}"
+
+
+class CustomerCodeSequence(models.Model):
+    project = models.OneToOneField(Project, on_delete=models.CASCADE, related_name="customer_code_sequence")
+    next_number = models.PositiveIntegerField(default=1)
+
+
+class BookingReceiptSequence(models.Model):
+    project = models.OneToOneField(Project, on_delete=models.CASCADE, related_name="booking_receipt_sequence")
+    next_number = models.PositiveIntegerField(default=1)
+
+
+class BookingIdempotencyKey(models.Model):
+    organization = models.ForeignKey("organizations.Organization", on_delete=models.CASCADE, related_name="booking_idempotency_keys")
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="booking_idempotency_keys")
+    key = models.CharField(max_length=255)
+    request_hash = models.CharField(max_length=64)
+    booking = models.ForeignKey("inventory.PlotBooking", on_delete=models.CASCADE, related_name="idempotency_records")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["organization", "project", "key"], name="inventory_booking_idempotency_unique")]
+
+
 class PlotBooking(models.Model):
     """A lead's booking intent; plot state remains owned by inventory services."""
 
     class Status(models.TextChoices):
-        PENDING = "pending", "Pending"
+        CREATED = "created", "Created"
+        PENDING = "payment_pending", "Payment Pending"
+        PARTIALLY_PAID = "partially_paid", "Partially Paid"
         CONFIRMED = "confirmed", "Confirmed"
         CANCELLED = "cancelled", "Cancelled"
+        EXPIRED = "expired", "Expired"
 
     organization = models.ForeignKey(
         "organizations.Organization", on_delete=models.CASCADE, related_name="plot_bookings"
@@ -227,7 +282,17 @@ class PlotBooking(models.Model):
         "leads.Sitevisit", null=True, blank=True, on_delete=models.SET_NULL,
         related_name="plot_bookings",
     )
-    status = models.CharField(max_length=12, choices=Status.choices, default=Status.PENDING)
+    project = models.ForeignKey(Project, on_delete=models.PROTECT, null=True, blank=True, related_name="bookings")
+    customer = models.ForeignKey(Customer, on_delete=models.PROTECT, null=True, blank=True, related_name="bookings")
+    booking_code = models.CharField(max_length=64, blank=True)
+    booking_date = models.DateField(default=timezone.localdate)
+    total_amount = models.DecimalField(max_digits=16, decimal_places=2, null=True, blank=True)
+    discount_amount = models.DecimalField(max_digits=16, decimal_places=2, default=0)
+    net_amount = models.DecimalField(max_digits=16, decimal_places=2, null=True, blank=True)
+    booking_amount_paid = models.DecimalField(max_digits=16, decimal_places=2, default=0)
+    hold_expires_at = models.DateTimeField(null=True, blank=True)
+    booking_receipt_number = models.CharField(max_length=64, blank=True)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
     notes = models.TextField(blank=True)
     cancellation_reason = models.TextField(blank=True)
     final_price = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
@@ -254,6 +319,10 @@ class PlotBooking(models.Model):
             errors["lead"] = "Lead must belong to this organization."
         if self.plot_id and self.plot.organization_id != self.organization_id:
             errors["plot"] = "Plot must belong to this organization."
+        if self.project_id and self.plot_id and self.project_id != self.plot.project_id:
+            errors["project"] = "Project must match the plot project."
+        if self.customer_id and self.customer.organization_id != self.organization_id:
+            errors["customer"] = "Customer must belong to this organization."
         if self.site_visit_id:
             if self.site_visit.organization_id != self.organization_id:
                 errors["site_visit"] = "Site visit must belong to this organization."
@@ -261,6 +330,10 @@ class PlotBooking(models.Model):
                 errors["site_visit"] = "Site visit must belong to the selected lead."
         if errors:
             raise ValidationError(errors)
+
+    @staticmethod
+    def allowed_lead_statuses():
+        return {"site_visit_completed"}
 
     def __str__(self):
         return f"Booking #{self.pk or 'new'}: {self.plot} for {self.lead}"

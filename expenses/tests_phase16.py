@@ -6,42 +6,47 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 from rest_framework.test import APIClient
 
+from core.tests.factories import make_member, make_organization, make_project
 from core.tests.samples import SAMPLE_PDF
 from inventory.models import Project
 from system_settings.models import SystemParameter
 
-from organizations.models import Organization, OrganizationMembership, OrganizationRole, Permission
+from organizations.models import OrganizationMembership, OrganizationRole, Permission, ProjectAssignment
 from .models import ApprovalStep, Expense, ExpenseCategory
 from django.core.files.uploadedfile import SimpleUploadedFile
 
 
 class ExpensePhase16WorkflowTests(TestCase):
     def setUp(self):
-        user_model = get_user_model()
-        self.employee = user_model.objects.create_user(username="expense-employee", email="employee@example.com")
-        self.manager = user_model.objects.create_user(username="expense-manager", email="manager@example.com")
-        self.admin = user_model.objects.create_user(username="expense-admin-phase16", email="admin-phase16@example.com")
-        self.organization = Organization.objects.create(name="Phase 16 Org", slug="phase-16-org")
-        self.project = Project.objects.create(organization=self.organization, name="Phase 16 Project", code="P16")
-        self.other_project = Project.objects.create(organization=self.organization, name="Other Project", code="P16-OTHER")
+        self.organization = make_organization("phase-16-org")
+        self.project = make_project(self.organization, "P16")
+        self.other_project = make_project(self.organization, "P16-OTHER")
+        self.employee_membership = make_member(self.organization, role="telecaller", projects=[self.project])
+        self.manager_membership = make_member(self.organization, role="manager", projects=[self.project])
+        self.admin_membership = make_member(self.organization, role="admin", projects=[self.project])
+        self.employee = self.employee_membership.user
+        self.manager = self.manager_membership.user
+        self.admin = self.admin_membership.user
+        ProjectAssignment.objects.create(
+            membership=self.employee_membership,
+            project=self.other_project,
+            role=self.employee_membership.organization_role,
+        )
 
-        def role(code, permissions):
-            item = OrganizationRole.objects.create(organization=self.organization, name=code.title(), code=code)
-            item.permissions.set([
-                Permission.objects.get_or_create(module=module, action=action, defaults={"name": f"{module}.{action}"})[0]
-                for module, action in (permission.split(".", 1) for permission in permissions)
-            ])
-            return item
+        def permissions(codes):
+            return [
+                Permission.objects.get_or_create(
+                    module=module, action=action, defaults={"name": f"{module}.{action}"}
+                )[0]
+                for module, action in (permission.split(".", 1) for permission in codes)
+            ]
 
-        employee_role = role("telecaller", ["expenses.view_own", "expenses.edit_own", "expenses.submit", "expenses.add"])
-        manager_role = role("manager", ["expenses.view_team", "expenses.approve", "expenses.reject"])
-        admin_role = role("admin", [
-            "expenses.view_team", "expenses.approve", "expenses.manage_categories",
-            "expenses.process_payment", "expenses.mark_paid", "expenses.process_reimbursement", "expenses.reports",
-        ])
-        OrganizationMembership.objects.create(organization=self.organization, user=self.employee, role="telecaller", organization_role=employee_role)
-        OrganizationMembership.objects.create(organization=self.organization, user=self.manager, role="manager", organization_role=manager_role)
-        OrganizationMembership.objects.create(organization=self.organization, user=self.admin, role="admin", organization_role=admin_role)
+        self.employee_membership.organization_role.permissions.add(*permissions([
+            "expenses.view_own", "expenses.edit_own", "expenses.submit", "expenses.add",
+        ]))
+        self.manager_membership.organization_role.permissions.add(*permissions([
+            "expenses.view_team", "expenses.approve", "expenses.reject",
+        ]))
         self.category = ExpenseCategory.objects.create(organization=self.organization, project=self.project, name="Travel")
         self.client = APIClient()
 
@@ -126,6 +131,8 @@ class ExpensePhase16WorkflowTests(TestCase):
         OrganizationMembership.objects.create(
             organization=self.organization, user=other_user, role="telecaller", organization_role=other_role
         )
+        other_membership = OrganizationMembership.objects.get(user=other_user, organization=self.organization)
+        ProjectAssignment.objects.create(membership=other_membership, project=self.project, role=other_role)
         Expense.objects.create(
             organization=self.organization,
             project=self.project,
@@ -159,6 +166,7 @@ class ExpensePhase16WorkflowTests(TestCase):
             role="telecaller",
             organization_role=viewer_role,
         )
+        ProjectAssignment.objects.create(membership=viewer_membership, project=self.project, role=viewer_role)
         own_expense = Expense.objects.create(
             organization=self.organization,
             project=self.project,
@@ -246,6 +254,37 @@ class ExpensePhase16WorkflowTests(TestCase):
         self.assertEqual(response.status_code, 201, response.data)
         self.assertEqual(response.data["data"]["status"], Expense.Status.PENDING_APPROVAL)
 
+    def test_api_p17_03_reports_export_returns_xlsx_and_pdf_for_export_permission(self):
+        export_permission = Permission.objects.get_or_create(
+            module="reports", action="export", defaults={"name": "reports.export"}
+        )[0]
+        self.manager_membership.organization_role.permissions.add(export_permission)
+
+        xlsx = self.client.get(
+            "/api/reports/export/", {"format": "xlsx"}, format="json", **self.auth(self.manager)
+        )
+        self.assertEqual(xlsx.status_code, 200, xlsx.data if hasattr(xlsx, "data") else xlsx.content)
+        self.assertEqual(
+            xlsx["Content-Type"],
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        self.assertTrue(xlsx.content.startswith(b"PK"))
+
+        pdf = self.client.get(
+            "/api/reports/export/", {"format": "pdf"}, format="json", **self.auth(self.manager)
+        )
+        self.assertEqual(pdf.status_code, 200, pdf.data if hasattr(pdf, "data") else pdf.content)
+        self.assertEqual(pdf["Content-Type"], "application/pdf")
+        self.assertTrue(pdf.content.startswith(b"%PDF"))
+
+    def test_api_p17_03_reports_export_requires_export_permission(self):
+        response = self.client.get(
+            "/api/reports/export/", {"format": "xlsx"}, format="json", **self.auth(self.manager)
+        )
+
+        self.assertEqual(response.status_code, 403, response.data)
+        self.assertEqual(response.data["detail"], "Export permission is required.")
+
     def test_approved_expense_cannot_be_edited_and_project_scope_is_enforced(self):
         expense = Expense.objects.create(
             organization=self.organization,
@@ -286,6 +325,8 @@ class ExpensePhase16WorkflowTests(TestCase):
             role="expense-rejector",
             organization_role=rejector_role,
         )
+        rejector_membership = OrganizationMembership.objects.get(user=rejector, organization=self.organization)
+        ProjectAssignment.objects.create(membership=rejector_membership, project=self.project, role=rejector_role)
 
         submitted = self.create_submitted()
         denied_reject = self.client.post(
@@ -327,6 +368,8 @@ class ExpensePhase16WorkflowTests(TestCase):
             role="expense-processor",
             organization_role=processor_role,
         )
+        processor_membership = OrganizationMembership.objects.get(user=processor, organization=self.organization)
+        ProjectAssignment.objects.create(membership=processor_membership, project=self.project, role=processor_role)
 
         denied_payment = self.client.post(
             f"/api/expenses/{paid_expense.id}/mark-paid/",
@@ -345,7 +388,7 @@ class ExpensePhase16WorkflowTests(TestCase):
         self.assertEqual(allowed_payment.status_code, 201, allowed_payment.data)
         self.assertEqual(allowed_payment.data["data"]["paid_by"]["id"], processor.id)
 
-    def test_org_scoped_expense_creation_without_active_project_does_not_500(self):
+    def test_org_scoped_expense_creation_without_active_project_returns_validation_error_fr_p0_02_g1_item_5(self):
         category = ExpenseCategory.objects.create(
             organization=self.organization,
             project=None,
@@ -365,8 +408,8 @@ class ExpensePhase16WorkflowTests(TestCase):
             format="json",
         )
 
-        self.assertEqual(response.status_code, 201, response.data)
-        self.assertEqual(response.data["data"]["status"], Expense.Status.DRAFT)
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn("project", response.data)
 
     def test_mark_paid_uses_authenticated_actor_when_paid_by_is_blank(self):
         processor = get_user_model().objects.create_user(
@@ -390,6 +433,8 @@ class ExpensePhase16WorkflowTests(TestCase):
             role="blank-paid-by-processor",
             organization_role=role,
         )
+        processor_membership = OrganizationMembership.objects.get(user=processor, organization=self.organization)
+        ProjectAssignment.objects.create(membership=processor_membership, project=self.project, role=role)
         expense = Expense.objects.create(
             organization=self.organization,
             project=self.project,

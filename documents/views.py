@@ -13,7 +13,7 @@ from rest_framework import status
 from leads.models import Lead
 from organizations.services import apply_data_scope, get_organization_access, get_project_context
 from .models import CustomerDocument, CustomerDocumentRequirement, DocumentCategory, EmployeeDocument, EmployeeDocumentCategory
-from .permissions import require_document_management, require_document_view
+from .permissions import require_document_export, require_document_management, require_document_view, require_employee_document_export
 from .serializers import CustomerDocumentSerializer, CustomerDocumentUploadSerializer, DocumentCategorySerializer, DocumentRequirementSerializer, VerificationHistorySerializer
 from .services import archive_customer_document, archive_employee_document, get_customer_document_summary, put_document_under_verification, reject_customer_document, upload_customer_document, upload_employee_document, verify_customer_document
 from organizations.models import OrganizationActivity, OrganizationMembership
@@ -56,7 +56,7 @@ def document_list(request, organization_slug):
     if request.method == "POST":
         require_document_management(access); serializer = CustomerDocumentUploadSerializer(data=request.data); serializer.is_valid(raise_exception=True); data = serializer.validated_data
         try:
-            document = upload_customer_document(organization=access.organization, customer=_customer(access, data["customer"], project), document_category=get_object_or_404(DocumentCategory.objects.filter(organization=access.organization), pk=data["document_category"]), uploaded_file=data["file"], document_name=data["document_name"], expiry_date=data.get("expiry_date"), notes=data.get("notes", ""), user=request.user)
+            document = upload_customer_document(organization=access.organization, customer=_customer(access, data["customer"], project), document_category=get_object_or_404(DocumentCategory.objects.filter(organization=access.organization), pk=data["document_category"]), uploaded_file=data["file"], document_name=data["document_name"], expiry_date=data.get("expiry_date"), notes=data.get("notes", ""), user=request.user, request=request)
         except ValidationError as error: return _error(error)
         return Response(CustomerDocumentSerializer(_docs(access, project).get(pk=document.pk)).data, status=status.HTTP_201_CREATED)
     require_document_view(access)
@@ -78,7 +78,7 @@ def document_detail(request, organization_slug, document_id):
 @permission_classes([IsAuthenticated])
 def document_download(request, organization_slug, document_id):
     access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access)
-    require_document_view(access)
+    require_document_export(access)
     document = _doc(access, document_id, project)
     return private_file_response(document.file, filename=document.file_name)
 
@@ -97,7 +97,7 @@ def _action(request, slug, document_id, action):
         if action == "under-verification": doc = put_document_under_verification(document=doc, user=request.user)
         elif action == "verify": doc = verify_customer_document(document=doc, user=request.user)
         elif action == "reject": doc = reject_customer_document(document=doc, user=request.user, reason=str(request.data.get("rejection_reason", "")))
-        else: doc = archive_customer_document(document=doc, user=request.user)
+        else: doc = archive_customer_document(document=doc, user=request.user, request=request)
     except ValidationError as error: return _error(error)
     return Response(CustomerDocumentSerializer(_docs(access, project).get(pk=doc.pk)).data)
 @api_view(["POST"])
@@ -116,8 +116,7 @@ def document_archive(request, organization_slug, document_id): return _action(re
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def customer_documents(request, organization_slug, customer_id):
-    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); customer = _customer(access, customer_id, project)
-    require_document_view(access)
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); require_document_view(access); customer = _customer(access, customer_id, project)
     requirements = CustomerDocumentRequirement.objects.filter(organization=access.organization, customer=customer).select_related("document_category")
     return Response({"customer": {"id": customer.id, "full_name": customer.full_name}, "requirements": DocumentRequirementSerializer(requirements, many=True).data, "documents": CustomerDocumentSerializer(_docs(access, project).filter(customer=customer, is_active=True), many=True).data, "summary": get_customer_document_summary(customer)})
 
@@ -137,11 +136,15 @@ def category_detail(request, organization_slug, category_id):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def requirements(request, organization_slug, customer_id):
-    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); customer = _customer(access, customer_id, project); query = CustomerDocumentRequirement.objects.filter(organization=access.organization, customer=customer).select_related("document_category")
+    access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access)
     if request.method == "GET":
         require_document_view(access)
+    else:
+        require_document_management(access)
+    customer = _customer(access, customer_id, project); query = CustomerDocumentRequirement.objects.filter(organization=access.organization, customer=customer).select_related("document_category")
+    if request.method == "GET":
         return Response(DocumentRequirementSerializer(query, many=True).data)
-    require_document_management(access); serializer = DocumentRequirementSerializer(data=request.data); serializer.is_valid(raise_exception=True); category = serializer.validated_data["document_category"]
+    serializer = DocumentRequirementSerializer(data=request.data); serializer.is_valid(raise_exception=True); category = serializer.validated_data["document_category"]
     if category.organization_id != access.organization.id: return Response({"document_category": "Use a category in this organization."}, status=400)
     requirement = CustomerDocumentRequirement.objects.create(organization=access.organization, customer=customer, **serializer.validated_data); return Response(DocumentRequirementSerializer(requirement).data, status=201)
 @api_view(["PATCH"])
@@ -218,7 +221,7 @@ def employee_document_detail(request, organization_slug, document_id):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def employee_document_download(request, organization_slug, document_id):
-    access = get_organization_access(request.user, organization_slug); require_document_view(access)
+    access = get_organization_access(request.user, organization_slug); require_employee_document_export(access)
     document = _employee_document(access, document_id)
     return private_file_response(document.file, filename=document.file_name)
 

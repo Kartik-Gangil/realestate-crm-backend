@@ -9,18 +9,20 @@ from django.http import HttpResponse
 from django.utils.dateparse import parse_date
 from django.utils import timezone
 from rest_framework import status
-from rest_framework.decorators import api_view, parser_classes, permission_classes
+from rest_framework.decorators import api_view, parser_classes, permission_classes, renderer_classes
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.renderers import BaseRenderer
 from rest_framework.response import Response
 from core.files import private_file_response
+from core.audit_context import set_audit_action
 
 from inventory.models import Project
 from organizations.services import get_organization_access, get_project_context, has_permission, is_platform_admin
 from organizations.models import OrganizationMembership
 
-from .models import ActivityLog, Expense, ExpenseCategory, Payment, ReimbursementRequest
+from .models import ActivityLog, ApprovalStep, Expense, ExpenseCategory, Payment, ReimbursementRequest
 from .serializers import ExpenseCategorySerializer, ExpenseSerializer
 from .services import (
     EXPENSE_PERMISSIONS,
@@ -29,6 +31,7 @@ from .services import (
     approve_reimbursement,
     can_approve,
     can_create,
+    can_edit,
     can_process_reimbursement,
     can_process_payment,
     can_reject,
@@ -44,6 +47,25 @@ from .services import (
 )
 
 
+class _ReportExportRenderer(BaseRenderer):
+    charset = "utf-8"
+
+    def render(self, data, accepted_media_type=None, renderer_context=None):
+        import json
+
+        return json.dumps(data).encode(self.charset)
+
+
+class ReportExportXlsxRenderer(_ReportExportRenderer):
+    media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    format = "xlsx"
+
+
+class ReportExportPdfRenderer(_ReportExportRenderer):
+    media_type = "application/pdf"
+    format = "pdf"
+
+
 def _organization_context(request):
     project_id = request.headers.get("X-Project-ID")
     if not project_id:
@@ -52,22 +74,21 @@ def _organization_context(request):
             raise ValidationError({"project": "X-Project-ID is required to resolve the organization."})
         return memberships.first().organization, None
     try:
-        project = Project.objects.select_related("organization").get(pk=int(project_id))
+        int(project_id)
     except (TypeError, ValueError):
         raise ValidationError({"project": "X-Project-ID must be a valid project id."})
-    except Project.DoesNotExist as error:
-        raise NotFound("Project not found.") from error
-    if not is_platform_admin(request.user) and not OrganizationMembership.objects.filter(
-        organization=project.organization, user=request.user, is_active=True
-    ).exists():
-        raise PermissionDenied("You do not have access to this project.")
-    return project.organization, project
+    project = Project.objects.select_related("organization").filter(pk=int(project_id)).first()
+    if project is None:
+        raise NotFound("Project not found.")
+    access = get_organization_access(request.user, project.organization.slug)
+    project = get_project_context(request, access)
+    return access.organization, project
 
 
-def _can_manage(request, organization, action):
-    return can_create(request.user, organization) if action == "add" else has_permission(
-        request.user, organization, f"expenses.{action}"
-    ) or has_permission(request.user, organization, "expenses.manage_categories")
+def _can_manage(request, organization, action, project=None):
+    return can_create(request.user, organization, project=project) if action == "add" else has_permission(
+        request.user, organization, f"expenses.{action}", project=project
+    ) or has_permission(request.user, organization, "expenses.manage_categories", project=project)
 
 
 def _envelope(data, success=True, request=None, error=None):
@@ -143,12 +164,14 @@ def category_list(request):
     organization, project = _organization_context(request)
     categories = ExpenseCategory.objects.filter(organization=organization)
     if project:
-        categories = categories.filter(Q(project=project) | Q(project__isnull=True))
+        categories = categories.filter(project=project)
+    else:
+        categories = categories.filter(project__isnull=True)
     if request.query_params.get("is_active") in {"true", "1"}:
         categories = categories.filter(is_active=True)
     if request.method == "GET":
         return Response(_envelope(ExpenseCategorySerializer(categories, many=True).data, request=request))
-    if not _can_manage(request, organization, "add"):
+    if not _can_manage(request, organization, "add", project):
         raise PermissionDenied("You do not have permission to create expense categories.")
     serializer = ExpenseCategorySerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
@@ -163,7 +186,7 @@ def category_detail(request, category_id):
     category = get_object_or_404(ExpenseCategory, pk=category_id, organization=organization)
     if project and category.project_id not in {None, project.id}:
         raise PermissionDenied("You do not have access to this project category.")
-    if not _can_manage(request, organization, "edit"):
+    if not _can_manage(request, organization, "edit", project):
         raise PermissionDenied("You do not have permission to edit expense categories.")
     serializer = ExpenseCategorySerializer(category, data=request.data, partial=True)
     serializer.is_valid(raise_exception=True)
@@ -198,6 +221,8 @@ def expense_list(request):
         return Response(_envelope(page, request=request))
     if not _can_manage(request, organization, "add"):
         raise PermissionDenied("You do not have permission to log expenses.")
+    if project is None:
+        raise ValidationError({"project": "X-Project-ID is required for project expenses."})
     payload = request.data.copy()
     if "category" in payload and "category_id" not in payload:
         payload["category_id"] = request.data.get("category")
@@ -298,15 +323,16 @@ def _approval_queue(request):
 def pending_approval(request):
     items = _approval_queue(request)
     if not items:
-        organization, _ = _organization_context(request)
-        if not has_permission(request.user, organization, EXPENSE_PERMISSIONS["approve"]) and not has_permission(request.user, organization, EXPENSE_PERMISSIONS["reject"]):
+        organization, project = _organization_context(request)
+        if not has_permission(request.user, organization, EXPENSE_PERMISSIONS["approve"], project=project) and not has_permission(request.user, organization, EXPENSE_PERMISSIONS["reject"], project=project):
             raise PermissionDenied("You do not have permission to access the approval queue.")
     return Response(_envelope(_paginate(request, items), request=request))
 
 
 def _run_approval_action(request, expense_id, action):
-    expense, _, _ = _get_scoped_expense(request, expense_id)
+    expense, organization, project = _get_scoped_expense(request, expense_id)
     try:
+        set_audit_action(request, action if action in {"approve", "reject"} else None)
         if action == "approve":
             expense = approve_expense(expense, request.user)
         elif action == "reject":
@@ -315,6 +341,7 @@ def _run_approval_action(request, expense_id, action):
             expense = request_expense_changes(expense, request.user, request.data.get("comment"))
     except (ValidationError, DjangoValidationError) as error:
         return Response(error.message_dict if hasattr(error, "message_dict") else {"detail": error.messages}, status=status.HTTP_400_BAD_REQUEST)
+    set_audit_action(request, None)
     return Response(_envelope(_serialize_expense(expense, request, detailed=True), request=request))
 
 
@@ -557,7 +584,7 @@ def _report_items(request):
         query = query.filter(date__gte=start_date)
     if end_date:
         query = query.filter(date__lte=end_date)
-    return [expense for expense in query if can_view(request.user, expense) or has_permission(request.user, organization, EXPENSE_PERMISSIONS["reports"])]
+    return [expense for expense in query if can_view(request.user, expense) or has_permission(request.user, organization, EXPENSE_PERMISSIONS["reports"], project=project)]
 
 
 def _report_payload(request):
@@ -596,7 +623,11 @@ def report_summary(request):
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
+@renderer_classes([ReportExportXlsxRenderer, ReportExportPdfRenderer])
 def report_export(request):
+    organization, project = _organization_context(request)
+    if not is_platform_admin(request.user) and not has_permission(request.user, organization, "reports.export", project=project):
+        raise PermissionDenied("Export permission is required.")
     report_format = request.query_params.get("format", "xlsx").lower()
     if report_format not in {"xlsx", "pdf"}:
         return Response({"format": "Use xlsx or pdf."}, status=status.HTTP_400_BAD_REQUEST)
@@ -644,7 +675,14 @@ def report_export(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def expense_receipt(request, expense_id):
-    expense, _organization, _project = _get_scoped_expense(request, expense_id)
-    if not can_view(request.user, expense) and not can_approve(request.user, expense) and not can_reject(request.user, expense):
+    expense, organization, project = _get_scoped_expense(request, expense_id)
+    can_review_pending_expense = can_approve(request.user, expense) or can_reject(request.user, expense)
+    is_recorded_reviewer = expense.approval_steps.filter(
+        actor_id=request.user.id,
+        status__in=(ApprovalStep.Status.DONE, ApprovalStep.Status.REJECTED),
+    ).exists()
+    if not has_permission(request.user, organization, "expenses.export", project=project) and not (
+        can_review_pending_expense or is_recorded_reviewer
+    ):
         raise PermissionDenied("You do not have access to this expense receipt.")
     return private_file_response(expense.receipt, filename=os.path.basename(expense.receipt.name or "") or "receipt")

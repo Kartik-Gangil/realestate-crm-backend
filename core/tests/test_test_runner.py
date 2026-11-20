@@ -36,6 +36,23 @@ class CrmTestRunnerTests(SimpleTestCase):
         self.assertNotEqual(legacy, REAL_MEDIA)
         self.assertTrue(legacy.is_relative_to(Path(tempfile.gettempdir()).resolve()))
 
+    def test_media_roots_never_live_inside_backend_task_sec_001(self):
+        backend = Path(settings.BASE_DIR).resolve()
+        for setting_name in ("MEDIA_ROOT", "LEGACY_MEDIA_ROOT"):
+            configured = Path(getattr(settings, setting_name)).resolve()
+            self.assertFalse(
+                configured == backend or configured.is_relative_to(backend),
+                f"{setting_name} must not be inside Backend",
+            )
+
+    def test_runner_rejects_a_temp_root_inside_backend_task_sec_001(self):
+        unsafe = str(Path(settings.BASE_DIR) / "unsafe-test-media")
+        runner = CrmTestRunner(verbosity=0)
+        with mock.patch.object(DiscoverRunner, "setup_test_environment"), \
+                mock.patch("core.test_runner.tempfile.mkdtemp", return_value=unsafe), \
+                self.assertRaises(RuntimeError):
+            runner.setup_test_environment()
+
     def test_the_runner_creates_and_removes_its_folder(self):
         outer = settings.MEDIA_ROOT
         outer_legacy = settings.LEGACY_MEDIA_ROOT
@@ -56,3 +73,16 @@ class CrmTestRunnerTests(SimpleTestCase):
         self.assertEqual(settings.MEDIA_ROOT, outer)
         self.assertEqual(settings.LEGACY_MEDIA_ROOT, outer_legacy)
         self.assertEqual(settings.FILE_ENCRYPTION_KEY, outer_key)
+
+    def test_runner_uses_fast_password_hasher_for_test_runs_gnfr_10(self):
+        runner = CrmTestRunner(verbosity=0)
+        with mock.patch.object(DiscoverRunner, "setup_test_environment"), \
+                mock.patch.object(DiscoverRunner, "teardown_test_environment"):
+            runner.setup_test_environment()
+            try:
+                self.assertEqual(
+                    settings.PASSWORD_HASHERS,
+                    ["django.contrib.auth.hashers.MD5PasswordHasher"],
+                )
+            finally:
+                runner.teardown_test_environment()

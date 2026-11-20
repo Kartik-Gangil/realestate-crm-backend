@@ -3,6 +3,50 @@ from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils import timezone
 
+from .constants import LEAD_STATUS_NEW
+from .phone import normalize_phone
+
+
+class LeadCodeSequence(models.Model):
+    project = models.OneToOneField("inventory.Project", on_delete=models.CASCADE, related_name="lead_code_sequence")
+    next_number = models.PositiveIntegerField(default=1)
+    updated_at = models.DateTimeField(auto_now=True)
+
+
+class LeadHistory(models.Model):
+    lead = models.ForeignKey("leads.Lead", on_delete=models.CASCADE, related_name="history")
+    organization = models.ForeignKey("organizations.Organization", on_delete=models.CASCADE, related_name="lead_history")
+    project = models.ForeignKey("inventory.Project", on_delete=models.CASCADE, related_name="lead_history")
+    action = models.CharField(max_length=64)
+    details = models.JSONField(default=dict, blank=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="lead_history_entries")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
+class LeadImportBatch(models.Model):
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        RUNNING = "running", "Running"
+        COMPLETED = "completed", "Completed"
+        FAILED = "failed", "Failed"
+
+    organization = models.ForeignKey("organizations.Organization", on_delete=models.CASCADE, related_name="lead_import_batches")
+    project = models.ForeignKey("inventory.Project", on_delete=models.CASCADE, related_name="lead_import_batches")
+    file_name = models.CharField(max_length=255)
+    upload = models.FileField(upload_to="lead_imports/%Y/%m/")
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
+    total_rows = models.PositiveIntegerField(default=0)
+    imported_rows = models.PositiveIntegerField(default=0)
+    skipped_rows = models.PositiveIntegerField(default=0)
+    current_chunk = models.PositiveIntegerField(default=0)
+    error_report = models.FileField(upload_to="lead_import_errors/%Y/%m/", null=True, blank=True)
+    error_rows = models.JSONField(default=list, blank=True)
+    import_duplicates = models.BooleanField(default=False)
+    task_id = models.CharField(max_length=64, blank=True, default="")
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL, related_name="lead_import_batches")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
 
 class Lead(models.Model):
 
@@ -13,9 +57,11 @@ class Lead(models.Model):
         SITEVISIT = "site_visit", "Site Visit"
         OTHER = "other", "Other"
         WALKIN = "walk_in", "Walk-in"
+        GOOGLE = "google", "Google"
 
     organization = models.ForeignKey("organizations.Organization", on_delete=models.CASCADE, related_name="leads")
-    project = models.ForeignKey("inventory.Project", null=True, blank=True, on_delete=models.SET_NULL, related_name="leads")
+    project = models.ForeignKey("inventory.Project", on_delete=models.PROTECT, related_name="leads")
+    lead_code = models.CharField(max_length=100, blank=True, default="")
     first_name = models.CharField(max_length=100)
     last_name = models.CharField(max_length=100, blank=True)
     occupation = models.CharField(max_length=100, blank=True)
@@ -24,6 +70,14 @@ class Lead(models.Model):
     alt_phone = models.CharField(max_length=20 , blank=True)
     address = models.CharField(max_length=200 , blank=True)
     source = models.CharField(max_length=20, choices=Source.choices, default=Source.WEBSITE)
+    source_item = models.ForeignKey("system_settings.MasterData", null=True, blank=True, on_delete=models.PROTECT, related_name="lead_source_items")
+    status = models.ForeignKey("system_settings.MasterData", null=True, blank=True, on_delete=models.PROTECT, related_name="lead_status_items")
+    lifecycle_status = models.CharField(max_length=32, default="new", null=True, blank=True)
+    score = models.PositiveIntegerField(null=True, blank=True)
+    budget_range = models.CharField(max_length=120, blank=True, default="")
+    preferred_location = models.CharField(max_length=200, blank=True, default="")
+    external_source = models.CharField(max_length=64, blank=True, default="")
+    external_id = models.CharField(max_length=255, blank=True, default="")
     assigned_membership = models.ForeignKey("organizations.OrganizationMembership", null=True, blank=True, on_delete=models.SET_NULL, related_name="assigned_leads")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -32,6 +86,18 @@ class Lead(models.Model):
         ordering = ["-created_at"]
         indexes = [
             models.Index(fields=["organization", "source"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["project", "lead_code"],
+                condition=~models.Q(lead_code=""),
+                name="leads_project_lead_code_unique",
+            ),
+            models.UniqueConstraint(
+                fields=["project", "external_source", "external_id"],
+                condition=~models.Q(external_id=""),
+                name="leads_project_external_id_unique",
+            ),
         ]
 
     @property
@@ -43,8 +109,106 @@ class Lead(models.Model):
             from django.core.exceptions import ValidationError
             raise ValidationError({"assigned_membership": "Assignee must belong to this organization."})
 
+    def save(self, *args, **kwargs):
+        if self.phone:
+            normalized = normalize_phone(self.phone)
+            if normalized is None:
+                raise ValidationError({"phone": "Phone number cannot be normalized."})
+            self.phone = normalized
+        if self.alt_phone:
+            normalized_alt = normalize_phone(self.alt_phone)
+            if normalized_alt is None:
+                raise ValidationError({"alt_phone": "Phone number cannot be normalized."})
+            self.alt_phone = normalized_alt
+        if self.project_id and not self.lead_code:
+            from .codes import next_lead_code
+            self.lead_code = next_lead_code(self.project)
+        if self.project_id and self.source_item_id is None:
+            from system_settings.models import MasterData
+            self.source_item_id = MasterData.objects.filter(
+                organization_id=self.organization_id,
+                project_id=self.project_id,
+                category__code="lead_source",
+                code=self.source,
+            ).values_list("id", flat=True).first()
+        if self.project_id and self.status_id is None:
+            from system_settings.models import MasterData
+            self.status_id = MasterData.objects.filter(
+                organization_id=self.organization_id,
+                project_id=self.project_id,
+                category__code="lead_stage",
+                code=LEAD_STATUS_NEW,
+                is_active=True,
+            ).values_list("id", flat=True).first()
+        if self.source_item_id:
+            self.source = type(self).objects.filter(pk=self.pk).values_list("source", flat=True).first() or self.source
+        return super().save(*args, **kwargs)
+
     def __str__(self):
         return self.full_name
+
+
+class ImmutableLeadHistoryQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise ValidationError("Lead history rows are immutable and cannot be updated.")
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Lead history rows are immutable and cannot be deleted.")
+
+
+class LeadAssignmentHistory(models.Model):
+    lead = models.ForeignKey(Lead, on_delete=models.PROTECT, related_name="assignment_history")
+    organization = models.ForeignKey("organizations.Organization", on_delete=models.CASCADE, related_name="lead_assignment_history")
+    assigned_from = models.ForeignKey("organizations.OrganizationMembership", null=True, blank=True, on_delete=models.SET_NULL, related_name="lead_assignments_from")
+    assigned_to = models.ForeignKey("organizations.OrganizationMembership", null=True, blank=True, on_delete=models.SET_NULL, related_name="lead_assignments_to")
+    reason = models.TextField()
+    assigned_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="lead_assignment_actions")
+    created_at = models.DateTimeField(auto_now_add=True)
+    objects = ImmutableLeadHistoryQuerySet.as_manager()
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise ValidationError("Lead assignment history rows are immutable.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Lead assignment history rows are immutable and cannot be deleted.")
+
+    class Meta:
+        ordering = ["created_at", "id"]
+
+
+class LeadStatusHistory(models.Model):
+    lead = models.ForeignKey(Lead, on_delete=models.PROTECT, related_name="status_history")
+    organization = models.ForeignKey("organizations.Organization", on_delete=models.CASCADE, related_name="lead_status_history")
+    old_status = models.CharField(max_length=32)
+    new_status = models.CharField(max_length=32)
+    changed_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="lead_status_actions")
+    created_at = models.DateTimeField(auto_now_add=True)
+    objects = ImmutableLeadHistoryQuerySet.as_manager()
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise ValidationError("Lead status history rows are immutable.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Lead status history rows are immutable and cannot be deleted.")
+
+    class Meta:
+        ordering = ["created_at", "id"]
+
+
+class LeadTag(models.Model):
+    lead = models.ForeignKey(Lead, on_delete=models.CASCADE, related_name="tags")
+    tag_name = models.CharField(max_length=80)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["tag_name", "id"]
+        constraints = [models.UniqueConstraint(fields=["lead", "tag_name"], name="unique_lead_tag")]
+
+
 class Sitevisit(models.Model):
     class Status(models.TextChoices):
         SCHEDULED = "scheduled", "Scheduled"
@@ -67,7 +231,7 @@ class Sitevisit(models.Model):
         OTHER = "other", "Other"
 
     organization = models.ForeignKey("organizations.Organization" , on_delete=models.CASCADE, related_name="site_visit")
-    project = models.ForeignKey("inventory.Project", null=True, blank=True, on_delete=models.SET_NULL, related_name="site_visits")
+    project = models.ForeignKey("inventory.Project", on_delete=models.PROTECT, related_name="site_visits")
     lead = models.ForeignKey(Lead, on_delete=models.CASCADE,related_name="site_visit")
     # An organization membership is the project's existing representation of a team member/executive.
     executive_membership = models.ForeignKey("organizations.OrganizationMembership", null=True, blank=True, on_delete=models.SET_NULL, related_name="site_visits")
@@ -84,6 +248,7 @@ class Sitevisit(models.Model):
     outcome = models.CharField(max_length=30, choices=Outcome.choices, null=True, blank=True)
     interest_level = models.PositiveSmallIntegerField(null=True, blank=True)
     remarks = models.TextField(null=True, blank=True)
+    reminder_sent_at = models.DateTimeField(null=True, blank=True)
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="created_site_visits")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -209,6 +374,7 @@ class FollowUpCall(models.Model):
     outcome = models.CharField(max_length=20, choices=Outcome.choices, blank=True, default="")
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.NEW)
     next_follow_up = models.DateTimeField(null=True, blank=True)
+    reminder_sent = models.BooleanField(default=False, db_default=False)
     called_at = models.DateTimeField(null=True, blank=True)
     call_recording = models.FileField(upload_to="call_recordings/%Y/%m/", null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)

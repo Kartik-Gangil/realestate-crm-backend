@@ -16,7 +16,7 @@ from pathlib import Path
 from corsheaders.defaults import default_headers
 from django.core.exceptions import ImproperlyConfigured
 
-from .database import database_config_from_url
+from .database import database_config_from_url, sqlite_database_config
 from .env import env_bool, env_list, env_str, load_env_file
 from core.crypto import decode_file_key
 
@@ -32,6 +32,7 @@ load_env_file(BASE_DIR / ".env")
 
 # SECURITY WARNING: keep the secret key used in production secret!
 DEBUG = env_bool("DJANGO_DEBUG", False)
+DJANGO_HTTPS = env_bool("DJANGO_HTTPS", True)
 SECRET_KEY = env_str("DJANGO_SECRET_KEY")
 if not SECRET_KEY:
     if not DEBUG:
@@ -45,19 +46,20 @@ CORS_ALLOWED_ORIGINS = env_list("CORS_ALLOWED_ORIGINS", LOCAL_ORIGINS if DEBUG e
 CSRF_TRUSTED_ORIGINS = env_list("CSRF_TRUSTED_ORIGINS", LOCAL_ORIGINS if DEBUG else [])
 
 CORS_ALLOW_CREDENTIALS = True
-CORS_ALLOW_HEADERS = (*default_headers, "x-project-id")
+CORS_ALLOW_HEADERS = (*default_headers, "x-project-id", "x-idempotency-key")
 
 if not DEBUG:
-    SECURE_SSL_REDIRECT = True
-    SESSION_COOKIE_SECURE = True
-    CSRF_COOKIE_SECURE = True
-    SECURE_HSTS_SECONDS = 31536000
+    SECURE_SSL_REDIRECT = DJANGO_HTTPS
+    SESSION_COOKIE_SECURE = DJANGO_HTTPS
+    CSRF_COOKIE_SECURE = DJANGO_HTTPS
+    SECURE_HSTS_SECONDS = 31536000 if DJANGO_HTTPS else 0
     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
     SECURE_CONTENT_TYPE_NOSNIFF = True
     SECURE_REFERRER_POLICY = "same-origin"
     X_FRAME_OPTIONS = "DENY"
 
-if env_bool("DJANGO_TRUST_PROXY", False):
+DJANGO_TRUST_PROXY = env_bool("DJANGO_TRUST_PROXY", False)
+if DJANGO_TRUST_PROXY:
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 # Application definition
@@ -85,10 +87,14 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     "corsheaders.middleware.CorsMiddleware",
+    'core.middleware.metrics.MetricsMiddleware',
+    'core.middleware.envelope.ApiV1EnvelopeMiddleware',
+    'core.middleware.rate_limit.RateLimitMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'core.middleware.audit_context.AuditContextMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
@@ -119,11 +125,34 @@ WSGI_APPLICATION = 'config.wsgi.application'
 DATABASE_URL = env_str("DATABASE_URL")
 DATABASES = {
     "default": database_config_from_url(DATABASE_URL)
-    or {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
+    or sqlite_database_config(BASE_DIR / "db.sqlite3")
+}
+
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.db.DatabaseCache",
+        "LOCATION": "crm_cache",
+    },
+    "ratelimit": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "crm-rate-limit",
     }
 }
+
+RATE_LIMIT_PUBLIC_PER_MINUTE = int(env_str("RATE_LIMIT_PUBLIC_PER_MINUTE", "20"))
+RATE_LIMIT_API_PER_MINUTE = int(env_str("RATE_LIMIT_API_PER_MINUTE", "300"))
+METRICS_TOKEN = env_str("METRICS_TOKEN", "")
+
+TASKS = {
+    "default": {
+        "BACKEND": "core.tasks_backend.DatabaseTaskBackend",
+    }
+}
+TASK_MAX_ATTEMPTS = 3
+TASK_RETRY_DELAY_SECONDS = 60
+TASK_WORKER_POLL_INTERVAL = 1
+TASK_RUNNING_TIMEOUT_SECONDS = 900
+REMINDER_INTERVAL_SECONDS = int(env_str("REMINDER_INTERVAL_SECONDS", "60"))
 
 
 # Password validation
@@ -161,6 +190,7 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = 'static/'
+STATIC_ROOT = BASE_DIR / "staticfiles"
 # Uploaded files: AES-256-GCM encrypted, in a private folder that is never served (Appendix G-4).
 PRIVATE_MEDIA_ROOT = Path(env_str("PRIVATE_MEDIA_ROOT", str(BASE_DIR / "private_media")))
 MEDIA_ROOT = PRIVATE_MEDIA_ROOT
@@ -187,6 +217,8 @@ EMAIL_HOST_PASSWORD = env_str("EMAIL_HOST_PASSWORD", "")
 EMAIL_USE_TLS = env_bool("EMAIL_USE_TLS", True)
 DEFAULT_FROM_EMAIL = env_str("DEFAULT_FROM_EMAIL", EMAIL_HOST_USER or "noreply@example.com")
 PASSWORD_RESET_FRONTEND_URL = env_str("PASSWORD_RESET_FRONTEND_URL", "http://localhost:5173/reset-password")
+AUTH_SESSION_TIMEOUT_MINUTES = int(env_str("AUTH_SESSION_TIMEOUT_MINUTES", "30"))
+AUTH_LOCKOUT_MINUTES = int(env_str("AUTH_LOCKOUT_MINUTES", "15"))
 INTEGRATION_ENCRYPTION_KEY = env_str("INTEGRATION_ENCRYPTION_KEY", "")
 ENVIRONMENT_NAME = env_str("ENVIRONMENT_NAME", "development")
 FIREBASE_PROJECT_ID = env_str("FIREBASE_PROJECT_ID", "")
@@ -217,9 +249,10 @@ AUTHENTICATION_BACKENDS = [
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
-        "rest_framework.authentication.TokenAuthentication",
+        "users.authentication.SessionTokenAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",
     ],
+    "EXCEPTION_HANDLER": "core.exceptions.database_exception_handler",
 }

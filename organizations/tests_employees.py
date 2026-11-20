@@ -6,6 +6,7 @@ from django.urls import reverse
 from rest_framework.test import APIClient
 
 from .models import Department, Organization, OrganizationActivity, OrganizationMembership, OrganizationRole, Permission
+from inventory.models import Project
 
 
 class EmployeeApiTests(TestCase):
@@ -135,7 +136,7 @@ class EmployeeApiTests(TestCase):
 
         self.assertEqual(response.status_code, 400, response.data)
         self.manager_membership.refresh_from_db()
-        self.assertIsNone(self.manager_membership.organization_role_id)
+        self.assertIsNotNone(self.manager_membership.organization_role_id)
 
     def test_v1_user_update_accepts_settings_fields_and_persists_them(self):
         response = self.client.put(
@@ -225,7 +226,7 @@ class EmployeeApiTests(TestCase):
         eligibility = {item["email"]: item["can_process_expense_payment"] for item in response.data["results"]}
         self.assertTrue(eligibility[self.admin.email])
         self.assertTrue(eligibility[self.manager.email])
-        self.assertTrue(eligibility[finance_user.email])
+        self.assertFalse(eligibility[finance_user.email])
         self.assertTrue(eligibility[permission_user.email])
         self.assertFalse(eligibility[self.viewer.email])
         self.assertEqual(finance_membership.employee_id, "EMP0004")
@@ -245,6 +246,35 @@ class EmployeeApiTests(TestCase):
         employee = OrganizationMembership.objects.get(user__email="new.employee@example.com")
         self.assertEqual(employee.organization_role_id, selected_role.id)
         self.assertEqual(response.data["role_name"], "Expense Reviewer")
+
+    def test_admin_can_assign_projects_and_response_exposes_assignments(self):
+        project = Project.objects.create(organization=self.org, name="Assigned", code="ASSIGNED")
+
+        response = self.client.post(
+            self.employees_url(), self.create_payload(project_ids=[project.id]), format="json"
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        employee = OrganizationMembership.objects.get(user__email="new.employee@example.com")
+        self.assertEqual(list(employee.assigned_projects.values_list("id", flat=True)), [project.id])
+        self.assertEqual(response.data["project_ids"], [project.id])
+
+    def test_project_assignment_rejects_foreign_projects_and_non_admins(self):
+        foreign_project = Project.objects.create(
+            organization=self.other_org, name="Foreign Project", code="FOREIGN"
+        )
+        response = self.client.post(
+            self.employees_url(), self.create_payload(project_ids=[foreign_project.id]), format="json"
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+
+        manager_client = APIClient()
+        manager_client.force_authenticate(self.manager)
+        project = Project.objects.create(organization=self.org, name="Manager Project", code="MANAGER")
+        response = manager_client.post(
+            self.employees_url(), self.create_payload(email="manager-created@example.com", project_ids=[project.id]), format="json"
+        )
+        self.assertEqual(response.status_code, 403, response.data)
         response = self.client.post(self.employees_url(), self.create_payload(reporting_manager=self.other_membership.id), format="json")
         self.assertEqual(response.status_code, 400)
         self.assertEqual(self.client.get(self.detail_url(self.other_membership)).status_code, 404)

@@ -7,6 +7,8 @@ from django.test import TestCase
 from django.utils import timezone
 
 from leads.models import Lead
+from inventory.models import Project
+from core.tests.factories import make_lead
 from organizations.models import Organization, OrganizationMembership
 from core.tests.samples import FORGED_EXE, FORGED_HTML, SAMPLE_JPEG, SAMPLE_PNG
 from .models import CustomerDocument, CustomerDocumentRequirement, DocumentCategory, EmployeeDocumentCategory
@@ -18,7 +20,8 @@ class DocumentServiceTests(TestCase):
     def setUp(self):
         self.user = get_user_model().objects.create_user(username="reviewer", email="reviewer@example.com", password="pw")
         self.org = Organization.objects.create(name="Org", slug="org")
-        self.customer = Lead.objects.create(organization=self.org, first_name="Customer", phone="1")
+        self.project = Project.objects.create(organization=self.org, name="Project", code="PROJECT")
+        self.customer = make_lead(self.org, self.project, first_name="Customer")
         self.category = DocumentCategory.objects.create(organization=self.org, name="PAN", code="pan")
         CustomerDocumentRequirement.objects.create(organization=self.org, customer=self.customer, document_category=self.category)
 
@@ -44,8 +47,8 @@ class DocumentServiceTests(TestCase):
         from django.core.exceptions import ValidationError
         from inventory.models import Block, Plot
         from inventory.services import confirm_plot_booking, create_plot_booking
-        block = Block.objects.create(organization=self.org, name="A", code="A")
-        plot = Plot.objects.create(organization=self.org, block=block, plot_number="1", size=Decimal("100"))
+        block = Block.objects.create(organization=self.org, project=self.project, name="A", code="A")
+        plot = Plot.objects.create(organization=self.org, project=self.project, block=block, plot_number="1", size=Decimal("100"))
         booking = create_plot_booking(organization=self.org, lead=self.customer, plot=plot, site_visit=None, notes="", user=self.user)
         with self.assertRaises(ValidationError) as raised:
             confirm_plot_booking(booking=booking, user=self.user)

@@ -18,7 +18,11 @@ class DatabaseUrlConfigurationTests(SimpleTestCase):
         self.assertEqual(config["PASSWORD"], "pass@word")
         self.assertEqual(config["HOST"], "db.example.supabase.co")
         self.assertEqual(config["PORT"], 5432)
-        self.assertEqual(config["OPTIONS"], {"sslmode": "require"})
+        self.assertEqual(
+            config["OPTIONS"],
+            {"sslmode": "require", "options": "-c lock_timeout=5000"},
+        )
+        self.assertTrue(config["CONN_HEALTH_CHECKS"])
 
     def test_preserves_explicit_connection_options(self):
         config = database_config_from_url(
@@ -27,8 +31,13 @@ class DatabaseUrlConfigurationTests(SimpleTestCase):
 
         self.assertEqual(
             config["OPTIONS"],
-            {"sslmode": "verify-full", "connect_timeout": "10"},
+            {
+                "sslmode": "verify-full",
+                "connect_timeout": "10",
+                "options": "-c lock_timeout=5000",
+            },
         )
+        self.assertTrue(config["CONN_HEALTH_CHECKS"])
 
     def test_blank_url_requests_sqlite_fallback(self):
         self.assertIsNone(database_config_from_url(""))

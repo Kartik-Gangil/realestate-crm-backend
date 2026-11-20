@@ -1,11 +1,14 @@
 from cryptography.fernet import Fernet
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
+from django.test import RequestFactory
 from django.test import override_settings
 from rest_framework.test import APITestCase
 from organizations.models import Organization, OrganizationMembership, OrganizationRole, Permission
 from organizations.services import ensure_default_roles, has_permission
+from .audit import log_audit
 from .models import AuditLog, IntegrationConfiguration, SystemParameter
+from users.models import DeveloperAccount
 
 
 class SettingsApiTests(APITestCase):
@@ -31,23 +34,60 @@ class SettingsApiTests(APITestCase):
         self.client.force_authenticate(user=None)
         self.assertEqual(self.client.get("/api/settings/overview/").status_code, 401)
 
-    def test_v1_audit_logs_returns_paginated_actor_data_and_supports_search(self):
+    def test_v1_audit_logs_is_developer_only_and_supports_search(self):
         AuditLog.objects.create(
             organization=self.org,
-            actor=self.admin,
+            user=self.admin,
             module="users",
             action="user_updated",
             ip_address="127.0.0.1",
             details={"fields": ["email"]},
         )
         self.client.force_authenticate(self.platform)
+        self.assertEqual(self.client.get("/api/v1/audit-logs/", {"search": "user_updated"}).status_code, 403)
+        DeveloperAccount.objects.create(user=self.platform)
 
         response = self.client.get("/api/v1/audit-logs/", {"search": "user_updated"})
 
         self.assertEqual(response.status_code, 200, response.data)
         self.assertEqual(response.data["count"], 1)
-        self.assertEqual(response.data["results"][0]["actor"]["email"], self.admin.email)
+        self.assertEqual(response.data["results"][0]["user"]["email"], self.admin.email)
         self.assertEqual(response.data["results"][0]["details"], {"fields": ["email"]})
+
+    @override_settings(DJANGO_TRUST_PROXY=True)
+    def test_explicit_audit_row_uses_trusted_forwarded_client_address_gnfr_14(self):
+        request = RequestFactory().post(
+            "/api/organizations/org-a/settings/general/",
+            REMOTE_ADDR="127.0.0.1",
+            HTTP_X_FORWARDED_FOR="198.51.100.40",
+        )
+        request.user = self.admin
+
+        row = log_audit(
+            request=request,
+            organization=self.org,
+            module="settings",
+            action="explicit_test",
+        )
+
+        self.assertEqual(row.ip_address, "198.51.100.40")
+
+    def test_audit_rows_are_immutable_and_expose_phase3_fields(self):
+        row = AuditLog.objects.create(
+            organization=self.org,
+            user=self.admin,
+            module="users",
+            action="user_updated",
+            method="PUT",
+            route="/api/v1/organizations/org-a/users/1/",
+            payload_before={"first_name": "before"},
+            payload_after={"first_name": "after"},
+        )
+        with self.assertRaises(Exception):
+            AuditLog.objects.filter(pk=row.pk).delete()
+        with self.assertRaises(Exception):
+            row.action = "tampered"
+            row.save(update_fields=["action"])
 
     def test_general_settings_and_isolation(self):
         self.client.force_authenticate(self.admin)

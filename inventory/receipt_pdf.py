@@ -125,3 +125,42 @@ def payment_receipt_pdf(payment, receipt):
 
 def payment_receipt_filename(receipt):
     return f"Receipt_{_safe_filename(receipt.receipt_number)}.pdf"
+
+
+def booking_receipt_pdf(booking):
+    """Render the Phase 9 booking summary receipt."""
+    output = BytesIO()
+    document = canvas.Canvas(output, pagesize=A4, pageCompression=0)
+    width, height = A4
+    receipt_number = booking.booking_receipt_number or booking.booking_code or f"BKG-{booking.pk}"
+    document.setTitle(f"Booking Receipt {receipt_number}")
+    left, right = 22 * mm, width - 22 * mm
+    document.setFillColor(colors.HexColor("#0B2A4A"))
+    document.rect(0, height - 42 * mm, width, 42 * mm, fill=1, stroke=0)
+    document.setFillColor(colors.white)
+    document.setFont("Helvetica-Bold", 20)
+    document.drawString(left, height - 20 * mm, "BOOKING RECEIPT")
+    document.setFont("Helvetica", 9)
+    document.drawRightString(right, height - 19 * mm, _pdf_text(receipt_number))
+    y = height - 58 * mm
+    document.setFillColor(colors.HexColor("#101828"))
+    document.setFont("Helvetica", 10)
+    rows = [
+        ("Booking code", booking.booking_code or f"BKG-{booking.pk}"),
+        ("Customer", booking.customer.full_name if booking.customer_id else booking.lead.full_name),
+        ("Plot", booking.plot.plot_number),
+        ("Status", booking.status),
+        ("Net amount", _money(booking.net_amount or booking.final_price)),
+    ]
+    for label, value in rows:
+        document.setFillColor(colors.HexColor("#667085"))
+        document.drawString(left, y, _pdf_text(label))
+        document.setFillColor(colors.HexColor("#101828"))
+        document.drawString(left + 47 * mm, y, _pdf_text(value))
+        y -= 8 * mm
+    document.setFillColor(colors.HexColor("#667085"))
+    document.setFont("Helvetica", 8)
+    document.drawString(left, 20 * mm, "This is a system-generated booking receipt.")
+    document.showPage()
+    document.save()
+    return output.getvalue()

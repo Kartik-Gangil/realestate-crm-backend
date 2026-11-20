@@ -18,10 +18,10 @@ class ProjectApiTests(TestCase):
         )
         self.organization = Organization.objects.create(name="Acme", slug="acme")
         self.other_organization = Organization.objects.create(name="Other", slug="other")
-        OrganizationMembership.objects.create(
+        self.admin_membership = OrganizationMembership.objects.create(
             organization=self.organization, user=self.admin, role=OrganizationMembership.Role.ADMIN
         )
-        OrganizationMembership.objects.create(
+        self.manager_membership = OrganizationMembership.objects.create(
             organization=self.organization, user=self.manager, role=OrganizationMembership.Role.MANAGER
         )
         self.project = Project.objects.create(
@@ -54,4 +54,17 @@ class ProjectApiTests(TestCase):
         self.client.force_authenticate(self.manager)
         response = self.client.post(self.url(), {"name": "Nope", "code": "NO"}, format="json")
 
+        self.assertEqual(response.status_code, 403)
+
+    def test_non_admin_lists_and_opens_only_assigned_projects(self):
+        second = Project.objects.create(organization=self.organization, name="Second", code="SECOND")
+        self.project.assigned_memberships.add(self.manager_membership)
+        self.client.force_authenticate(self.manager)
+
+        response = self.client.get(self.url())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([item["id"] for item in response.data["results"]], [self.project.id])
+
+        self.client.credentials(HTTP_X_PROJECT_ID=str(second.id))
+        response = self.client.get("/api/organizations/acme/inventory/plots/")
         self.assertEqual(response.status_code, 403)

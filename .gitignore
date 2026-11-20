@@ -10,6 +10,17 @@ wheels/
 .venv
 .env
 media
+recovered_media/
 private_media/
 *.sqlite3*
 backups/
+
+# Local test and build artifacts
+.coverage
+.test-temp/
+.crm-*/
+.pnpm-store/
+.vite-cache/
+test-results/
+playwright-report/
+*.log

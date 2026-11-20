@@ -16,21 +16,49 @@ class OrganizationSettings(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
 
+class MasterDataCategory(models.Model):
+    code = models.SlugField(max_length=64, unique=True)
+    name = models.CharField(max_length=120)
+    description = models.TextField(blank=True)
+    is_system = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ("name", "code")
+
+
 class MasterData(models.Model):
     organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name="master_data")
-    master_type = models.CharField(max_length=40)
+    project = models.ForeignKey("inventory.Project", null=True, blank=True, on_delete=models.CASCADE, related_name="master_data")
+    category = models.ForeignKey(MasterDataCategory, on_delete=models.PROTECT, related_name="items")
     code = models.SlugField(max_length=64)
     name = models.CharField(max_length=120)
     color = models.CharField(max_length=7, blank=True)
     description = models.TextField(blank=True)
+    properties = models.JSONField(default=dict, blank=True)
     is_active = models.BooleanField(default=True)
+    is_system = models.BooleanField(default=False)
     sort_order = models.PositiveIntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        constraints = [models.UniqueConstraint(fields=("organization", "master_type", "code"), name="settings_master_code_unique")]
-        ordering = ("master_type", "sort_order", "name")
+        constraints = [
+            models.UniqueConstraint(fields=("organization", "category", "code"), condition=models.Q(project__isnull=True), name="settings_master_default_code_unique"),
+            models.UniqueConstraint(fields=("organization", "project", "category", "code"), condition=models.Q(project__isnull=False), name="settings_master_project_code_unique"),
+        ]
+        ordering = ("category__code", "sort_order", "name")
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            previous = type(self).objects.get(pk=self.pk)
+            if previous.is_system and (previous.code != self.code or previous.is_system != self.is_system):
+                raise ValidationError("System master data key and system flag are immutable.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        if self.is_system:
+            raise ValidationError("System master data can only be deactivated.")
+        return super().delete(*args, **kwargs)
 
 
 class IntegrationConfiguration(models.Model):
@@ -39,6 +67,8 @@ class IntegrationConfiguration(models.Model):
         SMS = "sms", "SMS"
         WHATSAPP = "whatsapp", "WhatsApp"
         DOCUMENT_STORAGE = "document_storage", "Document storage"
+        META_ADS = "meta_ads", "Meta Ads"
+        GOOGLE_ADS = "google_ads", "Google Ads"
     class Status(models.TextChoices):
         NOT_CONFIGURED = "not_configured", "Not configured"
         CONFIGURED = "configured", "Configured"
@@ -54,6 +84,7 @@ class IntegrationConfiguration(models.Model):
     configuration = models.JSONField(default=dict, blank=True)
     encrypted_secrets = models.TextField(blank=True)
     last_tested_at = models.DateTimeField(null=True, blank=True)
+    last_synced_at = models.DateTimeField(null=True, blank=True)
     last_error = models.CharField(max_length=500, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -65,6 +96,7 @@ class SystemParameter(models.Model):
     class DataType(models.TextChoices):
         STRING = "string", "String"; INTEGER = "integer", "Integer"; DECIMAL = "decimal", "Decimal"; BOOLEAN = "boolean", "Boolean"; JSON = "json", "JSON"
     organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name="system_parameters")
+    project = models.ForeignKey("inventory.Project", null=True, blank=True, on_delete=models.CASCADE, related_name="system_parameters")
     category = models.CharField(max_length=40, default="general")
     parameter_key = models.SlugField(max_length=100)
     parameter_name = models.CharField(max_length=150)
@@ -76,25 +108,49 @@ class SystemParameter(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     class Meta:
-        constraints = [models.UniqueConstraint(fields=("organization", "parameter_key"), name="settings_parameter_key_unique")]
+        constraints = [
+            models.UniqueConstraint(fields=("organization", "parameter_key"), condition=models.Q(project__isnull=True), name="settings_parameter_default_key_unique"),
+            models.UniqueConstraint(fields=("organization", "project", "parameter_key"), condition=models.Q(project__isnull=False), name="settings_parameter_project_key_unique"),
+        ]
+
+
+class AuditLogQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        # Django's SET_NULL collector path is the only permitted bulk update.
+        # Payload, action, actor and other audit content are immutable.
+        if set(kwargs) <= {"organization", "organization_id", "project", "project_id"} and all(value is None for value in kwargs.values()):
+            return super().update(**kwargs)
+        raise ValidationError("Audit logs are immutable and cannot be updated.")
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Audit logs are immutable and cannot be deleted.")
 
 
 class AuditLog(models.Model):
     organization = models.ForeignKey(Organization, null=True, blank=True, on_delete=models.SET_NULL, related_name="settings_audit_logs")
-    actor = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="settings_audit_logs")
+    project = models.ForeignKey("inventory.Project", null=True, blank=True, on_delete=models.SET_NULL, related_name="settings_audit_logs")
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="settings_audit_logs")
     module = models.CharField(max_length=64)
     action = models.CharField(max_length=64)
-    timestamp = models.DateTimeField(auto_now_add=True)
+    method = models.CharField(max_length=16, blank=True)
+    route = models.CharField(max_length=255, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
     ip_address = models.GenericIPAddressField(null=True, blank=True)
     details = models.JSONField(default=dict, blank=True)
+    payload_before = models.JSONField(null=True, blank=True)
+    payload_after = models.JSONField(null=True, blank=True)
     target_type = models.CharField(max_length=100, blank=True)
     target_id = models.CharField(max_length=64, blank=True)
+    objects = AuditLogQuerySet.as_manager()
     class Meta:
-        ordering = ("-timestamp", "-id")
+        ordering = ("-created_at", "-id")
     def save(self, *args, **kwargs):
         if self.pk and type(self).objects.filter(pk=self.pk).exists():
             raise ValidationError("Audit logs are immutable.")
         return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Audit logs are immutable and cannot be deleted.")
 
 
 class BackupRecord(models.Model):

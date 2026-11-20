@@ -67,7 +67,7 @@ class Expense(models.Model):
         PAID = "paid", "Paid"
 
     organization = models.ForeignKey("organizations.Organization", on_delete=models.CASCADE, related_name="expenses")
-    project = models.ForeignKey("inventory.Project", null=True, blank=True, on_delete=models.CASCADE, related_name="expenses")
+    project = models.ForeignKey("inventory.Project", on_delete=models.PROTECT, related_name="expenses")
     expense_id = models.CharField(max_length=32, unique=True, editable=False)
     submitted_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="submitted_expenses")
     date = models.DateField(default=timezone.localdate)

@@ -5,6 +5,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from .models import AttendanceRecord, LeaveRequest, OrganizationActivity, OrganizationHoliday
+from .services import is_organization_admin
 
 
 def log_activity(*, organization, employee, action, actor, module, details=None):
@@ -81,7 +82,7 @@ def decide_leave(*, leave, actor_membership, actor, approved, rejection_reason="
         if leave.employee.user_id == actor.id:
             raise ValidationError({"approval": "Employees cannot approve or reject their own leave."})
         is_manager = leave.employee.reporting_manager_id == getattr(actor_membership, "id", None)
-        is_admin = bool(actor_membership and actor_membership.role == "admin")
+        is_admin = is_organization_admin(actor_membership)
         if not (is_manager or is_admin):
             raise ValidationError({"approval": "Only the reporting manager or an organization admin can decide this leave request."})
         if not approved and not rejection_reason.strip():

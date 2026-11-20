@@ -10,8 +10,9 @@ class CorsConfigurationTests(TestCase):
                 "/api/auth/login/",
                 HTTP_ORIGIN=origin,
                 HTTP_ACCESS_CONTROL_REQUEST_METHOD="POST",
-                HTTP_ACCESS_CONTROL_REQUEST_HEADERS="content-type, x-project-id",
+                HTTP_ACCESS_CONTROL_REQUEST_HEADERS="content-type, x-project-id, x-idempotency-key",
             )
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response["Access-Control-Allow-Origin"], origin)
             self.assertIn("x-project-id", response["Access-Control-Allow-Headers"].lower())
+            self.assertIn("x-idempotency-key", response["Access-Control-Allow-Headers"].lower())

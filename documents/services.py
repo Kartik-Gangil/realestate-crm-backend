@@ -9,6 +9,7 @@ from django.utils import timezone
 from core.files import DOCUMENT_KINDS, validate_upload
 from .models import (CustomerDocument, CustomerDocumentRequirement, CustomerDocumentVerificationHistory,
                      EmployeeDocument)
+from system_settings.audit import log_bulk_audit
 
 
 def _validate_file(uploaded_file):
@@ -16,7 +17,7 @@ def _validate_file(uploaded_file):
     return validate_upload(uploaded_file, kinds=DOCUMENT_KINDS, max_bytes=maximum)
 
 
-def upload_customer_document(*, organization, customer, document_category, uploaded_file, document_name, expiry_date=None, notes="", user=None):
+def upload_customer_document(*, organization, customer, document_category, uploaded_file, document_name, expiry_date=None, notes="", user=None, request=None):
     if customer.organization_id != organization.id or document_category.organization_id != organization.id:
         raise ValidationError("Customer and category must belong to this organization.")
     if not document_category.is_active:
@@ -24,14 +25,18 @@ def upload_customer_document(*, organization, customer, document_category, uploa
     content_type = _validate_file(uploaded_file)
     with transaction.atomic():
         active = CustomerDocument.objects.select_for_update().filter(organization=organization, customer=customer, document_category=document_category, is_active=True)
+        active_items = list(active)
         active.update(is_active=False, archived_at=timezone.now())
+        if active_items:
+            log_bulk_audit(request=request, module="documents", action="bulk_update", instances=active_items, organization=organization,
+                           changed_values={"is_active": False, "archived_at": "now"})
         latest = CustomerDocument.objects.select_for_update().filter(organization=organization, customer=customer, document_category=document_category).order_by("-version").first()
         document = CustomerDocument.objects.create(organization=organization, customer=customer, document_category=document_category, document_name=document_name.strip(), file=uploaded_file, file_name=uploaded_file.name, file_size=uploaded_file.size, content_type=content_type, version=(latest.version + 1 if latest else 1), expiry_date=expiry_date, notes=notes or "", uploaded_by=user)
         CustomerDocumentVerificationHistory.objects.create(document=document, old_status=CustomerDocument.Status.UPLOADED, new_status=CustomerDocument.Status.UPLOADED, reason="Document uploaded", changed_by=user)
         return document
 
 
-def archive_customer_document(*, document, user=None):
+def archive_customer_document(*, document, user=None, request=None):
     with transaction.atomic():
         document = CustomerDocument.objects.select_for_update().get(pk=document.pk)
         if not document.is_active:
@@ -90,6 +95,31 @@ def validate_customer_documents_for_booking(customer):
         elif doc.status in {CustomerDocument.Status.UPLOADED, CustomerDocument.Status.UNDER_VERIFICATION}: result["pending"].append(label)
         elif doc.status == CustomerDocument.Status.REJECTED: result["rejected"].append(label)
         elif doc.status != CustomerDocument.Status.VERIFIED or (doc.expiry_date and doc.expiry_date < today): result["expired"].append(label)
+
+    def is_identity_category(category):
+        value = f"{category.code} {category.name}".lower().replace("_", "-")
+        return any(token in value for token in ("identity", "id-proof", "aadhaar", "aadhar", "pan"))
+
+    identity_documents = [document for document in active.values() if is_identity_category(document.document_category)]
+    if not any(
+        document.status == CustomerDocument.Status.VERIFIED
+        and (document.expiry_date is None or document.expiry_date >= today)
+        for document in identity_documents
+    ):
+        if not identity_documents:
+            result["missing"].append("Identity document")
+        else:
+            document = identity_documents[0]
+            label = document.document_category.name
+            if document.status in {CustomerDocument.Status.UPLOADED, CustomerDocument.Status.UNDER_VERIFICATION}:
+                if label not in result["pending"]:
+                    result["pending"].append(label)
+            elif document.status == CustomerDocument.Status.REJECTED:
+                if label not in result["rejected"]:
+                    result["rejected"].append(label)
+            else:
+                if label not in result["expired"]:
+                    result["expired"].append(label)
     result["allowed"] = not any(result[key] for key in ("missing", "pending", "rejected", "expired"))
     return result
 
@@ -102,7 +132,11 @@ def upload_employee_document(*, organization, employee, document_category, uploa
     content_type = _validate_file(uploaded_file)
     with transaction.atomic():
         active = EmployeeDocument.objects.select_for_update().filter(organization=organization, employee=employee, document_category=document_category, is_active=True)
+        active_items = list(active)
         active.update(is_active=False, status=EmployeeDocument.Status.ARCHIVED, archived_at=timezone.now())
+        if active_items:
+            log_bulk_audit(module="documents", action="bulk_update", instances=active_items, organization=organization,
+                           changed_values={"is_active": False, "status": EmployeeDocument.Status.ARCHIVED, "archived_at": "now"})
         latest = EmployeeDocument.objects.select_for_update().filter(organization=organization, employee=employee, document_category=document_category).order_by("-version").first()
         return EmployeeDocument.objects.create(organization=organization, employee=employee, document_category=document_category,
                                                document_name=document_name.strip(), file=uploaded_file, file_name=uploaded_file.name,

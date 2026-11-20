@@ -1,9 +1,8 @@
-from django.contrib.auth import get_user_model
 from rest_framework.test import APITestCase
 
-from inventory.models import Project
+from core.tests.factories import make_lead, make_member, make_organization, make_project
 from leads.models import Lead
-from organizations.models import Organization, OrganizationMembership, OrganizationRole, Permission
+from organizations.models import Permission
 
 from .models import CustomerDocument, DocumentCategory
 
@@ -12,40 +11,17 @@ class DocumentPermissionEnforcementTests(APITestCase):
     """Task 4 / GNFR-05: document access must be denied after RBAC revocation."""
 
     def setUp(self):
-        user_model = get_user_model()
-        self.user = user_model.objects.create_user(
-            username="telecaller",
-            email="telecaller@example.com",
-            password="password123",
-        )
-        self.organization = Organization.objects.create(name="Acme", slug="acme")
-        self.project = Project.objects.create(
-            organization=self.organization,
-            name="Main project",
-            code="MAIN",
-        )
-        self.role = OrganizationRole.objects.create(
-            organization=self.organization,
-            name="Telecaller",
-            code="telecaller",
-        )
+        self.organization = make_organization("acme")
+        self.project = make_project(self.organization, "MAIN")
+        membership = make_member(self.organization, role="telecaller", projects=[self.project])
+        self.user = membership.user
+        self.role = membership.organization_role
         self.documents_view, _ = Permission.objects.get_or_create(
             module="documents",
             action="view",
             defaults={"name": "View documents"},
         )
-        OrganizationMembership.objects.create(
-            organization=self.organization,
-            user=self.user,
-            role=OrganizationMembership.Role.TELECALLER,
-            organization_role=self.role,
-        )
-        self.customer = Lead.objects.create(
-            organization=self.organization,
-            project=self.project,
-            first_name="Customer",
-            phone="1",
-        )
+        self.customer = make_lead(self.organization, self.project, first_name="Customer")
         self.category = DocumentCategory.objects.create(
             organization=self.organization,
             name="Identity",
@@ -88,14 +64,16 @@ class DocumentPermissionEnforcementTests(APITestCase):
             403,
         )
 
-    def test_document_and_kyc_related_reads_are_denied_without_view_permission(self):
-        for path in (
-            "documents/categories/",
-            f"customers/{self.customer.id}/documents/",
-            f"customers/{self.customer.id}/document-requirements/",
-        ):
-            with self.subTest(path=path):
-                self.assertEqual(
-                    self.client.get(self.url(path), HTTP_X_PROJECT_ID=str(self.project.id)).status_code,
-                    403,
-                )
+    def test_customer_documents_read_requires_documents_view_permission(self):
+        response = self.client.get(
+            self.url(f"customers/{self.customer.id}/documents/"),
+            HTTP_X_PROJECT_ID=str(self.project.id),
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_document_requirements_read_requires_documents_view_permission(self):
+        response = self.client.get(
+            self.url(f"customers/{self.customer.id}/document-requirements/"),
+            HTTP_X_PROJECT_ID=str(self.project.id),
+        )
+        self.assertEqual(response.status_code, 403)

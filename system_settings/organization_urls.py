@@ -2,7 +2,18 @@ from django.urls import path
 from . import views
 
 urlpatterns = [
+    path("master-data/categories/", views.master_data_categories),
+    path("master-data/", views.master_data_create),
+    path("master-data/defaults/categories/", views.master_data_categories),
+    path("master-data/defaults/", views.master_data_defaults_list),
+    path("master-data/defaults/<int:item_id>/", views.master_data_defaults_update),
+    path("master-data/defaults/<slug:category_code>/", views.master_data_defaults_list),
+    path("master-data/<slug:category_code>/", views.master_data_list),
+    path("master-data/<slug:category_code>/<int:item_id>/", views.master_data_update),
+    path("system-parameters/", views.canonical_system_parameters),
+    path("system-parameters/defaults/", views.canonical_system_parameter_defaults),
     path("settings/overview/", views.organization_overview),
+    path("audit-logs/", views.organization_audit_logs),
     path("settings/general/", views.general_settings),
     path("settings/general/logo/", views.general_settings_logo),
     path("settings/integrations/", views.integrations),

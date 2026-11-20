@@ -12,7 +12,7 @@ from rest_framework.test import APIClient
 
 from leads.models import FollowUpCall, Lead
 from inventory.models import Project
-from organizations.models import Organization, OrganizationMembership
+from organizations.models import Organization, OrganizationMembership, OrganizationRole, Permission, ProjectAssignment
 
 
 @override_settings(MEDIA_ROOT=tempfile.gettempdir())
@@ -25,9 +25,36 @@ class TelecallingApiTests(TestCase):
         self.organization = Organization.objects.create(name="Acme", slug="acme")
         self.project = Project.objects.create(organization=self.organization, name="Main", code="MAIN")
         self.other_project = Project.objects.create(organization=self.organization, name="Other", code="OTHER")
-        self.membership = OrganizationMembership.objects.create(organization=self.organization, user=self.user, role=OrganizationMembership.Role.TELECALLER)
-        self.other_membership = OrganizationMembership.objects.create(organization=self.organization, user=self.other, role=OrganizationMembership.Role.TELECALLER)
+        telecalling_view, _ = Permission.objects.get_or_create(
+            module="telecalling", action="view", defaults={"name": "View telecalling"}
+        )
+        telecaller_role = OrganizationRole.objects.create(
+            organization=self.organization, name="Telecaller", code="telecaller"
+        )
+        telecaller_role.permissions.add(telecalling_view)
+        self.membership = OrganizationMembership.objects.create(
+            organization=self.organization, user=self.user, role=OrganizationMembership.Role.TELECALLER,
+            organization_role=telecaller_role,
+        )
+        self.other_membership = OrganizationMembership.objects.create(
+            organization=self.organization, user=self.other, role=OrganizationMembership.Role.TELECALLER,
+            organization_role=telecaller_role,
+        )
         self.admin_membership = OrganizationMembership.objects.create(organization=self.organization, user=self.admin, role=OrganizationMembership.Role.ADMIN)
+        self.project.assigned_memberships.add(self.membership, self.other_membership)
+        ProjectAssignment.objects.create(
+            membership=self.membership, project=self.project, role=telecaller_role
+        )
+        ProjectAssignment.objects.create(
+            membership=self.other_membership, project=self.project, role=telecaller_role
+        )
+        admin_project_role = OrganizationRole.objects.create(
+            organization=self.organization, name="Admin Telecalling", code="admin-telecalling"
+        )
+        admin_project_role.permissions.add(telecalling_view)
+        ProjectAssignment.objects.create(
+            membership=self.admin_membership, project=self.project, role=admin_project_role
+        )
         self.assigned = Lead.objects.create(organization=self.organization, project=self.project, first_name="Assigned", phone="9000000001", assigned_membership=self.membership)
         self.hidden = Lead.objects.create(organization=self.organization, project=self.project, first_name="Hidden", phone="9000000002", assigned_membership=self.other_membership)
         self.client = APIClient()
@@ -38,6 +65,19 @@ class TelecallingApiTests(TestCase):
         response = self.client.get(reverse("telecalling-queue", args=[self.organization.slug]))
         self.assertEqual(response.status_code, 200)
         self.assertEqual([item["id"] for item in response.data["results"]], [self.assigned.id])
+
+    def test_queue_is_denied_when_project_role_lacks_telecalling_view(self):
+        restricted_role = OrganizationRole.objects.create(
+            organization=self.organization, name="Restricted", code="restricted"
+        )
+        self.membership.organization_role = restricted_role
+        self.membership.save(update_fields=["organization_role"])
+        ProjectAssignment.objects.filter(
+            membership=self.membership, project=self.project
+        ).update(role=restricted_role)
+        response = self.client.get(reverse("telecalling-queue", args=[self.organization.slug]))
+
+        self.assertEqual(response.status_code, 403)
 
     def test_admin_queue_contains_all_leads_with_assignee_and_status(self):
         FollowUpCall.objects.create(
@@ -54,7 +94,8 @@ class TelecallingApiTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual({item["id"] for item in response.data["results"]}, {self.assigned.id, self.hidden.id})
         assigned = next(item for item in response.data["results"] if item["id"] == self.assigned.id)
-        self.assertEqual(assigned["assigned_membership"], self.membership.user.get_full_name())
+        expected_assignee = self.membership.user.get_full_name().strip() or self.membership.user.email or self.membership.role
+        self.assertEqual(assigned["assigned_membership"], expected_assignee)
         self.assertEqual(assigned["status"], "contacted")
 
     def test_queue_is_scoped_to_active_project(self):
@@ -99,7 +140,7 @@ class TelecallingApiTests(TestCase):
     def test_reassigning_a_lead_does_not_create_duplicate_pending_attempts(self):
         self.client.force_authenticate(self.admin)
         url = reverse("leads:assign-lead", args=[self.organization.slug, self.assigned.id])
-        payload = {"telecaller_membership": self.membership.id}
+        payload = {"telecaller_membership": self.membership.id, "reason": "Keep the assigned queue stable"}
 
         first = self.client.patch(url, payload, format="json")
         second = self.client.patch(url, payload, format="json")

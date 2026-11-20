@@ -31,7 +31,7 @@ class AgreementSignedCopyTests(TestCase):
         project = Project.objects.create(organization=self.organization, name="Green", code="GREEN")
         block = Block.objects.create(organization=self.organization, project=project, name="A", code="A")
         plot = Plot.objects.create(organization=self.organization, project=project, block=block, plot_number="A-101", size=Decimal("100"), total_price=Decimal("1000"), status=Plot.Status.BOOKED)
-        lead = Lead.objects.create(organization=self.organization, first_name="Ada", phone="9999999999")
+        lead = Lead.objects.create(organization=self.organization, project=project, first_name="Ada", phone="9999999999")
         self.booking = PlotBooking.objects.create(organization=self.organization, lead=lead, plot=plot, status=PlotBooking.Status.CONFIRMED, final_price=Decimal("1000"), created_by=self.user)
         self.agreement = create_agreement(booking=self.booking, agreement_number="AGR-1", created_by=self.user)
         transition_agreement(agreement=self.agreement, status=Agreement.Status.READY)

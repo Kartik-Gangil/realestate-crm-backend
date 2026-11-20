@@ -2,7 +2,11 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models import Q, F
-TAB_PERMISSIONS = ("dashboard", "leads", "assigned_leads", "follow_ups", "telecalling", "members")
+TAB_PERMISSIONS = (
+    "dashboard", "leads", "assigned_leads", "follow_ups", "telecalling",
+    "members", "site-visits", "plots", "payments", "registry", "loans",
+    "employees", "documents", "expenses", "communications", "settings",
+)
 
 
 def default_tab_permissions():
@@ -71,7 +75,7 @@ class OrganizationMembership(models.Model):
         DEPARTMENT = "department", "Department Data"
         CUSTOM = "custom", "Custom Scope"
 
-    access_scope = models.CharField(max_length=20, choices=AccessScope.choices, default=AccessScope.ALL)
+    access_scope = models.CharField(max_length=20, choices=AccessScope.choices, default=AccessScope.OWN)
     custom_scope_memberships = models.ManyToManyField("self", blank=True, symmetrical=False, related_name="included_in_custom_scopes")
     custom_scope_departments = models.ManyToManyField("Department", blank=True, related_name="included_in_custom_scopes")
 
@@ -110,6 +114,9 @@ class OrganizationMembership(models.Model):
         # Legacy role is compatibility data. New memberships get a canonical role.
         if self.organization_id and not self.organization_role_id:
             role = OrganizationRole.objects.filter(organization_id=self.organization_id, code=self.role).first()
+            if role is None:
+                from .services import ensure_default_roles
+                role = ensure_default_roles(self.organization).get(self.role)
             if role:
                 self.organization_role = role
         return super().save(*args, **kwargs)
@@ -133,9 +140,12 @@ class Department(models.Model):
 
 class Permission(models.Model):
     """Small, reusable permission catalogue; roles select from this catalogue."""
+    SCOPE_CHOICES = (("organization", "Organization"), ("project", "Project"))
+
     module = models.CharField(max_length=32)
     action = models.CharField(max_length=32)
     name = models.CharField(max_length=100)
+    scope = models.CharField(max_length=16, choices=SCOPE_CHOICES, default="project")
 
     class Meta:
         constraints = [models.UniqueConstraint(fields=["module", "action"], name="organization_permission_unique")]
@@ -153,6 +163,7 @@ class OrganizationRole(models.Model):
     organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name="roles")
     name = models.CharField(max_length=100)
     code = models.SlugField(max_length=50)
+    description = models.TextField(blank=True, default="")
     permissions = models.ManyToManyField(Permission, blank=True, related_name="organization_roles")
     is_system = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -164,6 +175,29 @@ class OrganizationRole(models.Model):
 
     def __str__(self):
         return f"{self.organization}: {self.name}"
+
+
+class ProjectAssignment(models.Model):
+    """The role a membership holds inside one project."""
+
+    membership = models.ForeignKey(OrganizationMembership, on_delete=models.CASCADE, related_name="project_assignments")
+    project = models.ForeignKey("inventory.Project", on_delete=models.CASCADE, related_name="role_assignments")
+    role = models.ForeignKey(OrganizationRole, on_delete=models.PROTECT, related_name="project_assignments")
+    assigned_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="created_project_assignments")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=("membership", "project"), name="unique_project_membership_assignment")]
+
+    def clean(self):
+        super().clean()
+        errors = {}
+        if self.membership_id and self.project_id and self.membership.organization_id != self.project.organization_id:
+            errors["project"] = "Project must belong to the membership organization."
+        if self.role_id and self.membership_id and self.role.organization_id != self.membership.organization_id:
+            errors["role"] = "Role must belong to the membership organization."
+        if errors:
+            raise ValidationError(errors)
 
 
 class OrganizationHoliday(models.Model):
@@ -281,5 +315,6 @@ class PlatformOrganizationAccess(models.Model):
         constraints = [models.UniqueConstraint(fields=["organization", "user"], name="unique_platform_organization_access")]
 
     def clean(self):
-        if not self.user.groups.filter(name="Platform Admin").exists() and not self.user.is_superuser:
+        from users.security import is_developer
+        if not is_developer(self.user) and not self.user.groups.filter(name="Platform Admin").exists() and not self.user.is_superuser:
             raise ValidationError({"user": "Only a platform admin or superadmin can receive platform access."})

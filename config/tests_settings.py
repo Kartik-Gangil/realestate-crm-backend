@@ -11,6 +11,7 @@ with `DJANGO_ENV_FILE=none` (the local Backend/.env is never read there). Secret
 printed: the settings probe reports only a hash and the length of SECRET_KEY.
 """
 
+from datetime import timedelta
 import importlib
 import base64
 import io
@@ -31,8 +32,13 @@ from django.contrib.auth import get_user_model
 from django.core.exceptions import ImproperlyConfigured
 from django.core.management import CommandError, call_command
 from django.test import SimpleTestCase, TestCase, override_settings
+from django.utils import timezone
+from organizations.models import Organization, OrganizationMembership
+from organizations.services import ensure_default_roles
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
+from users.models import UserSession
+from users.security import token_hash
 
 BACKEND_DIR = Path(settings.BASE_DIR)
 FRONTEND_DIR = BACKEND_DIR.parent / "Frontend"
@@ -449,8 +455,20 @@ class RevokeAllTokensCommandTests(TestCase):
         self.bob = user_model.objects.create_user(
             username="revoke-bob@example.com", email="revoke-bob@example.com", password=self.PASSWORD
         )
+        organization = Organization.objects.create(name="Revoke Org", slug="revoke-org")
+        role = ensure_default_roles(organization)["manager"]
+        OrganizationMembership.objects.bulk_create([
+            OrganizationMembership(organization=organization, user=self.alice, role="manager", organization_role=role),
+            OrganizationMembership(organization=organization, user=self.bob, role="manager", organization_role=role),
+        ])
         self.alice_key = Token.objects.create(user=self.alice).key
         self.bob_key = Token.objects.create(user=self.bob).key
+        for user, key in ((self.alice, self.alice_key), (self.bob, self.bob_key)):
+            UserSession.objects.create(
+                user=user,
+                token_hash=token_hash(key),
+                expires_at=timezone.now() + timedelta(minutes=30),
+            )
 
     def _me(self, key):
         client = APIClient()
@@ -550,6 +568,7 @@ class RepositoryHygieneTests(SimpleTestCase):
         ".test-db.sqlite3",
         ".env",
         "private_media/documents/sample.bin",
+        "recovered_media/sample.pdf",
     )
     FRONTEND_IGNORED = (
         ".env",
@@ -635,3 +654,40 @@ class RepositoryHygieneTests(SimpleTestCase):
         template = FRONTEND_DIR / ".env.example"
         self.assertTrue(template.is_file(), msg="Frontend/.env.example is missing")
         self._assert_template_entries(_parse_env_template(template), used)
+
+
+class CiIntegrityPolicyTests(SimpleTestCase):
+    """TASK-SEC-001 / Appendix B / GNFR-10 / G-3 item 8: CI policy is explicit."""
+
+    SCRIPTS_DIR = BACKEND_DIR.parent / "scripts"
+    def test_known_failures_have_spec_and_owner_metadata(self):
+        lines = [
+            line.strip()
+            for line in (self.SCRIPTS_DIR / "known-failures.txt").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(lines, [])
+        for line in lines:
+            self.assertEqual(len(line.split("|")), 3)
+
+    def test_ci_checks_verbose_failures_and_private_media_count(self):
+        source = (self.SCRIPTS_DIR / "ci.ps1").read_text(encoding="utf-8")
+        self.assertIn("'test', '--noinput', '-v', '2'", source)
+        self.assertIn("@('exec', 'vitest', 'run', '--maxWorkers=2')", source)
+        self.assertIn("Get-PrivateMediaFileCount", source)
+        self.assertIn("Get-ObservedFailureIds", source)
+        self.assertIn("known-failures mismatch", source)
+
+    def test_ci_loads_test_database_url_key_without_echoing_it(self):
+        source = (self.SCRIPTS_DIR / "ci.ps1").read_text(encoding="utf-8")
+        self.assertIn("TEST_DATABASE_URL", source)
+        self.assertIn("Join-Path $backendRoot '.env'", source)
+        self.assertIn("Get-Content -LiteralPath $backendEnvPath", source)
+        self.assertNotIn("Write-Host $candidate", source)
+
+    def test_ci_defers_postgres_without_a_connection_attempt_g3_item_8(self):
+        """G-3 item 8: owner-deferred PostgreSQL is explicit and non-connecting."""
+        source = (self.SCRIPTS_DIR / "ci.ps1").read_text(encoding="utf-8")
+        self.assertIn("PostgreSQL not verified (deferred by owner, G-3 item 8)", source)
+        self.assertNotIn("$env:DATABASE_URL = $env:TEST_DATABASE_URL", source)
+        self.assertNotIn("$backendPython manage.py test --noinput", source)

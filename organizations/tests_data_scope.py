@@ -1,30 +1,20 @@
-from django.contrib.auth import get_user_model
 from django.test import TestCase
 from rest_framework.test import APIClient
 
 from documents.models import CustomerDocument, DocumentCategory
 from expenses.models import Expense, ExpenseCategory
-from inventory.models import Block, Plot, Project
+from inventory.models import Block, Plot
 from leads.models import Lead
+from core.tests.factories import make_member, make_organization, make_project
 
-from .models import Department, Organization, OrganizationMembership, OrganizationRole, Permission
+from .models import Department, OrganizationMembership, OrganizationRole, Permission, ProjectAssignment
 
 
 class FullCrmDataScopeTests(TestCase):
     """GNFR-06/FR-P3-07: access scope must protect CRM rows, not only employees."""
 
     def setUp(self):
-        user_model = get_user_model()
-        self.owner = user_model.objects.create_user(
-            username="owner@example.com", email="owner@example.com", password="password123"
-        )
-        self.same_department_user = user_model.objects.create_user(
-            username="teammate@example.com", email="teammate@example.com", password="password123"
-        )
-        self.other_department_user = user_model.objects.create_user(
-            username="other@example.com", email="other@example.com", password="password123"
-        )
-        self.organization = Organization.objects.create(name="Acme", slug="acme")
+        self.organization = make_organization("acme")
         self.sales = Department.objects.create(organization=self.organization, name="Sales")
         self.finance = Department.objects.create(organization=self.organization, name="Finance")
         self.role = OrganizationRole.objects.create(
@@ -36,31 +26,24 @@ class FullCrmDataScopeTests(TestCase):
         ]
         self.role.permissions.set(permissions)
 
-        self.owner_membership = OrganizationMembership.objects.create(
-            organization=self.organization,
-            user=self.owner,
-            role="manager",
-            organization_role=self.role,
-            department=self.sales,
-            access_scope=OrganizationMembership.AccessScope.OWN,
-        )
-        self.same_department_membership = OrganizationMembership.objects.create(
-            organization=self.organization,
-            user=self.same_department_user,
-            role="manager",
-            organization_role=self.role,
-            department=self.sales,
-        )
-        self.other_department_membership = OrganizationMembership.objects.create(
-            organization=self.organization,
-            user=self.other_department_user,
-            role="manager",
-            organization_role=self.role,
-            department=self.finance,
-        )
-        self.project = Project.objects.create(
-            organization=self.organization, name="Main project", code="MAIN"
-        )
+        self.project = make_project(self.organization, "MAIN")
+        self.owner_membership = make_member(self.organization, role="manager", projects=[self.project])
+        self.same_department_membership = make_member(self.organization, role="manager", projects=[self.project])
+        self.other_department_membership = make_member(self.organization, role="manager", projects=[self.project])
+        self.owner = self.owner_membership.user
+        self.same_department_user = self.same_department_membership.user
+        self.other_department_user = self.other_department_membership.user
+        for membership, department in (
+            (self.owner_membership, self.sales),
+            (self.same_department_membership, self.sales),
+            (self.other_department_membership, self.finance),
+        ):
+            membership.organization_role = self.role
+            membership.department = department
+            membership.save(update_fields=["organization_role", "department"])
+            ProjectAssignment.objects.filter(membership=membership, project=self.project).update(role=self.role)
+        self.owner_membership.access_scope = OrganizationMembership.AccessScope.OWN
+        self.owner_membership.save(update_fields=["access_scope"])
         self.owner_lead = Lead.objects.create(
             organization=self.organization,
             project=self.project,
