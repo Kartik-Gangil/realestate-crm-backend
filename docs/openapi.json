@@ -5775,6 +5775,42 @@
         }
       }
     },
+    "/api/v1/organizations/{organization_slug}/leave-balances/": {
+      "get": {
+        "operationId": "get_api_v1_organizations_organization_slug_leave-balances",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "organization_slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "Successful response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-crm-scope": "organization",
+        "x-permissions": {
+          "GET": "leave.view"
+        }
+      }
+    },
     "/api/v1/organizations/{organization_slug}/leaves/": {
       "get": {
         "operationId": "get_api_v1_organizations_organization_slug_leaves",

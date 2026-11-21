@@ -69,6 +69,9 @@ class GroupEPhase15Tests(TestCase):
     def leave_url(self):
         return f"/api/v1/organizations/{self.organization.slug}/leaves/"
 
+    def leave_balances_url(self):
+        return f"/api/v1/organizations/{self.organization.slug}/leave-balances/"
+
     def performance_url(self, employee_id):
         return f"/api/v1/organizations/{self.organization.slug}/performance/{employee_id}/"
 
@@ -80,6 +83,16 @@ class GroupEPhase15Tests(TestCase):
             organization=self.organization, name="Republic Day", holiday_date=date(2026, 1, 3)
         )
         self.assertEqual(leave_days(self.organization, date(2026, 1, 1), date(2026, 1, 7)), 5)
+
+    def test_ui_p15_04_employee_can_read_current_leave_balances(self):
+        response = self.employee_client.get(self.leave_balances_url())
+
+        self.assertEqual(response.status_code, 200, response.data)
+        casual = next(item for item in response.data["results"] if item["leave_type"] == "casual")
+        self.assertEqual(casual["employee"]["id"], self.employee_membership.id)
+        self.assertEqual(casual["allocated_days"], 12)
+        self.assertEqual(casual["used_days"], 0)
+        self.assertEqual(casual["remaining_days"], 12)
 
     def test_nfr_p15_01_server_calculates_total_hours_and_refuses_double_check_in(self):
         start = timezone.make_aware(datetime(2026, 1, 5, 9, 0))

@@ -291,6 +291,34 @@ def leaves(request, organization_slug):
     return Response(_leave(LeaveRequest.objects.select_related("employee__user").get(pk=leave.pk)), status=201)
 
 
+def _leave_balance(balance):
+    return {
+        "id": balance.id,
+        "employee": _dict_employee(balance.employee),
+        "leave_type": balance.leave_type,
+        "year": balance.year,
+        "allocated_days": balance.allocated_days,
+        "used_days": balance.used_days,
+        "remaining_days": balance.remaining_days,
+    }
+
+
+@crm_endpoint(["GET"], scope="organization", permissions={"GET": "leave.view"})
+def leave_balances(request, organization_slug):
+    access = get_organization_access(request.user, organization_slug)
+    year = timezone.localdate().year
+    results = []
+    for employee in _employees_for_access(access):
+        for leave_type in (LeaveRequest.LeaveType.CASUAL, LeaveRequest.LeaveType.SICK, LeaveRequest.LeaveType.PAID):
+            results.append(_leave_balance(ensure_leave_balance(
+                organization=access.organization,
+                employee=employee,
+                leave_type=leave_type,
+                year=year,
+            )))
+    return Response({"year": year, "results": results})
+
+
 @crm_endpoint(["GET", "PATCH"], scope="organization", permissions={"GET": "leave.view", "PATCH": "leave.edit"})
 def leave_detail(request, organization_slug, leave_id):
     access = get_organization_access(request.user, organization_slug)
