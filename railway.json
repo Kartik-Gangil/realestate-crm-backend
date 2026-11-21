@@ -1,0 +1,12 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "deploy": {
+    "preDeployCommand": [
+      "python manage.py migrate --noinput"
+    ],
+    "startCommand": "gunicorn config.wsgi:application --bind 0.0.0.0:$PORT --workers 2",
+    "healthcheckPath": "/readyz",
+    "healthcheckTimeout": 300,
+    "restartPolicyType": "ALWAYS"
+  }
+}

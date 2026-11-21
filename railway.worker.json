@@ -1,0 +1,7 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "deploy": {
+    "startCommand": "python manage.py run_worker",
+    "restartPolicyType": "ALWAYS"
+  }
+}
