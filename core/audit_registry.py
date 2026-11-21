@@ -19,7 +19,7 @@ AUDIT_MODEL_LABELS = {
     "leads.Sitevisit", "leads.SitevisitReschedule", "leads.FollowUpCall",
     "leads.LeadAssignmentHistory", "leads.LeadStatusHistory", "leads.LeadTag",
     "inventory.Project", "inventory.Block", "inventory.Plot", "inventory.PlotHold",
-    "inventory.PlotBooking", "inventory.Customer", "inventory.CustomerCodeSequence",
+    "inventory.PlotBooking", "inventory.Customer", "inventory.CustomerNote", "inventory.CustomerCodeSequence",
     "inventory.BookingReceiptSequence", "inventory.BookingIdempotencyKey",
     "inventory.Payment", "inventory.PaymentRefund",
     "inventory.PaymentAllocation", "inventory.PaymentAdvance", "inventory.PaymentReceipt",

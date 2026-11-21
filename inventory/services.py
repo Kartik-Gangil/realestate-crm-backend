@@ -220,6 +220,8 @@ def create_idempotent_booking(*, organization, project, lead, plot, user, idempo
         )
         booking.full_clean()
         change_plot_status(plot=locked_plot, new_status=Plot.Status.BOOKED, reason="Booking created", user=user)
+        from .customer_services import advance_customer_lifecycle
+        advance_customer_lifecycle(customer, Customer.Status.ACTIVE, reason="Booking created", actor=user)
         from .phase5_services import payment_totals, record_initial_booking_payment
         if amount:
             record_initial_booking_payment(
@@ -259,6 +261,9 @@ def confirm_plot_booking(*, booking, user):
             raise ValidationError({"plot": "Only a held or booked plot can have its booking confirmed."})
         locked_booking.status = PlotBooking.Status.CONFIRMED
         locked_booking.save(update_fields=["status", "updated_at"])
+        if locked_booking.customer_id:
+            from .customer_services import advance_customer_lifecycle
+            advance_customer_lifecycle(locked_booking.customer, Customer.Status.CONVERTED, reason="Booking confirmed", actor=user)
         if locked_booking.lead.lifecycle_status == "site_visit_completed":
             from leads.views import _record_lead_status_transition
             _record_lead_status_transition(

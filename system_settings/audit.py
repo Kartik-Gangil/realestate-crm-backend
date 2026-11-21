@@ -1,4 +1,4 @@
-SENSITIVE_KEYS = {"password", "temporary_password", "token", "api_key", "secret", "secrets", "authorization", "encrypted_secrets", "smtp_password", "integration_encryption_key", "otp", "otp_code", "id_number", "national_id", "aadhaar", "pan", "file", "file_contents", "content"}
+SENSITIVE_KEYS = {"password", "temporary_password", "token", "api_key", "secret", "secrets", "authorization", "encrypted_secrets", "smtp_password", "integration_encryption_key", "otp", "otp_code", "id_number", "national_id", "aadhaar", "pan", "government_id", "government_id_encrypted", "government_id_hash", "government_id_last4", "file", "file_contents", "content"}
 
 from core.middleware.rate_limit import client_ip
 

@@ -11,7 +11,8 @@ from django.db import transaction
 
 from documents.models import DocumentCategory
 from expenses.models import Expense, ExpenseCategory
-from inventory.models import Block, Payment, PaymentReceipt, PaymentRefund, Plot, PlotBooking, Project
+from inventory.models import Block, Customer, Payment, PaymentReceipt, PaymentRefund, Plot, PlotBooking, Project
+from inventory.customer_services import advance_customer_lifecycle, create_customer
 from leads.models import Lead
 from organizations.models import Organization, OrganizationMembership, Permission, ProjectAssignment
 from organizations.services import ensure_default_roles
@@ -313,6 +314,23 @@ class Command(BaseCommand):
         plot = Plot.objects.filter(organization=organization, project=project).order_by("id").first()
         if plot is None:
             raise CommandError("Extended beta fixtures require at least one demo plot.")
+        customer = Customer.objects.filter(organization=organization, project=project, lead=booked_lead).first()
+        if customer is None:
+            customer = create_customer(
+                organization=organization,
+                project=project,
+                lead=booked_lead,
+                full_name=booked_lead.full_name,
+                phone=booked_lead.phone,
+                email=f"booked.demo.customer@{organization.slug}.invalid",
+                actor=admin,
+            )
+        customer = advance_customer_lifecycle(
+            customer,
+            Customer.Status.CONVERTED,
+            reason="Confirmed browser acceptance booking",
+            actor=admin,
+        )
         plot.status = Plot.Status.BOOKED
         plot.save(update_fields=["status", "updated_at"])
         booking, _ = PlotBooking.objects.update_or_create(
@@ -324,6 +342,7 @@ class Command(BaseCommand):
                 "final_price": Decimal("5000000.00"),
                 "created_by": admin,
                 "notes": "Browser acceptance booked-lead fixture.",
+                "customer": customer,
             },
         )
         payment, _ = Payment.objects.update_or_create(

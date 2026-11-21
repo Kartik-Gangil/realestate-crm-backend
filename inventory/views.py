@@ -22,13 +22,23 @@ from leads.models import Lead, Sitevisit
 from leads.views import _leads_for_access, _site_visits_for_access
 from documents.models import CustomerDocument
 
-from .models import (Agreement, AgreementSignedDocument, Block, Customer, Installment, InstallmentPayment, Payment, PaymentAdjustment,
+from .models import (Agreement, AgreementSignedDocument, Block, Customer, CustomerNote, Installment, InstallmentPayment, Payment, PaymentAdjustment,
     PaymentAdvance, PaymentAllocation, PaymentReceipt, PaymentRefund, Plot, PlotBooking, PlotHold, PlotSelection,
     Possession, Project, RecentlyViewedPlot, Registry, RegistryCharge, RegistryDocument)
 from .serializers import PlotWriteSerializer , BlockWriteSerializer
 from .services import (
     block_plot, bulk_change_plot_status, cancel_plot_booking, change_plot_status,
     confirm_plot_booking, create_idempotent_booking, create_plot_booking, hold_plot, release_plot,
+)
+from .customer_services import (
+    CustomerDuplicateError,
+    advance_customer_lifecycle,
+    create_customer,
+    customer_360_data,
+    customer_queryset_for_access,
+    customer_to_dict,
+    set_customer_status,
+    update_customer_identity,
 )
 from system_settings.audit import log_bulk_audit
 from .phase5_services import (
@@ -1480,8 +1490,163 @@ def managed_payment_adjustment(request, organization_slug, payment_id):
     return Response({"id": adjustment.id, "payment_id": payment.id, "amount": str(adjustment.amount), "reason": adjustment.reason}, status=status.HTTP_201_CREATED)
 
 
-@api_view(["GET"])
-@permission_classes([IsAuthenticated])
+def _require_customer_view(access):
+    if access.is_platform:
+        return
+    role = membership_role_code(access.membership)
+    if role in {"admin", "manager", "telecaller", "site-visit-executive"}:
+        return
+    raise PermissionDenied("This role does not have customer visibility.")
+
+
+def _require_customer_edit(access):
+    if access.is_platform or is_organization_admin(access.membership) or membership_role_code(access.membership) == "manager":
+        return
+    raise PermissionDenied("Only Managers and Admins may edit customers.")
+
+
+def _customer_for_access(access, project, customer_id):
+    _require_customer_view(access)
+    queryset = customer_queryset_for_access(access, project)
+    customer = queryset.filter(pk=customer_id).first()
+    if customer is None:
+        # Legacy payment/site-visit links use the lead id. Resolve that alias
+        # without widening the role/project scope of the customer queryset.
+        customer = queryset.filter(lead_id=customer_id).first()
+    if customer is None:
+        raise Http404
+    return customer
+
+
+def _customer_api_payload(request, access, project):
+    lead = None
+    if request.data.get("lead_id") not in (None, ""):
+        lead = get_object_or_404(Lead.objects.filter(organization=access.organization, project=project), pk=request.data.get("lead_id"))
+    role = membership_role_code(access.membership)
+    if role == "telecaller" and (lead is None or lead.assigned_membership_id != access.membership.id):
+        raise PermissionDenied("Telecallers may only create customers for assigned leads.")
+    return {
+        "organization": access.organization,
+        "project": project,
+        "lead": lead,
+        "full_name": request.data.get("full_name", ""),
+        "phone": request.data.get("phone", ""),
+        "email": request.data.get("email", ""),
+        "address": request.data.get("address", ""),
+        "government_id_type": request.data.get("government_id_type", ""),
+        "government_id": request.data.get("government_id", ""),
+        "actor": request.user,
+    }
+
+
+@crm_endpoint(["GET", "POST"], scope="organization")
+def customer_list(request, organization_slug):
+    access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
+    _require_customer_view(access)
+    if request.method == "POST":
+        try:
+            customer = create_customer(**_customer_api_payload(request, access, project))
+        except (ValidationError, ValueError, TypeError) as error:
+            response = _validation_response(error)
+            if getattr(error, "code", "") == "customer_duplicate":
+                response.status_code = status.HTTP_409_CONFLICT
+            return response
+        return Response(customer_to_dict(customer), status=status.HTTP_201_CREATED)
+    query = customer_queryset_for_access(access, project)
+    if search := request.query_params.get("search"):
+        query = query.filter(
+            Q(full_name__icontains=search)
+            | Q(customer_code__icontains=search)
+            | Q(phone__icontains=search)
+            | Q(email__icontains=search)
+        )
+    if status_value := request.query_params.get("status"):
+        if status_value not in Customer.Status.values:
+            return Response({"status": "Use a valid customer status."}, status=status.HTTP_400_BAD_REQUEST)
+        query = query.filter(status=status_value)
+    count, page, page_size, results = _paginate(query.order_by("full_name", "id"), request.query_params)
+    return Response({
+        "count": count,
+        "next": _page_url(request, page + 1, page_size) if page * page_size < count else None,
+        "previous": _page_url(request, page - 1, page_size) if page > 1 else None,
+        "results": [customer_to_dict(customer) for customer in results],
+    })
+
+
+@crm_endpoint(["GET", "PATCH"], scope="organization")
+def customer_detail(request, organization_slug, customer_id):
+    access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
+    customer = _customer_for_access(access, project, customer_id)
+    if request.method == "GET":
+        return Response(customer_to_dict(customer))
+    _require_customer_edit(access)
+    updates = {}
+    for field in ("full_name", "address"):
+        if field in request.data:
+            updates[field] = str(request.data[field] or "").strip()
+    if "phone" in request.data:
+        from .customer_services import normalize_phone
+        normalized_phone = normalize_phone(request.data.get("phone")) if request.data.get("phone") else ""
+        if request.data.get("phone") and normalized_phone is None:
+            return Response({"phone": "Phone number cannot be normalized."}, status=status.HTTP_400_BAD_REQUEST)
+        updates["phone"] = normalized_phone
+    if "email" in request.data:
+        from .customer_services import normalize_customer_email
+        updates["email"] = normalize_customer_email(request.data.get("email"))
+    identity_changed = any(field in request.data for field in ("phone", "email", "government_id_type", "government_id"))
+    if "status" in request.data:
+        try:
+            customer = set_customer_status(customer, request.data["status"], request.data.get("reason", ""), request.user)
+        except (ValidationError, PermissionDenied) as error:
+            return _validation_response(error) if isinstance(error, ValidationError) else Response({"detail": str(error)}, status=403)
+    if updates or identity_changed:
+        if identity_changed:
+            try:
+                update_customer_identity(
+                    customer,
+                    phone=request.data.get("phone") if "phone" in request.data else None,
+                    email=request.data.get("email") if "email" in request.data else None,
+                    government_id_type=request.data.get("government_id_type") if "government_id_type" in request.data else None,
+                    government_id=request.data.get("government_id") if "government_id" in request.data else None,
+                )
+            except (ValidationError, ValueError, TypeError) as error:
+                response = _validation_response(error)
+                if getattr(error, "code", "") == "customer_duplicate":
+                    response.status_code = status.HTTP_409_CONFLICT
+                return response
+        for field, value in updates.items():
+            if field not in {"phone", "email"}:
+                setattr(customer, field, value)
+        if any(field not in {"phone", "email"} for field in updates):
+            customer.save(update_fields=[field for field in updates if field not in {"phone", "email"}] + ["updated_at"])
+    return Response(customer_to_dict(customer))
+
+
+@crm_endpoint(["GET"], scope="organization")
+def customer_360(request, organization_slug, customer_id):
+    access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
+    customer = _customer_for_access(access, project, customer_id)
+    data = customer_360_data(customer)
+    data["totals"]["total_paid"] = str(data["totals"]["total_paid"])
+    data["totals"]["outstanding"] = str(data["totals"]["outstanding"])
+    return Response(data)
+
+
+@crm_endpoint(["POST"], scope="organization")
+def customer_notes(request, organization_slug, customer_id):
+    access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
+    customer = _customer_for_access(access, project, customer_id)
+    note_text = str(request.data.get("note_text", "")).strip()
+    if not note_text:
+        return Response({"note_text": "This field is required."}, status=status.HTTP_400_BAD_REQUEST)
+    note = CustomerNote.objects.create(customer=customer, author=request.user, note_text=note_text)
+    return Response({"id": note.id, "customer_id": note.customer_id, "author_id": note.author_id, "note_text": note.note_text, "created_at": note.created_at.isoformat()}, status=status.HTTP_201_CREATED)
+
+
 def customer_payment_history(request, organization_slug, customer_id):
     access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_permission(access, "payments.view")
     get_object_or_404(_leads_for_access(access, project), pk=customer_id)

@@ -805,6 +805,196 @@
         "x-permissions": {}
       }
     },
+    "/api/v1/organizations/{organization_slug}/customers/": {
+      "get": {
+        "operationId": "get_api_v1_organizations_organization_slug_customers",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "organization_slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "Successful response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-crm-scope": "organization",
+        "x-permissions": {}
+      },
+      "post": {
+        "operationId": "post_api_v1_organizations_organization_slug_customers",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "organization_slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "Successful response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-crm-scope": "organization",
+        "x-permissions": {}
+      }
+    },
+    "/api/v1/organizations/{organization_slug}/customers/{customer_id}/": {
+      "get": {
+        "operationId": "get_api_v1_organizations_organization_slug_customers_customer_id",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "organization_slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "customer_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "Successful response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-crm-scope": "organization",
+        "x-permissions": {}
+      },
+      "patch": {
+        "operationId": "patch_api_v1_organizations_organization_slug_customers_customer_id",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "organization_slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "customer_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "Successful response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-crm-scope": "organization",
+        "x-permissions": {}
+      }
+    },
+    "/api/v1/organizations/{organization_slug}/customers/{customer_id}/360/": {
+      "get": {
+        "operationId": "get_api_v1_organizations_organization_slug_customers_customer_id_360",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "organization_slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "customer_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "Successful response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-crm-scope": "organization",
+        "x-permissions": {}
+      }
+    },
     "/api/v1/organizations/{organization_slug}/customers/{customer_id}/document-requirements/": {
       "get": {
         "operationId": "get_api_v1_organizations_organization_slug_customers_customer_id_document-requirements",
@@ -984,6 +1174,48 @@
             "description": "Successful response"
           }
         }
+      }
+    },
+    "/api/v1/organizations/{organization_slug}/customers/{customer_id}/notes/": {
+      "post": {
+        "operationId": "post_api_v1_organizations_organization_slug_customers_customer_id_notes",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "organization_slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "customer_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "Successful response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-crm-scope": "organization",
+        "x-permissions": {}
       }
     },
     "/api/v1/organizations/{organization_slug}/customers/{customer_id}/payment-ledger/": {

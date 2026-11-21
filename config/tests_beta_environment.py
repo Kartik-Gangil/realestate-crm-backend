@@ -17,7 +17,7 @@ from django.test import SimpleTestCase, TestCase, override_settings
 from core.crypto import decode_file_key
 from documents.models import DocumentCategory
 from expenses.models import Expense, ExpenseCategory
-from inventory.models import Payment, PaymentRefund, Plot, PlotBooking, Project
+from inventory.models import Customer, Payment, PaymentRefund, Plot, PlotBooking, Project
 from leads.models import Lead
 from organizations.models import Organization, OrganizationMembership, OrganizationRole, Permission
 from system_settings.models import IntegrationConfiguration, MasterData
@@ -386,6 +386,7 @@ class BetaSeedCommandTests(TestCase):
         project = Project.objects.get(organization=organization, code="DEMO3")
         booked_lead = Lead.objects.get(organization=organization, email="booked.demo.invalid")
         booking = PlotBooking.objects.get(organization=organization, lead=booked_lead, status=PlotBooking.Status.CONFIRMED)
+        self.assertTrue(Customer.objects.filter(organization=organization, project=project, lead=booked_lead, full_name="Booked Demo Customer").exists())
         payment = Payment.objects.get(organization=organization, booking=booking, status=Payment.Status.SUCCESS)
         self.assertFalse(PaymentRefund.objects.filter(organization=organization, payment=payment).exists())
 

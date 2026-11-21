@@ -181,6 +181,18 @@ def confirm_payment(*, payment, user, initial_booking=False):
         for allocation in allocations:
             if allocation.installment: refresh_installment_status(allocation.installment)
         _refresh_booking_paid_amounts(payment)
+        from .customer_services import advance_customer_lifecycle
+        booking_ids = {allocation.booking_id for allocation in allocations}
+        if payment.booking_id:
+            booking_ids.add(payment.booking_id)
+        for booking in PlotBooking.objects.filter(pk__in=booking_ids).select_related("customer"):
+            if booking.customer_id:
+                advance_customer_lifecycle(
+                    booking.customer,
+                    booking.customer.Status.ENGAGED,
+                    reason="First recorded payment",
+                    actor=user,
+                )
         return payment
 
 

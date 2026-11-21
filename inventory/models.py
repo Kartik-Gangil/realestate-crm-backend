@@ -216,28 +216,108 @@ class PlotHold(models.Model):
         return f"{self.plot} - {self.get_action_type_display()}"
 
 
+class ImmutableCustomerQuerySet(models.QuerySet):
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Customer records are never hard-deleted; mark them Inactive or Blacklisted.")
+
+
 class Customer(models.Model):
-    """Minimal Phase 9 customer projection; Customer 360 remains Phase 10."""
+    """Phase 10 Customer 360 record."""
+
+    class Status(models.TextChoices):
+        NEW = "new", "New"
+        ACTIVE = "active", "Active"
+        ENGAGED = "engaged", "Engaged"
+        CONVERTED = "converted", "Converted"
+        INACTIVE = "inactive", "Inactive"
+        BLACKLISTED = "blacklisted", "Blacklisted"
+
+    class GovernmentIdType(models.TextChoices):
+        AADHAAR = "aadhaar", "Aadhaar"
+        PAN = "pan", "PAN"
 
     organization = models.ForeignKey("organizations.Organization", on_delete=models.CASCADE, related_name="inventory_customers")
     project = models.ForeignKey(Project, on_delete=models.PROTECT, related_name="customers")
-    lead = models.ForeignKey("leads.Lead", on_delete=models.PROTECT, related_name="customer_records")
+    lead = models.ForeignKey("leads.Lead", null=True, blank=True, on_delete=models.PROTECT, related_name="customer_records")
     customer_code = models.CharField(max_length=64)
     full_name = models.CharField(max_length=255)
     phone = models.CharField(max_length=64, blank=True)
     email = models.EmailField(blank=True)
     address = models.TextField(blank=True)
-    status = models.CharField(max_length=24, default="active")
+    status = models.CharField(max_length=24, choices=Status.choices, default=Status.NEW)
+    lifecycle_reason = models.TextField(blank=True)
+    lifecycle_changed_at = models.DateTimeField(null=True, blank=True)
+    lifecycle_changed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="customer_lifecycle_changes",
+    )
+    government_id_type = models.CharField(max_length=16, choices=GovernmentIdType.choices, blank=True)
+    government_id_encrypted = models.TextField(blank=True)
+    government_id_hash = models.CharField(max_length=64, blank=True)
+    government_id_last4 = models.CharField(max_length=4, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = ImmutableCustomerQuerySet.as_manager()
 
     class Meta:
         constraints = [
             models.UniqueConstraint(fields=["project", "customer_code"], name="inventory_customer_project_code_unique"),
+            models.UniqueConstraint(
+                fields=["project", "phone"], condition=~Q(phone=""),
+                name="inventory_customer_project_phone_unique",
+            ),
+            models.UniqueConstraint(
+                fields=["project", "email"], condition=~Q(email=""),
+                name="inventory_customer_project_email_unique",
+            ),
+            models.UniqueConstraint(
+                fields=["project", "government_id_hash"], condition=~Q(government_id_hash=""),
+                name="inventory_customer_project_id_hash_unique",
+            ),
         ]
         indexes = [models.Index(fields=["organization", "project", "lead"])]
 
     def __str__(self):
         return f"{self.customer_code} - {self.full_name}"
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Customer records are never hard-deleted; mark them Inactive or Blacklisted.")
+
+    def identity_hash(self, value):
+        from .customer_services import government_id_hash
+        return government_id_hash(value)
+
+
+class ImmutableCustomerNoteQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise ValidationError("Customer notes are immutable and cannot be updated.")
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Customer notes are immutable and cannot be deleted.")
+
+
+class CustomerNote(models.Model):
+    customer = models.ForeignKey(Customer, on_delete=models.PROTECT, related_name="notes")
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="customer_notes",
+    )
+    note_text = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = ImmutableCustomerNoteQuerySet.as_manager()
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise ValidationError("Customer notes are immutable and cannot be updated.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Customer notes are immutable and cannot be deleted.")
+
+    class Meta:
+        ordering = ["created_at", "id"]
 
 
 class CustomerCodeSequence(models.Model):
