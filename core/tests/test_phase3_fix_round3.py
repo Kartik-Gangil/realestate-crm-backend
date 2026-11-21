@@ -84,14 +84,14 @@ class Phase3AuditApiBase(TestCase):
         )
         return block, plot, lead, booking
 
-    def expense_fixture(self, *, status=Expense.Status.DRAFT):
+    def expense_fixture(self, *, status=Expense.Status.DRAFT, submitted_by=None):
         category, _created = ExpenseCategory.objects.get_or_create(
             organization=self.organization, project=self.project, name="Travel",
             defaults={"description": "Round three category"},
         )
         expense = Expense.objects.create(
             organization=self.organization, project=self.project,
-            submitted_by=self.user, category=category, amount=Decimal("125.00"),
+            submitted_by=submitted_by or self.user, category=category, amount=Decimal("125.00"),
             description="Round three expense", status=status,
         )
         return category, expense
@@ -346,7 +346,8 @@ class Phase3PerAppAuditApiTests(Phase3AuditApiBase):
         )
 
     def test_gnfr_07_expense_approve_and_reject_have_semantic_actions(self):
-        _category, approved = self.expense_fixture(status=Expense.Status.PENDING_APPROVAL)
+        submitter = make_member(self.organization, role="telecaller", projects=[self.project])
+        _category, approved = self.expense_fixture(status=Expense.Status.PENDING_APPROVAL, submitted_by=submitter.user)
         ApprovalStep.objects.create(expense=approved, step_name="Manager Review")
         response = self.client.post(
             f"/api/v1/expenses/{approved.pk}/approve/", {}, format="json", **self.project_headers()
@@ -354,7 +355,7 @@ class Phase3PerAppAuditApiTests(Phase3AuditApiBase):
         self.assertEqual(response.status_code, 200, response.data)
         self.assertEqual(self.audit_rows(target_type="Expense", target_id=approved.pk, action="approve").count(), 1)
 
-        _category, rejected = self.expense_fixture(status=Expense.Status.PENDING_APPROVAL)
+        _category, rejected = self.expense_fixture(status=Expense.Status.PENDING_APPROVAL, submitted_by=submitter.user)
         ApprovalStep.objects.create(expense=rejected, step_name="Manager Review")
         response = self.client.post(
             f"/api/v1/expenses/{rejected.pk}/reject/", {"reason": "Round three test"},

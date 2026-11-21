@@ -66,7 +66,16 @@ class Command(BaseCommand):
             self._seed_document_categories(organization)
             roles = ensure_default_roles(organization)
             self._ensure_manager_site_visit_permissions(roles["manager"])
+            self._ensure_employee_phase15_phase16_permissions(roles["telecaller"])
             memberships, new_passwords = self._seed_users(organization, project, roles)
+            membership_by_code = {
+                code: membership for (code, _label), membership in zip(DEMO_ROLES, memberships)
+            }
+            employee = membership_by_code["telecaller"]
+            manager = membership_by_code["manager"]
+            if employee.reporting_manager_id != manager.id:
+                employee.reporting_manager = manager
+                employee.save(update_fields=["reporting_manager"])
             self._seed_plots(organization, project, created_by=memberships[3].user)
             self._seed_leads(organization, project)
             self._seed_parameters(organization, project)
@@ -148,6 +157,17 @@ class Command(BaseCommand):
         permissions = Permission.objects.filter(
             module="site_visits", action__in=["view", "add", "edit"]
         ) | Permission.objects.filter(module="telecalling", action="view")
+        role.permissions.add(*permissions)
+
+    @staticmethod
+    def _ensure_employee_phase15_phase16_permissions(role):
+        permissions = Permission.objects.filter(
+            module="attendance", action__in=["view", "add", "edit"]
+        ) | Permission.objects.filter(
+            module="leave", action__in=["view", "add", "edit"]
+        ) | Permission.objects.filter(
+            module="expenses", action__in=["view", "view_own", "edit_own", "submit"]
+        )
         role.permissions.add(*permissions)
 
     @staticmethod

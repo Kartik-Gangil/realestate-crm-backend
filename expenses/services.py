@@ -73,6 +73,8 @@ def can_edit(user, expense):
 def can_approve(user, expense):
     if not expense or expense.is_deleted or expense.status != Expense.Status.PENDING_APPROVAL:
         return False
+    if expense.submitted_by_id == getattr(user, "id", None):
+        return False
     if not _has_any(user, expense.organization, EXPENSE_PERMISSIONS["approve"], project=expense.project):
         return False
     if is_platform_admin(user):

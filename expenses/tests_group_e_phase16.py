@@ -83,6 +83,21 @@ class GroupEPhase16Tests(TestCase):
         )
         self.assertEqual(second.status_code, 409, second.data)
 
+    def test_fr_p16_06_submitter_cannot_approve_own_expense_claim(self):
+        permission, _ = Permission.objects.get_or_create(
+            module="expenses", action="approve", defaults={"name": "Approve expenses"}
+        )
+        self.employee_membership.organization_role.permissions.add(permission)
+        expense = self.create_expense(status=Expense.Status.PENDING_APPROVAL)
+
+        response = self.employee_client.post(
+            f"{self.url(expense.id)}approve/", {}, format="json", **self.headers()
+        )
+
+        self.assertEqual(response.status_code, 403, response.data)
+        expense.refresh_from_db()
+        self.assertEqual(expense.status, Expense.Status.PENDING_APPROVAL)
+
     def test_fr_p16_06_wrong_role_cannot_reimburse_and_one_locked_transaction_records_actor(self):
         expense = self.create_expense(status=Expense.Status.APPROVED)
         denied = self.employee_client.post(

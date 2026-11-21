@@ -152,6 +152,7 @@ class GroupEPhase15Tests(TestCase):
         self.assertEqual(approved.status_code, 200, approved.data)
         balance.refresh_from_db()
         self.assertEqual(balance.used_days, 2)
+        self.assertEqual(balance.remaining_days, 8)
         duplicate = self.manager_client.post(f"{self.leave_url()}{leave.id}/approve/", {}, format="json")
         self.assertEqual(duplicate.status_code, 400, duplicate.data)
         self.employee_client.post(f"{self.leave_url()}{leave.id}/cancel/", {}, format="json")

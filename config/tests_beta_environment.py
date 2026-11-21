@@ -296,6 +296,31 @@ class BetaSeedCommandTests(TestCase):
         self.assertIn("accounts=", credentials)
 
     @override_settings(INTEGRATION_ENCRYPTION_KEY=Fernet.generate_key().decode())
+    def test_seed_links_demo_employee_to_manager_for_phase15_and_grants_employee_expense_flow(self):
+        password_root = Path(__file__).resolve().parents[1]
+        password_file = password_root / "crm-beta-demo-passwords.txt"
+        password_file.unlink(missing_ok=True)
+        try:
+            with patch("inventory.management.commands.seed_beta_demo.Path.home", return_value=password_root):
+                management.call_command("seed_beta_demo", organization="demo-beta-phase15-16", project="DEMO", stdout=StringIO())
+
+            employee = OrganizationMembership.objects.get(
+                organization__slug="demo-beta-phase15-16",
+                user__username="telecaller@demo-beta-phase15-16.invalid",
+            )
+            manager = OrganizationMembership.objects.get(
+                organization__slug="demo-beta-phase15-16",
+                user__username="manager@demo-beta-phase15-16.invalid",
+            )
+            self.assertEqual(employee.reporting_manager_id, manager.id)
+            self.assertTrue(employee.organization_role.permissions.filter(module="expenses", action="view_own").exists())
+            self.assertTrue(employee.organization_role.permissions.filter(module="expenses", action="view").exists())
+            self.assertTrue(employee.organization_role.permissions.filter(module="expenses", action="edit_own").exists())
+            self.assertTrue(employee.organization_role.permissions.filter(module="expenses", action="submit").exists())
+        finally:
+            password_file.unlink(missing_ok=True)
+
+    @override_settings(INTEGRATION_ENCRYPTION_KEY=Fernet.generate_key().decode())
     def test_seed_creates_customer_document_categories_for_beta_flow(self):
         password_root = Path(__file__).resolve().parents[1]
         password_file = password_root / "crm-beta-demo-passwords.txt"
