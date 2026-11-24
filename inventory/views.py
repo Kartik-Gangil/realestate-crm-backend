@@ -476,8 +476,13 @@ def block_list(request, organization_slug):
             _reject_protected_payload_fields(request.data)
         except ValidationError as error:
             return _validation_response(error)
+        payload = request.data.copy()
+        requested_project = payload.get("project")
+        if requested_project not in (None, "") and str(requested_project) != str(project.id):
+            return _validation_response(ValidationError({"project": "Project must match X-Project-ID."}))
+        payload["project"] = project.id
         serializer = BlockWriteSerializer(
-            data=request.data, context={"organization": access.organization, "request": request}
+            data=payload, context={"organization": access.organization, "request": request}
         )
         serializer.is_valid(raise_exception=True)
         block = serializer.save()

@@ -138,6 +138,18 @@ class GroupEPhase15Tests(TestCase):
         self.assertEqual(insufficient.status_code, 400, insufficient.data)
         self.assertEqual(LeaveRequest.objects.count(), before)
 
+    def test_uat_d05_leave_without_employee_uses_authenticated_manager_membership(self):
+        response = self.manager_client.post(
+            self.leave_url(),
+            {"leave_type": "paid", "from_date": "2026-02-16", "to_date": "2026-02-17", "reason": "Manager leave"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        leave = LeaveRequest.objects.get(pk=response.data["id"])
+        self.assertEqual(leave.employee_id, self.manager_membership.id)
+        self.assertEqual(response.data["employee"]["id"], self.manager_membership.id)
+
     def test_fr_p15_06_only_reporting_manager_or_hr_admin_can_approve_and_cancel_restores_balance(self):
         leave = LeaveRequest.objects.create(
             organization=self.organization,

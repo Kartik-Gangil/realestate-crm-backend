@@ -127,6 +127,21 @@ class ProjectContextApiTests(TestCase):
             self.project_a.id,
         )
 
+    def test_uat_d02_block_create_assigns_active_project(self):
+        """FR-P8-01/FR-P8-03/API-P8-03 [UAT-D02]: block creation uses project context."""
+        url = "/api/organizations/scoped-org/inventory/blocks/"
+        response = self.client.post(
+            url,
+            {"name": "UAT Test Block", "code": "UAT"},
+            format="json",
+            HTTP_X_PROJECT_ID=str(self.project_a.id),
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["project"]["id"], self.project_a.id)
+        block = Block.objects.get(organization=self.organization, code="UAT")
+        self.assertEqual(block.project_id, self.project_a.id)
+
     def test_lead_list_requires_project_header_and_returns_only_active_project(self):
         url = "/api/organizations/scoped-org/leads/"
 
