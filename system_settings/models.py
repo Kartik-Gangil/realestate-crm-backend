@@ -9,6 +9,7 @@ class OrganizationSettings(models.Model):
     organization = models.OneToOneField(Organization, on_delete=models.CASCADE, related_name="settings")
     company_name = models.CharField(max_length=150, blank=True)
     company_logo = models.FileField(upload_to="organization_logos/%Y/%m/", null=True, blank=True)
+    support_email = models.CharField(max_length=254, blank=True)
     date_format = models.CharField(max_length=32, default="DD/MM/YYYY")
     timezone = models.CharField(max_length=64, default="Asia/Kolkata")
     currency = models.CharField(max_length=3, default="INR")

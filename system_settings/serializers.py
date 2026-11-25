@@ -1,6 +1,8 @@
 import json
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from django.core.validators import validate_email
+from django.core.exceptions import ValidationError
 from rest_framework import serializers
 from .models import AuditLog, BackupRecord, IntegrationConfiguration, MasterData, MasterDataCategory, OrganizationSettings, SystemParameter
 from .parameters import GENERAL_SETTINGS_CHOICES, PARAMETER_REGISTRY
@@ -9,13 +11,27 @@ from core.files import validate_image_upload
 
 
 class OrganizationSettingsSerializer(serializers.ModelSerializer):
+    support_email = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
+
     class Meta:
         model = OrganizationSettings
-        fields = ("company_name", "company_logo", "date_format", "timezone", "currency", "items_per_page", "updated_at")
+        fields = ("company_name", "company_logo", "support_email", "date_format", "timezone", "currency", "items_per_page", "updated_at")
         read_only_fields = ("updated_at",)
     def validate_company_logo(self, value):
         if value:
             validate_image_upload(value)
+        return value
+
+    def validate_support_email(self, value):
+        value = value.strip().lower()
+        if not value:
+            return ""
+        if len(value) > 254:
+            raise serializers.ValidationError("Enter a valid support email address.")
+        try:
+            validate_email(value)
+        except ValidationError as error:
+            raise serializers.ValidationError("Enter a valid support email address.") from error
         return value
 
     def to_representation(self, instance):
