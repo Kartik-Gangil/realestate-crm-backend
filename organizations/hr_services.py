@@ -76,6 +76,21 @@ def leave_days(organization, from_date, to_date):
                if (day := from_date + timedelta(days=offset)).weekday() < 6 and day not in holidays)
 
 
+def validate_leave_date_range(from_date, to_date, today=None):
+    today = today or timezone.localdate()
+    errors = {}
+    if to_date < from_date:
+        errors["to_date"] = "To date cannot precede from date."
+    if from_date < today - timedelta(days=30):
+        errors["from_date"] = "From date cannot be more than 30 days in the past."
+    if to_date > today + timedelta(days=365):
+        errors["to_date"] = "To date cannot be more than 365 days in the future."
+    if from_date.year != to_date.year:
+        errors["date_range"] = "Leave request must stay within one calendar year."
+    if errors:
+        raise ValidationError(errors)
+
+
 LEAVE_PARAMETER_KEYS = {
     LeaveRequest.LeaveType.CASUAL: "leave_casual_days_per_year",
     LeaveRequest.LeaveType.SICK: "leave_sick_days_per_year",

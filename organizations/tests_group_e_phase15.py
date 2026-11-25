@@ -1,4 +1,4 @@
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from io import StringIO
 
 from django.core.management import call_command
@@ -51,6 +51,7 @@ class GroupEPhase15Tests(TestCase):
         self.employee_client.force_authenticate(self.employee)
         self.manager_client.force_authenticate(self.manager)
         self.hr_client.force_authenticate(self.hr_admin)
+        self.leave_start = timezone.localdate() + timedelta(days=1)
 
         # The employee is allowed to use the own-record attendance/leave APIs.
         permissions = []
@@ -109,15 +110,15 @@ class GroupEPhase15Tests(TestCase):
     def test_fr_p15_03_first_leave_use_creates_balance_and_overlap_or_insufficient_balance_creates_no_row(self):
         response = self.employee_client.post(
             self.leave_url(),
-            {"leave_type": "paid", "from_date": "2026-02-02", "to_date": "2026-02-03", "reason": "Family work"},
+            {"leave_type": "paid", "from_date": self.leave_start.isoformat(), "to_date": (self.leave_start + timedelta(days=1)).isoformat(), "reason": "Family work"},
             format="json",
         )
         self.assertEqual(response.status_code, 201, response.data)
-        self.assertTrue(LeaveBalance.objects.filter(employee=self.employee_membership, year=2026, leave_type="paid").exists())
+        self.assertTrue(LeaveBalance.objects.filter(employee=self.employee_membership, year=self.leave_start.year, leave_type="paid").exists())
         before = LeaveRequest.objects.count()
         overlap = self.employee_client.post(
             self.leave_url(),
-            {"leave_type": "paid", "from_date": "2026-02-03", "to_date": "2026-02-04", "reason": "Overlap"},
+            {"leave_type": "paid", "from_date": (self.leave_start + timedelta(days=1)).isoformat(), "to_date": (self.leave_start + timedelta(days=2)).isoformat(), "reason": "Overlap"},
             format="json",
         )
         self.assertEqual(overlap.status_code, 400, overlap.data)
@@ -126,13 +127,13 @@ class GroupEPhase15Tests(TestCase):
             organization=self.organization,
             employee=self.employee_membership,
             leave_type="casual",
-            year=2026,
+            year=self.leave_start.year,
         )
         balance.allocated_days = 1
         balance.save(update_fields=["allocated_days"])
         insufficient = self.employee_client.post(
             self.leave_url(),
-            {"leave_type": "casual", "from_date": "2026-02-09", "to_date": "2026-02-10", "reason": "Too long"},
+            {"leave_type": "casual", "from_date": (self.leave_start + timedelta(days=8)).isoformat(), "to_date": (self.leave_start + timedelta(days=9)).isoformat(), "reason": "Too long"},
             format="json",
         )
         self.assertEqual(insufficient.status_code, 400, insufficient.data)
@@ -141,7 +142,7 @@ class GroupEPhase15Tests(TestCase):
     def test_uat_d05_leave_without_employee_uses_authenticated_manager_membership(self):
         response = self.manager_client.post(
             self.leave_url(),
-            {"leave_type": "paid", "from_date": "2026-02-16", "to_date": "2026-02-17", "reason": "Manager leave"},
+            {"leave_type": "paid", "from_date": self.leave_start.isoformat(), "to_date": (self.leave_start + timedelta(days=1)).isoformat(), "reason": "Manager leave"},
             format="json",
         )
 

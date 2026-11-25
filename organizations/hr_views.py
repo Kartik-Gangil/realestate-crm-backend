@@ -10,7 +10,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from .employee_views import _employees_for_access, _page_url, _paginate, _validation_response
-from .hr_services import cancel_leave, check_in, check_out, decide_leave, ensure_leave_balance, leave_days, log_activity
+from .hr_services import (cancel_leave, check_in, check_out, decide_leave, ensure_leave_balance,
+                          leave_days, log_activity, validate_leave_date_range)
 from .models import (AttendanceRecord, LeaveRequest, OrganizationHoliday, OrganizationMembership,
                      OrganizationRole, Permission, PerformanceReview)
 from .services import get_organization_access, has_permission, is_organization_admin
@@ -260,6 +261,7 @@ def leaves(request, organization_slug):
     try:
         from_date, to_date = parse_date(str(request.data["from_date"])), parse_date(str(request.data["to_date"]))
         if not from_date or not to_date: raise ValidationError({"from_date": "Use ISO dates (YYYY-MM-DD)."})
+        validate_leave_date_range(from_date, to_date)
         leave_type = str(request.data["leave_type"]).strip().lower()
         if leave_type == LeaveRequest.LeaveType.EARNED:
             leave_type = LeaveRequest.LeaveType.PAID
@@ -332,9 +334,19 @@ def leave_detail(request, organization_slug, leave_id):
     if request.method == "GET": return Response(_leave(leave))
     if leave.employee_id != getattr(access.membership, "id", None) or leave.status != LeaveRequest.Status.PENDING: raise PermissionDenied("Only the requesting employee may edit a pending leave request.")
     if any(key in request.data for key in ("status", "days", "approved_by", "approved_at")): return Response({"detail": "Workflow and calculated fields are server controlled."}, status=400)
-    for key in ("leave_type", "from_date", "to_date", "reason"):
-        if key in request.data: setattr(leave, key, request.data[key])
-    leave.days = leave_days(access.organization, leave.from_date, leave.to_date); leave.full_clean(); leave.save()
+    if "leave_type" in request.data: leave.leave_type = request.data["leave_type"]
+    if "from_date" in request.data: leave.from_date = parse_date(str(request.data["from_date"]))
+    if "to_date" in request.data: leave.to_date = parse_date(str(request.data["to_date"]))
+    if "reason" in request.data: leave.reason = request.data["reason"]
+    try:
+        if not leave.from_date or not leave.to_date:
+            raise ValidationError({"from_date": "Use ISO dates (YYYY-MM-DD)."})
+        validate_leave_date_range(leave.from_date, leave.to_date)
+        leave.days = leave_days(access.organization, leave.from_date, leave.to_date)
+        leave.full_clean()
+    except ValidationError as error:
+        return _validation_response(error)
+    leave.save()
     return Response(_leave(leave))
 
 
