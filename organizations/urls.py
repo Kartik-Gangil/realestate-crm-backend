@@ -8,6 +8,7 @@ urlpatterns = [
     path("v1/organizations/<slug:organization_slug>/users/<int:employee_id>/", employee_views.employee_detail, name="v1-user-detail"),
     path("v1/organizations/<slug:organization_slug>/users/<int:employee_id>/activate/", employee_views.employee_activate, name="v1-user-activate"),
     path("v1/organizations/<slug:organization_slug>/users/<int:employee_id>/deactivate/", employee_views.employee_deactivate, name="v1-user-deactivate"),
+    path("v1/organizations/<slug:organization_slug>/users/<int:employee_id>/reset-password/", employee_views.employee_reset_password, name="v1-user-reset-password"),
     path("v1/organizations/<slug:organization_slug>/users/<int:employee_id>/tab-permissions/", employee_views.member_tab_permissions, name="v1-user-tab-permissions"),
     path("platform/admins/", views.platform_admins, name="platform-admins"),
     path("platform/organizations/", views.platform_organizations, name="platform-organizations"),

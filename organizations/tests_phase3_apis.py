@@ -24,12 +24,15 @@ class Phase3ScopedApiContractTests(TestCase):
         self.client = APIClient()
         self.client.force_authenticate(self.user)
 
-    def test_users_get_requires_employees_view(self):
+    def test_users_get_requires_users_manage_after_employee_view(self):
         response = self.client.get(f"/api/v1/organizations/{self.organization.slug}/users/")
         self.assertEqual(response.status_code, 403)
         permission = Permission.objects.get(module="employees", action="view")
         roles = self.membership.organization_role
         roles.permissions.add(permission)
+        response = self.client.get(f"/api/v1/organizations/{self.organization.slug}/users/")
+        self.assertEqual(response.status_code, 403)
+        roles.permissions.add(Permission.objects.get(module="users", action="manage"))
         response = self.client.get(f"/api/v1/organizations/{self.organization.slug}/users/")
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["success"])

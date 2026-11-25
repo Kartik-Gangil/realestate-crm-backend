@@ -81,9 +81,13 @@ def organizations(request):
     return _page(query, request, lambda x, many: __import__('rest_framework').serializers.Serializer(x, many=many)) if False else Response({"count": query.count(), "results": list(query.values("id", "name", "slug", "is_active"))})
 
 
-@crm_endpoint(["GET", "PATCH"], scope="organization", permissions={"GET": "settings.view", "PATCH": "settings.edit"})
+@crm_endpoint(
+    ["GET", "PATCH", "PUT"],
+    scope="organization",
+    permissions={"GET": "settings.view", "PATCH": "settings.edit", "PUT": "settings.edit"},
+)
 def general_settings(request, organization_slug):
-    access = _org_access(request, organization_slug, request.method == "PATCH")
+    access = _org_access(request, organization_slug, request.method in {"PATCH", "PUT"})
     obj, _ = OrganizationSettings.objects.get_or_create(organization=access.organization, defaults={"company_name": access.organization.name})
     if request.method == "GET": return Response(OrganizationSettingsSerializer(obj, context={"request": request}).data)
     serializer = OrganizationSettingsSerializer(obj, data=request.data, partial=True); serializer.is_valid(raise_exception=True)
@@ -152,7 +156,7 @@ def access_matrix(request, organization_slug):
     return Response({"modules": modules, "permissions": [{"code": p.code, "module": p.module, "action": p.action, "name": p.name} for p in catalogue], "roles": [{"id": r.id, "name": r.name, "code": r.code, "modules": {m: {p.action: p in r.permissions.all() for p in catalogue if p.module == m} for m in modules}} for r in roles]})
 
 
-@crm_endpoint(["GET", "POST"], scope="organization", permissions={"GET": "settings.view", "POST": "settings.edit"})
+@crm_endpoint(["GET", "POST"], scope="organization", permissions={"GET": "settings.edit", "POST": "settings.edit"})
 def masters(request, organization_slug, master_type=None):
     access = _org_access(request, organization_slug, request.method == "POST")
     category_code = (master_type or "").replace("-", "_")
@@ -184,7 +188,7 @@ def master_detail(request, organization_slug, master_type, item_id):
     serializer = LegacyMasterDataSerializer(item, data=request.data, partial=True); serializer.is_valid(raise_exception=True); item = serializer.save(); return Response(LegacyMasterDataSerializer(item).data)
 
 
-@crm_endpoint(["GET", "POST"], scope="organization", permissions={"GET": "settings.view", "POST": "settings.edit"})
+@crm_endpoint(["GET", "POST"], scope="organization", permissions={"GET": "settings.edit", "POST": "settings.edit"})
 def integrations(request, organization_slug):
     access = _org_access(request, organization_slug, request.method == "POST")
     if request.method == "GET": return Response(IntegrationSerializer(IntegrationConfiguration.objects.filter(organization=access.organization), many=True).data)
@@ -206,7 +210,7 @@ def integration_detail(request, organization_slug, integration_id):
     return Response(IntegrationSerializer(obj).data)
 
 
-@crm_endpoint(["GET", "POST"], scope="organization", permissions={"GET": "settings.view", "POST": "settings.edit"})
+@crm_endpoint(["GET", "POST"], scope="organization", permissions={"GET": "settings.edit", "POST": "settings.edit"})
 def system_parameters(request, organization_slug):
     access = _org_access(request, organization_slug, request.method == "POST")
     project = None

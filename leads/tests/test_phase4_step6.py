@@ -241,6 +241,8 @@ class Phase4Step6ConnectorTests(TestCase):
             integration_type="meta_ads",
         ).update(last_synced_at=synced_at)
 
+        admin = make_member(self.organization, role="admin")
+        self.client.force_authenticate(admin.user)
         response = self.client.get(
             f"/api/v1/organizations/{self.organization.slug}/settings/integrations/"
         )

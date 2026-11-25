@@ -40,6 +40,15 @@ def _require_employee_management(access, permission="employees.edit"):
         raise PermissionDenied("Only organization admins, managers, and authorized platform users can manage employees.")
 
 
+def _require_users_management(request, access):
+    """Keep user-account administration separate from the employee directory."""
+    path_segments = {segment for segment in request.path.split("/") if segment}
+    if "users" in path_segments and not access.is_platform and not has_permission(
+        access.membership.user, access.organization, "users.manage"
+    ):
+        raise PermissionDenied("User administration requires users.manage.")
+
+
 def _require_role_management(access):
     if not access.is_platform and not has_permission(access.membership.user, access.organization, "role.edit"):
         raise PermissionDenied("Only organization admins and authorized platform users can change employee roles or access scopes.")
@@ -352,6 +361,7 @@ def _assert_role_change_allowed(access, role):
 @crm_endpoint(["GET", "POST"], scope="organization", permissions={"GET": "employees.view", "POST": "employees.add"})
 def employee_list(request, organization_slug):
     access = get_organization_access(request.user, organization_slug)
+    _require_users_management(request, access)
     if request.method == "GET":
         try:
             employees = _filter_employees(_employees_for_access(access), request.query_params, access.organization)
@@ -453,6 +463,7 @@ def employee_list(request, organization_slug):
 @crm_endpoint(["GET", "PATCH", "PUT"], scope="organization", permissions={"GET": "employees.view", "PATCH": "employees.edit", "PUT": "employees.edit"})
 def employee_detail(request, organization_slug, employee_id):
     access = get_organization_access(request.user, organization_slug)
+    _require_users_management(request, access)
     developer_membership = OrganizationMembership.objects.filter(
         pk=employee_id,
         organization=access.organization,
@@ -594,6 +605,7 @@ def employee_photo(request, organization_slug, employee_id):
 
 def _set_employee_active(request, organization_slug, employee_id, active):
     access = get_organization_access(request.user, organization_slug)
+    _require_users_management(request, access)
     _require_employee_management(access)
     _assert_developer_mutation_forbidden(access, employee_id)
     employee = get_object_or_404(_employees_for_access(access), pk=employee_id)
@@ -629,6 +641,7 @@ def employee_deactivate(request, organization_slug, employee_id):
 def employee_reset_password(request, organization_slug, employee_id):
     """An organization admin can email a password-reset link to an employee."""
     access = get_organization_access(request.user, organization_slug)
+    _require_users_management(request, access)
     _require_role_management(access)
     _assert_developer_mutation_forbidden(access, employee_id)
     employee = get_object_or_404(_employees_for_access(access), pk=employee_id)

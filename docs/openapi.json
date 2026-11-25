@@ -8182,7 +8182,8 @@
         "x-crm-scope": "organization",
         "x-permissions": {
           "GET": "settings.view",
-          "PATCH": "settings.edit"
+          "PATCH": "settings.edit",
+          "PUT": "settings.edit"
         }
       },
       "patch": {
@@ -8217,7 +8218,44 @@
         "x-crm-scope": "organization",
         "x-permissions": {
           "GET": "settings.view",
-          "PATCH": "settings.edit"
+          "PATCH": "settings.edit",
+          "PUT": "settings.edit"
+        }
+      },
+      "put": {
+        "operationId": "put_api_v1_organizations_organization_slug_settings_general",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "organization_slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "Successful response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-crm-scope": "organization",
+        "x-permissions": {
+          "GET": "settings.view",
+          "PATCH": "settings.edit",
+          "PUT": "settings.edit"
         }
       }
     },
@@ -8289,7 +8327,7 @@
         ],
         "x-crm-scope": "organization",
         "x-permissions": {
-          "GET": "settings.view",
+          "GET": "settings.edit",
           "POST": "settings.edit"
         }
       },
@@ -8324,7 +8362,7 @@
         ],
         "x-crm-scope": "organization",
         "x-permissions": {
-          "GET": "settings.view",
+          "GET": "settings.edit",
           "POST": "settings.edit"
         }
       }
@@ -8405,7 +8443,7 @@
         ],
         "x-crm-scope": "organization",
         "x-permissions": {
-          "GET": "settings.view",
+          "GET": "settings.edit",
           "POST": "settings.edit"
         }
       },
@@ -8440,7 +8478,7 @@
         ],
         "x-crm-scope": "organization",
         "x-permissions": {
-          "GET": "settings.view",
+          "GET": "settings.edit",
           "POST": "settings.edit"
         }
       }
@@ -8485,7 +8523,7 @@
         ],
         "x-crm-scope": "organization",
         "x-permissions": {
-          "GET": "settings.view",
+          "GET": "settings.edit",
           "POST": "settings.edit"
         }
       },
@@ -8528,7 +8566,7 @@
         ],
         "x-crm-scope": "organization",
         "x-permissions": {
-          "GET": "settings.view",
+          "GET": "settings.edit",
           "POST": "settings.edit"
         }
       }
@@ -8696,7 +8734,7 @@
         ],
         "x-crm-scope": "organization",
         "x-permissions": {
-          "GET": "settings.view",
+          "GET": "settings.edit",
           "POST": "settings.edit"
         }
       },
@@ -8731,7 +8769,7 @@
         ],
         "x-crm-scope": "organization",
         "x-permissions": {
-          "GET": "settings.view",
+          "GET": "settings.edit",
           "POST": "settings.edit"
         }
       }
@@ -9881,6 +9919,41 @@
         }
       }
     },
+    "/api/v1/organizations/{organization_slug}/users/{employee_id}/reset-password/": {
+      "post": {
+        "operationId": "post_api_v1_organizations_organization_slug_users_employee_id_reset-password",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "organization_slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "employee_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "Successful response"
+          }
+        }
+      }
+    },
     "/api/v1/organizations/{organization_slug}/users/{employee_id}/tab-permissions/": {
       "get": {
         "operationId": "get_api_v1_organizations_organization_slug_users_employee_id_tab-permissions",
@@ -10651,6 +10724,41 @@
     "/api/v1/v1/organizations/{organization_slug}/users/{employee_id}/deactivate/": {
       "post": {
         "operationId": "post_api_v1_v1_organizations_organization_slug_users_employee_id_deactivate",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "organization_slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "employee_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/api/v1/v1/organizations/{organization_slug}/users/{employee_id}/reset-password/": {
+      "post": {
+        "operationId": "post_api_v1_v1_organizations_organization_slug_users_employee_id_reset-password",
         "parameters": [
           {
             "in": "path",

@@ -192,6 +192,7 @@ def ensure_default_roles(organization):
                 action__in=["view", "view_team", "add", "edit", "manage", "approve", "view_compensation"],
             )
         )
+        hr_admin_permissions.extend(Permission.objects.filter(module="users", action="manage"))
         roles["hr-admin"].permissions.set(hr_admin_permissions)
     if created["accounts"]:
         accounts_permissions = list(

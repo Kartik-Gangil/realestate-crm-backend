@@ -110,7 +110,7 @@ class Phase2DynamicBindingTests(TestCase):
         names = [item["name"] for item in response.data["data"]]
         self.assertEqual(names, ["Project copy"])
 
-    def test_non_admin_master_lookup_hides_inactive_items(self):
+    def test_non_admin_cannot_open_master_data_admin_endpoint(self):
         category = MasterDataCategory.objects.get(code="expense_category")
         MasterData.objects.create(organization=self.organization, category=category, code="active", name="Active", is_active=True)
         MasterData.objects.create(organization=self.organization, category=category, code="inactive", name="Inactive", is_active=False)
@@ -118,8 +118,7 @@ class Phase2DynamicBindingTests(TestCase):
 
         response = self.client.get("/api/organizations/dynamic-org/settings/masters/expense-category/")
 
-        self.assertEqual(response.status_code, 200, response.data)
-        self.assertEqual([item["code"] for item in response.data], ["active"])
+        self.assertEqual(response.status_code, 403, response.data)
 
     def test_system_master_data_cannot_be_deleted(self):
         item = MasterData.objects.create(
