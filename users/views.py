@@ -34,6 +34,32 @@ from .security import (
 )
 
 
+class PasswordResetDeliveryError(Exception):
+    """Raised when a password-reset email cannot be delivered."""
+
+
+def send_password_reset_email(user):
+    uid = urlsafe_base64_encode(force_bytes(user.pk))
+    token = default_token_generator.make_token(user)
+    reset_url = f"{settings.PASSWORD_RESET_FRONTEND_URL}?uid={uid}&token={token}"
+    try:
+        sent = send_mail(
+            "Reset your password",
+            f"Use this link to reset your password: {reset_url}",
+            settings.DEFAULT_FROM_EMAIL,
+            [user.email],
+            fail_silently=False,
+        )
+    except Exception as error:
+        raise PasswordResetDeliveryError(
+            "Password reset email could not be sent. Configure email delivery and try again."
+        ) from error
+    if sent != 1:
+        raise PasswordResetDeliveryError(
+            "Password reset email could not be sent. Configure email delivery and try again."
+        )
+
+
 def _auth_response(user, request, created=False):
     token = issue_session(user, request)
     return Response({"token": token.key, "user": {**UserSerializer(user).data, "session_timeout_minutes": get_session_timeout_minutes(user)}}, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
@@ -136,16 +162,16 @@ def forgot_password(request):
     if email:
         user = get_user_model().objects.filter(email__iexact=email, is_active=True).first()
         if user:
-            uid = urlsafe_base64_encode(force_bytes(user.pk))
-            token = default_token_generator.make_token(user)
-            reset_url = f"{settings.PASSWORD_RESET_FRONTEND_URL}?uid={uid}&token={token}"
-            send_mail(
-                "Reset your password",
-                f"Use this link to reset your password: {reset_url}",
-                settings.DEFAULT_FROM_EMAIL,
-                [user.email],
-                fail_silently=False,
-            )
+            try:
+                send_password_reset_email(user)
+            except PasswordResetDeliveryError:
+                return Response(
+                    {
+                        "code": "email_not_configured",
+                        "detail": "Password reset email could not be sent. Configure email delivery and try again.",
+                    },
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
     return Response({"detail": "If an active account uses this email address, a password-reset link has been sent."})
 
 

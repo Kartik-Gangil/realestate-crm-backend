@@ -22,6 +22,7 @@ from core.endpoint import crm_endpoint
 from core.audit_context import reset_audit_signal_suppression, set_audit_action, suppress_audit_signals
 from system_settings.audit import log_audit, log_bulk_audit
 from users.security import is_developer
+from users.views import PasswordResetDeliveryError, send_password_reset_email
 
 
 def _validation_response(error):
@@ -623,20 +624,21 @@ def employee_deactivate(request, organization_slug, employee_id):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def employee_reset_password(request, organization_slug, employee_id):
-    """An organization admin can issue a new temporary password for an employee."""
+    """An organization admin can email a password-reset link to an employee."""
     access = get_organization_access(request.user, organization_slug)
     _require_role_management(access)
     _assert_developer_mutation_forbidden(access, employee_id)
     employee = get_object_or_404(_employees_for_access(access), pk=employee_id)
     _assert_account_level(request, access, employee.user)
-    temporary_password = request.data.get("temporary_password")
-    if not isinstance(temporary_password, str) or len(temporary_password) < 8:
-        return Response({"temporary_password": ["Use at least 8 characters."]}, status=status.HTTP_400_BAD_REQUEST)
-    with transaction.atomic():
-        employee.user.set_password(temporary_password)
-        employee.user.save(update_fields=["password"])
-        _activity(employee=employee, action="employee_password_reset", actor=request.user)
-    return Response(status=status.HTTP_204_NO_CONTENT)
+    try:
+        send_password_reset_email(employee.user)
+    except PasswordResetDeliveryError as error:
+        return Response(
+            {"code": "email_not_configured", "detail": str(error)},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    _activity(employee=employee, action="employee_password_reset", actor=request.user)
+    return Response({"detail": "Password reset link sent."}, status=status.HTTP_200_OK)
 
 
 @api_view(["GET"])

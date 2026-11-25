@@ -310,6 +310,7 @@ class PasswordResetApiTests(TestCase):
 
     @patch("users.views.send_mail")
     def test_forgot_password_sends_a_link_without_exposing_account_data(self, send_mail):
+        send_mail.return_value = 1
         response = self.client.post(reverse("users:forgot-password"), {"email": self.user.email}, format="json")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(send_mail.call_count, 1)
