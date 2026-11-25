@@ -6,6 +6,7 @@ from django.core.exceptions import ValidationError
 from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from rest_framework import status
+from rest_framework.exceptions import AuthenticationFailed
 from rest_framework.response import Response
 
 from core.endpoint import crm_endpoint
@@ -95,6 +96,11 @@ def login(request):
                 "remaining_seconds": int(error.detail.get("remaining_seconds", 1)),
             },
             status=error.status_code,
+        )
+    except AuthenticationFailed as error:
+        return Response(
+            {"detail": str(error.detail), "code": "invalid_credentials"},
+            status=status.HTTP_401_UNAUTHORIZED,
         )
     return _auth_response(serializer.validated_data["user"], request)
 

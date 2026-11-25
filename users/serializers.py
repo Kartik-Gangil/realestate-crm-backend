@@ -1,5 +1,6 @@
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
+from rest_framework.exceptions import AuthenticationFailed
 
 from organizations.services import membership_permission_codes
 
@@ -51,7 +52,7 @@ class LoginSerializer(serializers.Serializer):
         except AccountLocked:
             raise
         except InvalidCredentials:
-            raise serializers.ValidationError({"detail": "Invalid email/phone or password."})
+            raise AuthenticationFailed("Incorrect email or password.", code="invalid_credentials")
         attrs["user"] = user
         return attrs
 
