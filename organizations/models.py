@@ -2,6 +2,7 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models import Q, F
+import re
 TAB_PERMISSIONS = (
     "dashboard", "leads", "assigned_leads", "follow_ups", "telecalling",
     "members", "site-visits", "plots", "payments", "registry", "loans",
@@ -12,6 +13,22 @@ TAB_PERMISSIONS = (
 def default_tab_permissions():
     """Compatibility callable required by the historical tab migration."""
     return list(TAB_PERMISSIONS)
+
+
+def normalize_mobile_number(value):
+    """Return a canonical Indian mobile number or raise for invalid input."""
+    if value is None:
+        return ""
+    compact = re.sub(r"\D", "", str(value).strip())
+    if not compact:
+        return ""
+    if compact.startswith("0") and len(compact) == 11:
+        compact = compact[1:]
+    elif compact.startswith("91") and len(compact) == 12:
+        compact = compact[2:]
+    if len(compact) != 10 or compact[0] not in "6789":
+        raise ValueError("Enter a valid Indian mobile number.")
+    return f"+91{compact}"
 
 
 class Organization(models.Model):
@@ -91,6 +108,11 @@ class OrganizationMembership(models.Model):
                 condition=Q(employee_id__isnull=False),
                 name="unique_organization_employee_id",
             ),
+            models.UniqueConstraint(
+                fields=["organization", "mobile_number"],
+                condition=~Q(mobile_number=""),
+                name="unique_organization_mobile_number",
+            ),
         ]
         indexes = [models.Index(fields=["organization", "role", "is_active"])]
 
@@ -100,6 +122,17 @@ class OrganizationMembership(models.Model):
     def clean(self):
         super().clean()
         errors = {}
+        try:
+            self.mobile_number = normalize_mobile_number(self.mobile_number)
+        except ValueError as error:
+            errors["mobile_number"] = str(error)
+        if self.mobile_number and self.organization_id:
+            duplicate = OrganizationMembership.objects.filter(
+                organization_id=self.organization_id,
+                mobile_number=self.mobile_number,
+            ).exclude(pk=self.pk).exists()
+            if duplicate:
+                errors["mobile_number"] = "An employee with this mobile number already exists in this organization."
         if self.department_id and self.department.organization_id != self.organization_id:
             errors["department"] = "Department must belong to this organization."
         if self.reporting_manager_id:
@@ -113,6 +146,7 @@ class OrganizationMembership(models.Model):
             raise ValidationError(errors)
 
     def save(self, *args, **kwargs):
+        self.mobile_number = normalize_mobile_number(self.mobile_number)
         # Legacy role is compatibility data. New memberships get a canonical role.
         if self.organization_id and not self.organization_role_id:
             role = OrganizationRole.objects.filter(organization_id=self.organization_id, code=self.role).first()

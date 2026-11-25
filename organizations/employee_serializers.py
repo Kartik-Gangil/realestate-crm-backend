@@ -1,7 +1,7 @@
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
-from .models import Department, OrganizationMembership
+from .models import Department, OrganizationMembership, normalize_mobile_number
 from core.files import validate_image_upload
 
 
@@ -49,6 +49,12 @@ class EmployeeCreateSerializer(serializers.Serializer):
     def validate_email(self, value):
         return value.lower()
 
+    def validate_mobile_number(self, value):
+        try:
+            return normalize_mobile_number(value)
+        except ValueError as error:
+            raise serializers.ValidationError(str(error)) from error
+
     def validate(self, attrs):
         organization = self.context["organization"]
         user = get_user_model().objects.filter(email__iexact=attrs["email"]).first()
@@ -56,6 +62,13 @@ class EmployeeCreateSerializer(serializers.Serializer):
             raise serializers.ValidationError({"temporary_password": "This field is required for a new user account."})
         if user and OrganizationMembership.objects.filter(organization=organization, user=user).exists():
             raise serializers.ValidationError({"email": "This user is already an employee in this organization."})
+        mobile_number = attrs.get("mobile_number", "")
+        if mobile_number and OrganizationMembership.objects.filter(
+            organization=organization, mobile_number=mobile_number
+        ).exists():
+            raise serializers.ValidationError(
+                {"mobile_number": "An employee with this mobile number already exists in this organization."}
+            )
         attrs["user"] = user
         return attrs
 
@@ -84,3 +97,21 @@ class EmployeeUpdateSerializer(serializers.Serializer):
     custom_scope_memberships = serializers.ListField(child=serializers.IntegerField(min_value=1), required=False, allow_empty=True)
     custom_scope_departments = serializers.ListField(child=serializers.IntegerField(min_value=1), required=False, allow_empty=True)
     project_ids = serializers.ListField(child=serializers.IntegerField(min_value=1), required=False, allow_empty=True)
+
+    def validate_mobile_number(self, value):
+        try:
+            return normalize_mobile_number(value)
+        except ValueError as error:
+            raise serializers.ValidationError(str(error)) from error
+
+    def validate(self, attrs):
+        mobile_number = attrs.get("mobile_number", "")
+        organization = self.context.get("organization")
+        employee = self.context.get("employee")
+        if mobile_number and organization and OrganizationMembership.objects.filter(
+            organization=organization, mobile_number=mobile_number
+        ).exclude(pk=employee.pk if employee else None).exists():
+            raise serializers.ValidationError(
+                {"mobile_number": "An employee with this mobile number already exists in this organization."}
+            )
+        return attrs

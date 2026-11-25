@@ -471,7 +471,10 @@ def employee_detail(request, organization_slug, employee_id):
         return Response(_employee_to_dict(employee, request, detailed=True))
     _require_employee_management(access)
     _assert_account_level(request, access, employee.user)
-    serializer = EmployeeUpdateSerializer(data=request.data)
+    serializer = EmployeeUpdateSerializer(
+        data=request.data,
+        context={"organization": access.organization, "employee": employee},
+    )
     serializer.is_valid(raise_exception=True)
     data = serializer.validated_data
     if not data:
