@@ -6,7 +6,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from organizations.models import OrganizationMembership, ProjectAssignment
-from organizations.services import has_permission, is_platform_admin
+from organizations.services import has_permission, is_organization_admin, is_platform_admin, membership_role_code
 from .models import ActivityLog, ApprovalStep, Expense, Payment, ReimbursementRequest
 
 
@@ -60,6 +60,26 @@ def can_view(user, expense):
     )
 
 
+def _can_act_on_claim(user, expense):
+    if is_platform_admin(user):
+        return True
+    actor_membership = OrganizationMembership.objects.filter(
+        organization=expense.organization,
+        user=user,
+        is_active=True,
+    ).select_related("organization_role").first()
+    if is_organization_admin(actor_membership):
+        return True
+    if membership_role_code(actor_membership) != "manager":
+        return False
+    submitter_membership = OrganizationMembership.objects.filter(
+        organization=expense.organization,
+        user_id=expense.submitted_by_id,
+        is_active=True,
+    ).only("reporting_manager_id").first()
+    return bool(submitter_membership and submitter_membership.reporting_manager_id == actor_membership.id)
+
+
 def can_edit(user, expense):
     return bool(
         expense
@@ -77,9 +97,7 @@ def can_approve(user, expense):
         return False
     if not _has_any(user, expense.organization, EXPENSE_PERMISSIONS["approve"], project=expense.project):
         return False
-    if is_platform_admin(user):
-        return True
-    return True
+    return _can_act_on_claim(user, expense)
 
 
 def can_reject(user, expense):
@@ -88,6 +106,7 @@ def can_reject(user, expense):
         and not expense.is_deleted
         and expense.status == Expense.Status.PENDING_APPROVAL
         and _has_any(user, expense.organization, EXPENSE_PERMISSIONS["reject"], project=expense.project)
+        and _can_act_on_claim(user, expense)
     )
 
 

@@ -25,6 +25,8 @@ class GroupEPhase16Tests(TestCase):
         self.manager = self.manager_membership.user
         self.admin = self.admin_membership.user
         self.accounts = self.accounts_membership.user
+        self.employee_membership.reporting_manager = self.manager_membership
+        self.employee_membership.save(update_fields=["reporting_manager"])
         self.category = ExpenseCategory.objects.create(organization=self.organization, project=self.project, name="Travel")
         self.employee_client = APIClient()
         self.manager_client = APIClient()
