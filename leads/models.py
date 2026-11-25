@@ -69,7 +69,10 @@ class Lead(models.Model):
     phone = models.CharField(max_length=20)
     alt_phone = models.CharField(max_length=20 , blank=True)
     address = models.CharField(max_length=200 , blank=True)
-    source = models.CharField(max_length=20, choices=Source.choices, default=Source.WEBSITE)
+    # Lead sources are project-scoped Master Data (FR-P2-01 / FR-P4-02 / GNFR-09).
+    # Keep the legacy code column for compatibility, but do not enforce a stale
+    # application-level choice list before the project source is resolved.
+    source = models.CharField(max_length=64, default=Source.WEBSITE)
     source_item = models.ForeignKey("system_settings.MasterData", null=True, blank=True, on_delete=models.PROTECT, related_name="lead_source_items")
     status = models.ForeignKey("system_settings.MasterData", null=True, blank=True, on_delete=models.PROTECT, related_name="lead_status_items")
     lifecycle_status = models.CharField(max_length=32, default="new", null=True, blank=True)
