@@ -137,3 +137,27 @@ def my_tab_permissions(request, slug):
         "role_allowed_tabs": effective_tabs,
         "effective_tab_permissions": effective_tabs,
     })
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def dashboard(request, role):
+    """Organization aggregate dashboard data for admin-level users only."""
+    if role not in {"admin", "super-admin", "super_admin", "platform_admin"}:
+        raise PermissionDenied("Unsupported dashboard role.")
+    organization_slug = request.query_params.get("organization")
+    if not organization_slug:
+        raise PermissionDenied("An organization is required.")
+    access = get_organization_access(request.user, organization_slug)
+    if not access.is_platform and not is_organization_admin(access.membership):
+        raise PermissionDenied("Organization dashboard aggregates require admin access.")
+
+    from inventory.models import Project
+    from inventory.phase5_services import organization_net_settled_revenue
+    from leads.models import Lead
+
+    return Response({
+        "total_revenue": str(organization_net_settled_revenue(access.organization)),
+        "total_leads": Lead.objects.filter(organization=access.organization).count(),
+        "active_projects": Project.objects.filter(organization=access.organization).count(),
+    })

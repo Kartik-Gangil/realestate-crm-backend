@@ -4,6 +4,7 @@ from . import employee_views, hr_views, views
 from core import notification_views
 
 urlpatterns = [
+    path("dashboards/<str:role>/", views.dashboard, name="dashboard-aggregate"),
     path("v1/organizations/<slug:organization_slug>/users/", employee_views.employee_list, name="v1-user-list"),
     path("v1/organizations/<slug:organization_slug>/users/<int:employee_id>/", employee_views.employee_detail, name="v1-user-detail"),
     path("v1/organizations/<slug:organization_slug>/users/<int:employee_id>/activate/", employee_views.employee_activate, name="v1-user-activate"),

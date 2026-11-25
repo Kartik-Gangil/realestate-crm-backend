@@ -41,6 +41,38 @@ def payment_totals(booking):
             "net_paid": net, "outstanding_amount": max((booking.final_price or Decimal("0.00")) - net, Decimal("0.00")) if booking.final_price is not None else None}
 
 
+def organization_net_settled_revenue(organization):
+    """Return settled organization revenue using the same payment ledger rules."""
+    settled = [Payment.Status.SUCCESS, Payment.Status.REFUNDED]
+    gross = _decimal_total(
+        PaymentAllocation.objects.filter(
+            payment__organization=organization, payment__status__in=settled,
+        ).values_list("amount", flat=True)
+    )
+    gross += _decimal_total(
+        PaymentAdvance.objects.filter(
+            payment__organization=organization, payment__status__in=settled,
+        ).values_list("amount", flat=True)
+    )
+    gross += _decimal_total(
+        Payment.objects.filter(
+            organization=organization,
+            payment_allocations__isnull=True,
+            payment_advances__isnull=True,
+            status__in=settled,
+        ).values_list("amount", flat=True)
+    )
+    refunded = _decimal_total(
+        PaymentRefund.objects.filter(
+            organization=organization, status=PaymentRefund.Status.COMPLETED,
+        ).values_list("amount", flat=True)
+    )
+    adjusted = _decimal_total(
+        PaymentAdjustment.objects.filter(payment__organization=organization).values_list("amount", flat=True)
+    )
+    return gross - refunded - adjusted
+
+
 def _payment_transition(payment, new_status):
     allowed = {Payment.Status.PENDING: {Payment.Status.SUCCESS, Payment.Status.FAILED, Payment.Status.CANCELLED},
                Payment.Status.SUCCESS: {Payment.Status.REFUNDED}, Payment.Status.FAILED: set(),
