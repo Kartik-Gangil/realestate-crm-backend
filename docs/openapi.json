@@ -312,6 +312,33 @@
         }
       }
     },
+    "/api/v1/dashboards/{role}/": {
+      "get": {
+        "operationId": "get_api_v1_dashboards_role",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "role",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "Successful response"
+          }
+        }
+      }
+    },
     "/api/v1/expenses/": {
       "get": {
         "operationId": "get_api_v1_expenses",

@@ -139,8 +139,7 @@ def my_tab_permissions(request, slug):
     })
 
 
-@api_view(["GET"])
-@permission_classes([IsAuthenticated])
+@crm_endpoint(["GET"], scope="user")
 def dashboard(request, role):
     """Organization aggregate dashboard data for admin-level users only."""
     if role not in {"admin", "super-admin", "super_admin", "platform_admin"}:

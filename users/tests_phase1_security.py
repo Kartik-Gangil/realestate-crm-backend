@@ -49,7 +49,7 @@ class Phase1AuthenticationSecurityTests(TestCase):
                 {"email": self.user.email, "password": "Wrong123!"},
                 format="json",
             )
-            self.assertEqual(response.status_code, 400, (attempt, response.data))
+            self.assertEqual(response.status_code, 401, (attempt, response.data))
 
         response = self.client.post(
             "/api/v1/auth/login/",

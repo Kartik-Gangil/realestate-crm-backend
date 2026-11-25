@@ -35,6 +35,7 @@ ALLOWED_NAMED_PERMISSION_REQUIREMENTS = {
     "registry.status": "FR-P13-05",
     "site_visits.view_team": "FR-P3-07",
     "telecalling.view_team": "FR-P3-07",
+    "users.manage": "FR-P3-01",
 }
 
 # Owner-approved dry-run delete list. These are non-standard actions only;
