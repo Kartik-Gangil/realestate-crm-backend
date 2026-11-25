@@ -40,6 +40,7 @@ class Bug02AuthorizationTests(TestCase):
         self.assertTrue(self.roles["hr-admin"].permissions.filter(pk=permission.pk).exists())
 
     def test_manager_is_denied_users_routes_but_employee_directory_remains_available(self):
+        """GNFR-05 / FR-P15-06 [UAT-D47]: employees.view is separate from users.manage."""
         self.client.force_authenticate(self.manager.user)
         user_base = self._url("users")
 
@@ -61,7 +62,8 @@ class Bug02AuthorizationTests(TestCase):
             403,
         )
 
-        self.assertEqual(self.client.get(self._url("employees/")).status_code, 200)
+        employee_response = self.client.get(self._url("employees/"))
+        self.assertEqual(employee_response.status_code, 200, employee_response.data)
 
     def test_admin_and_hr_admin_can_read_users(self):
         for member in (self.admin, self.hr_admin):
