@@ -354,9 +354,12 @@ def create_registry(*, booking, **data):
         for code, label, kind, value, amount in calculate_registry_charges(organization=booking.organization, booking=booking, consideration_amount=consideration): RegistryCharge.objects.create(registry=registry, code=code, label=label, calculation_type=kind, calculation_value=value, amount=amount)
         RegistryStatusHistory.objects.create(registry=registry, old_status="", new_status=Registry.Status.PENDING, remarks="Registry created", changed_by=data.get("created_by"))
         return registry
-def transition_registry(*, registry, status, user=None, remarks=""):
+def transition_registry(*, registry, status, user=None, remarks="", registry_number=None):
     with transaction.atomic():
         registry = Registry.objects.select_for_update().select_related("booking__lead", "booking__plot").get(pk=registry.pk)
+        if registry_number is not None:
+            registry.registry_number = str(registry_number).strip()
+            registry.save(update_fields=["registry_number", "updated_at"])
         if status == Registry.Status.COMPLETED:
             if not registry.registry_date: raise ValidationError({"registry_date": "Registry date is required before completion."})
             if payment_totals(registry.booking)["outstanding_amount"] > Decimal("0.00"):

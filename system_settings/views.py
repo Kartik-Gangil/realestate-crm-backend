@@ -57,10 +57,11 @@ def overview(request):
 def organization_overview(request, organization_slug):
     access = _org_access(request, organization_slug)
     organization = access.organization
-    last_general = OrganizationSettings.objects.filter(organization=organization).values_list("updated_at", flat=True).first()
+    organization_settings = OrganizationSettings.objects.filter(organization=organization).first()
     return Response({
         "organization_slug": organization.slug,
-        "general_last_updated": last_general,
+        "general_last_updated": organization_settings.updated_at if organization_settings else None,
+        "timezone": organization_settings.timezone if organization_settings else "Asia/Kolkata",
         "total_users": OrganizationMembership.objects.filter(organization=organization).count(),
         "total_roles": OrganizationRole.objects.filter(organization=organization).count(),
         "total_master_records": MasterData.objects.filter(organization=organization).count(),

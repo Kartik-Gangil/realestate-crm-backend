@@ -1908,7 +1908,7 @@ def managed_registry_detail(request, organization_slug, registry_id):
 def managed_registry_status(request, organization_slug, registry_id):
     access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_permission(access, "registry.status"); item = get_object_or_404(_registry_queryset(access, project), pk=registry_id)
     target = request.data.get("status")
-    try: item = transition_registry(registry=item, status=target, user=request.user, remarks=str(request.data.get("remarks", "")))
+    try: item = transition_registry(registry=item, status=target, user=request.user, remarks=str(request.data.get("remarks", "")), registry_number=request.data.get("registry_number"))
     except ValidationError as error: return _validation_response(error)
     return Response(managed_registry_to_dict(_registry_queryset(access, project).get(pk=item.pk), True))
 

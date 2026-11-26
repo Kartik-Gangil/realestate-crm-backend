@@ -3,6 +3,8 @@ from importlib import import_module
 from types import SimpleNamespace
 
 from django.test import TestCase
+from django.urls import reverse
+from rest_framework.test import APIClient
 
 from core.tests.factories import make_lead, make_member, make_organization, make_project
 from documents.views import _customer as document_customer
@@ -49,6 +51,9 @@ class UatCustomerIdentityTests(TestCase):
             size=Decimal("100"),
             total_price=Decimal("100000.00"),
         )
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+        self.client.defaults["HTTP_X_PROJECT_ID"] = str(self.project.id)
 
     def test_document_customer_lookup_resolves_inventory_customer_lc05_rt01(self):
         access = get_organization_access(self.user, self.organization.slug)
@@ -142,6 +147,34 @@ class UatCustomerIdentityTests(TestCase):
         self.assertEqual(before["registry_id"], f"REG-{registry.pk}")
         self.assertEqual(after["registry_id"], before["registry_id"])
         self.assertEqual(after["registry_number"], "REG-RT-PATCH")
+
+    def test_registry_status_endpoint_persists_registry_number_lc14(self):
+        booking = create_idempotent_booking(
+            organization=self.organization,
+            project=self.project,
+            lead=self.lead,
+            customer=self.customer,
+            plot=self.plot,
+            user=self.user,
+            idempotency_key="uat-registry-status-number",
+            body={"lead_id": self.lead.pk, "customer_id": self.customer.pk, "plot_id": self.plot.pk},
+        )
+        registry = Registry.objects.create(
+            organization=self.organization,
+            booking=booking,
+            created_by=self.user,
+        )
+
+        response = self.client.post(
+            reverse("inventory:managed-registry-status", args=[self.organization.slug, registry.pk]),
+            {"status": "in_process", "registry_number": "REG-R3-001"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        registry.refresh_from_db()
+        self.assertEqual(registry.registry_number, "REG-R3-001")
+        self.assertEqual(response.data["registry_number"], "REG-R3-001")
 
     def test_booking_customer_backfill_uses_historical_lead_fields_lc05_rt01(self):
         migration = import_module("inventory.migrations.0021_backfill_booking_customers")
