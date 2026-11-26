@@ -2,6 +2,14 @@ from django.db import migrations, models
 import django.db.models.deletion
 
 
+def _lead_name(lead):
+    return " ".join(
+        part.strip()
+        for part in (getattr(lead, "first_name", ""), getattr(lead, "last_name", ""))
+        if part and part.strip()
+    )
+
+
 def _customer_for_lead(apps, lead, organization_id):
     Customer = apps.get_model("inventory", "Customer")
     Project = apps.get_model("inventory", "Project")
@@ -30,7 +38,7 @@ def _customer_for_lead(apps, lead, organization_id):
         project_id=project.pk,
         lead_id=lead.pk,
         customer_code=code,
-        full_name=lead.full_name,
+        full_name=_lead_name(lead),
         phone=phone,
         email=email,
         address=lead.address or "",

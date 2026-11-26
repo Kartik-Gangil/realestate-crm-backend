@@ -1,6 +1,14 @@
 from django.db import migrations
 
 
+def _lead_name(lead):
+    return " ".join(
+        part.strip()
+        for part in (getattr(lead, "first_name", ""), getattr(lead, "last_name", ""))
+        if part and part.strip()
+    )
+
+
 def backfill_booking_customers(apps, schema_editor):
     Customer = apps.get_model("inventory", "Customer")
     CustomerCodeSequence = apps.get_model("inventory", "CustomerCodeSequence")
@@ -30,7 +38,7 @@ def backfill_booking_customers(apps, schema_editor):
                 project_id=project.pk,
                 lead_id=lead.pk,
                 customer_code=f"{project.code}-C-{number:06d}",
-                full_name=lead.full_name,
+                full_name=_lead_name(lead),
                 phone=phone,
                 email=email,
                 address=lead.address or "",

@@ -1,4 +1,6 @@
 from decimal import Decimal
+from importlib import import_module
+from types import SimpleNamespace
 
 from django.test import TestCase
 
@@ -140,3 +142,9 @@ class UatCustomerIdentityTests(TestCase):
         self.assertEqual(before["registry_id"], f"REG-{registry.pk}")
         self.assertEqual(after["registry_id"], before["registry_id"])
         self.assertEqual(after["registry_number"], "REG-RT-PATCH")
+
+    def test_booking_customer_backfill_uses_historical_lead_fields_lc05_rt01(self):
+        migration = import_module("inventory.migrations.0021_backfill_booking_customers")
+        historical_lead = SimpleNamespace(first_name="Asha", last_name="Sharma")
+
+        self.assertEqual(migration._lead_name(historical_lead), "Asha Sharma")

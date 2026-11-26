@@ -1,4 +1,6 @@
 from datetime import timedelta
+from types import SimpleNamespace
+from importlib import import_module
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
@@ -29,6 +31,12 @@ class DocumentServiceTests(TestCase):
 
     def upload(self):
         return upload_customer_document(organization=self.org, customer=self.customer, document_category=self.category, document_name="PAN", uploaded_file=SimpleUploadedFile("pan.pdf", b"%PDF-1.4 test", content_type="application/pdf"), user=self.user)
+
+    def test_customer_identity_migration_uses_historical_lead_fields_lc05_rt01(self):
+        migration = import_module("documents.migrations.0003_customer_identity")
+        historical_lead = SimpleNamespace(first_name="Asha", last_name="Sharma")
+
+        self.assertEqual(migration._lead_name(historical_lead), "Asha Sharma")
 
     def test_new_upload_archives_prior_version_and_latest_is_authoritative(self):
         first = self.upload(); first = put_document_under_verification(document=first, user=self.user); first = verify_customer_document(document=first, user=self.user)
