@@ -267,7 +267,7 @@ class GroupBBookingFixTests(TestCase):
         category = DocumentCategory.objects.create(organization=self.organization, name="Identity", code="identity")
         document = CustomerDocument.objects.create(
             organization=self.organization,
-            customer=self.lead,
+            customer=booking.customer,
             document_category=category,
             document_name="Identity",
             file="documents/test.pdf",

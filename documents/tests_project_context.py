@@ -3,7 +3,7 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from rest_framework.test import APIClient
 
-from inventory.models import Project
+from inventory.models import Customer, Project
 from leads.models import Lead
 from organizations.models import Organization, OrganizationMembership
 
@@ -22,14 +22,14 @@ class CustomerDocumentProjectContextTests(TestCase):
         )
         self.project_a = Project.objects.create(organization=self.organization, name="Project A", code="DOC-A")
         self.project_b = Project.objects.create(organization=self.organization, name="Project B", code="DOC-B")
-        self.customer_a = Lead.objects.create(
+        lead_a = Lead.objects.create(
             organization=self.organization,
             project=self.project_a,
             first_name="Customer",
             last_name="A",
             phone="9000000011",
         )
-        self.customer_b = Lead.objects.create(
+        lead_b = Lead.objects.create(
             organization=self.organization,
             project=self.project_b,
             first_name="Customer",
@@ -37,6 +37,8 @@ class CustomerDocumentProjectContextTests(TestCase):
             phone="9000000012",
         )
         category = DocumentCategory.objects.create(organization=self.organization, name="PAN", code="pan")
+        self.customer_a = Customer.objects.create(organization=self.organization, project=self.project_a, lead=lead_a, customer_code="DOC-A-C-000001", full_name="Customer A", phone="9000000011")
+        self.customer_b = Customer.objects.create(organization=self.organization, project=self.project_b, lead=lead_b, customer_code="DOC-B-C-000001", full_name="Customer B", phone="9000000012")
         self.document_a = self._document(self.customer_a, category, "a.pdf")
         self.document_b = self._document(self.customer_b, category, "b.pdf")
         self.client = APIClient()

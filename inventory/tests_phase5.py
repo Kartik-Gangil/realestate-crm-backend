@@ -11,7 +11,7 @@ from leads.models import Lead
 from organizations.models import Organization, OrganizationMembership
 from system_settings.models import MasterData, MasterDataCategory
 
-from .models import Agreement, AgreementSignedDocument, Block, Installment, Payment, PaymentAdvance, PaymentRefund, Plot, PlotBooking, Possession, Project, Registry
+from .models import Agreement, AgreementSignedDocument, Block, Customer, Installment, Payment, PaymentAdvance, PaymentRefund, Plot, PlotBooking, Possession, Project, Registry
 from .phase5_services import (allocate_payment, confirm_payment, create_agreement, create_installment,
     approve_refund, create_payment, create_possession, create_registry, fail_payment, payment_totals, refund_payment,
     transition_agreement, transition_possession, transition_registry)
@@ -25,15 +25,16 @@ class Phase5ServiceTests(TestCase):
         self.project = Project.objects.create(organization=self.org, name="Project", code="PROJECT")
         OrganizationMembership.objects.create(organization=self.org, user=self.user, role=OrganizationMembership.Role.MANAGER)
         for code in ("cash", "upi", "card", "bank_transfer"):
-            MasterData.objects.create(
+            MasterData.objects.get_or_create(
                 organization=self.org, project=self.project, category=MasterDataCategory.objects.get(code="payment_mode"),
-                code=code, name=code.title(),
+                code=code, defaults={"name": code.title()},
             )
         block = Block.objects.create(organization=self.org, project=self.project, name="A", code="A")
         plot = Plot.objects.create(organization=self.org, project=self.project, block=block, plot_number="1", size=Decimal("100"), total_price=Decimal("1000"), status=Plot.Status.BOOKED)
         lead = Lead.objects.create(organization=self.org, project=self.project, first_name="Ada", phone="9000000106")
+        self.customer = Customer.objects.create(organization=self.org, project=self.project, lead=lead, customer_code="PROJECT-C-000001", full_name="Ada", phone="9000000106")
         self.identity_category = DocumentCategory.objects.create(organization=self.org, name="Identity", code="identity")
-        self.booking = PlotBooking.objects.create(organization=self.org, lead=lead, plot=plot, status=PlotBooking.Status.CONFIRMED, final_price=Decimal("1000"), created_by=self.user)
+        self.booking = PlotBooking.objects.create(organization=self.org, project=self.project, customer=self.customer, lead=lead, plot=plot, status=PlotBooking.Status.CONFIRMED, final_price=Decimal("1000"), created_by=self.user)
 
     def test_payment_refund_and_summary(self):
         payment = create_payment(booking=self.booking, amount=Decimal("500"), payment_method=Payment.Method.CASH, transaction_reference="", payment_date=date.today(), notes="", user=self.user)
@@ -106,7 +107,7 @@ class Phase5ServiceTests(TestCase):
 
         data = payment_to_dict(payment)
 
-        self.assertEqual(data["customer"], {"id": self.booking.lead_id, "name": self.booking.lead.full_name, "phone": self.booking.lead.phone})
+        self.assertEqual(data["customer"], {"id": self.booking.customer_id, "name": self.booking.customer.full_name, "phone": self.booking.customer.phone})
         self.assertEqual(data["booking"], {"id": self.booking.id, "plot_number": self.booking.plot.plot_number})
         self.assertEqual(data["plot_number"], self.booking.plot.plot_number)
 
@@ -140,7 +141,7 @@ class Phase5ServiceTests(TestCase):
         with self.assertRaises(ValidationError): transition_agreement(agreement=agreement, status=Agreement.Status.READY)
         CustomerDocument.objects.create(
             organization=self.org,
-            customer=self.booking.lead,
+            customer=self.booking.customer,
             document_category=self.identity_category,
             document_name="Identity",
             file=SimpleUploadedFile("identity.pdf", b"verified identity", content_type="application/pdf"),
@@ -177,7 +178,7 @@ class Phase5ServiceTests(TestCase):
         transition_agreement(agreement=agreement, status=Agreement.Status.SIGNED)
         CustomerDocument.objects.create(
             organization=self.org,
-            customer=self.booking.lead,
+            customer=self.booking.customer,
             document_category=self.identity_category,
             document_name="Identity",
             file=SimpleUploadedFile("identity.pdf", b"verified identity", content_type="application/pdf"),
@@ -223,7 +224,7 @@ class Phase5ServiceTests(TestCase):
         transition_agreement(agreement=agreement, status=Agreement.Status.SIGNED)
         CustomerDocument.objects.create(
             organization=self.org,
-            customer=self.booking.lead,
+            customer=self.booking.customer,
             document_category=self.identity_category,
             document_name="Identity",
             file=SimpleUploadedFile("identity.pdf", b"verified identity", content_type="application/pdf"),

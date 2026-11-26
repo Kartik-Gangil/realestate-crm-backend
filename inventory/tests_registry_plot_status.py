@@ -9,7 +9,7 @@ from documents.models import CustomerDocument, DocumentCategory
 from leads.models import Lead
 from organizations.models import Organization, OrganizationMembership
 
-from .models import Agreement, AgreementSignedDocument, Block, Payment, PaymentAllocation, Plot, PlotBooking, Project, Registry
+from .models import Agreement, AgreementSignedDocument, Block, Customer, Payment, PaymentAllocation, Plot, PlotBooking, Project, Registry
 from .phase5_services import transition_registry
 
 
@@ -45,6 +45,8 @@ class RegistryPlotStatusTests(TestCase):
         )
         booking = PlotBooking.objects.create(
             organization=self.organization,
+            project=project,
+            customer=Customer.objects.create(organization=self.organization, project=project, lead=lead, customer_code="REG-C-000001", full_name="Registry Buyer", phone="9000000001"),
             lead=lead,
             plot=plot,
             status=PlotBooking.Status.CONFIRMED,
@@ -56,7 +58,7 @@ class RegistryPlotStatusTests(TestCase):
         )
         CustomerDocument.objects.create(
             organization=self.organization,
-            customer=lead,
+            customer=booking.customer,
             document_category=identity_category,
             document_name="Identity",
             file=SimpleUploadedFile("identity.pdf", b"verified identity", content_type="application/pdf"),

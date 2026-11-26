@@ -11,7 +11,7 @@ from core.tests.samples import SAMPLE_JPEG, SAMPLE_PDF
 from documents.models import CustomerDocument, DocumentCategory
 from leads.models import Lead
 from organizations.models import Organization, OrganizationMembership
-from .models import Block, Plot, PlotBooking, Project, Registry, RegistryDocument
+from .models import Block, Customer, Plot, PlotBooking, Project, Registry, RegistryDocument
 
 
 class RegistryDocumentDownloadTests(TestCase):
@@ -25,7 +25,8 @@ class RegistryDocumentDownloadTests(TestCase):
         plot = Plot.objects.create(organization=self.organization, project=self.project, block=block, plot_number="A-001",
                                    size=Decimal("100"), total_price=Decimal("100000"), status=Plot.Status.BOOKED)
         self.lead = Lead.objects.create(organization=self.organization, project=self.project, first_name="Buyer", phone="9000000041")
-        booking = PlotBooking.objects.create(organization=self.organization, lead=self.lead, plot=plot,
+        self.customer = Customer.objects.create(organization=self.organization, project=self.project, lead=self.lead, customer_code="RD-A-C-000001", full_name="Buyer", phone="9000000041")
+        booking = PlotBooking.objects.create(organization=self.organization, project=self.project, customer=self.customer, lead=self.lead, plot=plot,
                                              status=PlotBooking.Status.CONFIRMED, final_price=Decimal("100000"))
         self.registry = Registry.objects.create(organization=self.organization, booking=booking, registry_number="REG-D1",
                                                 consideration_amount=Decimal("100000"))
@@ -34,7 +35,7 @@ class RegistryDocumentDownloadTests(TestCase):
                                                         content_type="application/pdf", file_size_bytes=len(SAMPLE_PDF))
         category = DocumentCategory.objects.create(organization=self.organization, name="PAN", code="pan")
         customer_document = CustomerDocument.objects.create(
-            organization=self.organization, customer=self.lead, document_category=category, document_name="PAN",
+            organization=self.organization, customer=self.customer, document_category=category, document_name="PAN",
             file=SimpleUploadedFile("pan.jpg", SAMPLE_JPEG), file_name="pan.jpg", file_size=len(SAMPLE_JPEG),
             content_type="image/jpeg", version=1)
         self.reference = RegistryDocument.objects.create(registry=self.registry, customer_document=customer_document, document_label="PAN")

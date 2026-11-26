@@ -121,7 +121,7 @@ class PlotBookingApiTests(TestCase):
         )
         CustomerDocument.objects.create(
             organization=self.organization,
-            customer=self.lead,
+            customer=booking.customer,
             document_category=category,
             document_name="Identity",
             file=SimpleUploadedFile("identity.pdf", b"verified identity", content_type="application/pdf"),

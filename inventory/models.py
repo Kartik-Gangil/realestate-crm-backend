@@ -5,6 +5,7 @@ from django.db import models
 from django.db.models import Q
 from django.utils import timezone
 from datetime import timedelta
+from decimal import Decimal
 import os
 import uuid
 from django.utils.text import get_valid_filename
@@ -140,6 +141,13 @@ class Plot(models.Model):
             errors["project"] = "Project must match the block project."
         if errors:
             raise ValidationError(errors)
+
+    def save(self, *args, **kwargs):
+        if self.size is not None and self.rate_per_sq_unit is not None:
+            size = Decimal(str(self.size))
+            rate = Decimal(str(self.rate_per_sq_unit))
+            self.total_price = (size * rate).quantize(Decimal("0.01"))
+        return super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.block} / {self.plot_number}"
@@ -722,7 +730,7 @@ class RegistryDocument(models.Model):
         if self.customer_document_id:
             if self.customer_document.organization_id != self.registry.organization_id:
                 raise ValidationError({"customer_document": "Document must belong to this organization."})
-            if self.customer_document.customer_id != self.registry.booking.lead_id:
+            if self.customer_document.customer_id != self.registry.booking.customer_id:
                 raise ValidationError({"customer_document": "Document must belong to the registry buyer."})
         if not self.file and not self.customer_document_id:
             raise ValidationError({"file": "Attach a file or an existing customer document."})

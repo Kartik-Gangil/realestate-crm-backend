@@ -95,8 +95,14 @@ def create_plot_booking(*, organization, lead, plot, site_visit, notes, user):
             status__in=[PlotBooking.Status.PENDING, PlotBooking.Status.CONFIRMED],
         ).exists():
             raise ValidationError({"plot_id": "This plot already has an active booking."})
+        customer = _customer_for_booking(
+            organization=organization,
+            project=locked_plot.project,
+            lead=lead,
+        )
         booking = PlotBooking(
-            organization=organization, lead=lead, plot=locked_plot, site_visit=site_visit,
+            organization=organization, project=locked_plot.project, customer=customer,
+            lead=lead, plot=locked_plot, site_visit=site_visit,
             notes=(notes or "").strip(), created_by=user, final_price=locked_plot.total_price,
         )
         booking.full_clean()
@@ -143,7 +149,7 @@ def _booking_receipt_number(project):
     return f"{project.code}-BR-{number:06d}"
 
 
-def create_idempotent_booking(*, organization, project, lead, plot, user, idempotency_key, body=None, site_visit=None, notes="", initial_payment="0", payment_mode=None, transaction_reference=""):
+def create_idempotent_booking(*, organization, project, lead, plot, user, idempotency_key, body=None, site_visit=None, notes="", initial_payment="0", payment_mode=None, transaction_reference="", customer=None):
     """Create the Phase 9 booking in one serialized transaction."""
     key = (idempotency_key or "").strip()
     if not key:
@@ -184,7 +190,12 @@ def create_idempotent_booking(*, organization, project, lead, plot, user, idempo
         ).exists():
             raise PlotAvailabilityConflict({"plot_id": "This plot already has an active booking."})
 
-        customer = _customer_for_booking(organization=organization, project=project, lead=locked_lead)
+        if customer is not None:
+            customer = Customer.objects.select_for_update().get(
+                pk=customer.pk, organization=organization, project=project,
+            )
+        else:
+            customer = _customer_for_booking(organization=organization, project=project, lead=locked_lead)
         total = locked_plot.total_price or Decimal("0")
         from system_settings.parameters import PARAMETER_REGISTRY
         from system_settings.services import UnknownSystemParameter, get_system_parameter
@@ -252,7 +263,7 @@ def confirm_plot_booking(*, booking, user):
         validate_booking_transition(locked_booking.status, PlotBooking.Status.CONFIRMED)
         # Import lazily: documents is optional only for migration ordering, not for the rule.
         from documents.services import validate_customer_documents_for_booking
-        validation = validate_customer_documents_for_booking(locked_booking.lead)
+        validation = validate_customer_documents_for_booking(locked_booking.customer)
         if not validation["allowed"]:
             raise BookingDocumentValidationError(validation)
         if locked_plot.status == Plot.Status.HOLD:

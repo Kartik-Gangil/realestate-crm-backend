@@ -72,6 +72,7 @@ urlpatterns = [
     path("inventory/agreements/<int:agreement_id>/sign/", views.agreement_sign, name="agreement-sign"),
     path("inventory/agreements/<int:agreement_id>/upload-signed/", views.agreement_signed_copy, name="agreement-upload-signed"),
     path("inventory/agreements/<int:agreement_id>/signed-copy/", views.agreement_signed_copy, name="agreement-signed-copy"),
+    path("inventory/agreements/<int:agreement_id>/generate-pdf/", views.agreement_generate_pdf, name="agreement-generate-pdf"),
     path("inventory/agreements/<int:agreement_id>/download-signed/", views.agreement_download_signed, name="agreement-download-signed"),
     path("inventory/agreements/<int:agreement_id>/cancel/", views.agreement_cancel, name="agreement-cancel"),
     path("inventory/bookings/<int:booking_id>/registry/", views.booking_registry, name="booking-registry"),

@@ -40,9 +40,8 @@ class DocumentCategory(models.Model):
 
 
 class CustomerDocumentRequirement(models.Model):
-    # The existing CRM calls the customer entity Lead; APIs retain the customer term.
     organization = models.ForeignKey("organizations.Organization", on_delete=models.CASCADE, related_name="customer_document_requirements")
-    customer = models.ForeignKey("leads.Lead", on_delete=models.CASCADE, related_name="document_requirements")
+    customer = models.ForeignKey("inventory.Customer", on_delete=models.CASCADE, related_name="document_requirements")
     document_category = models.ForeignKey(DocumentCategory, on_delete=models.PROTECT, related_name="customer_requirements")
     is_mandatory = models.BooleanField(default=True)
     is_active = models.BooleanField(default=True)
@@ -71,7 +70,7 @@ class CustomerDocument(models.Model):
         EXPIRED = "expired", "Expired"
 
     organization = models.ForeignKey("organizations.Organization", on_delete=models.CASCADE, related_name="customer_documents")
-    customer = models.ForeignKey("leads.Lead", on_delete=models.CASCADE, related_name="documents")
+    customer = models.ForeignKey("inventory.Customer", on_delete=models.CASCADE, related_name="documents")
     document_category = models.ForeignKey(DocumentCategory, on_delete=models.PROTECT, related_name="documents")
     document_name = models.CharField(max_length=150)
     file = models.FileField(upload_to=customer_document_upload_path)

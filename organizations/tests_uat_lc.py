@@ -74,3 +74,17 @@ class UatLcOrganizationTests(TestCase):
 
         self.assertEqual(response.status_code, 200, response.data)
         self.assertEqual(response.data["results"][0]["employee"]["name"], "Asha Sharma")
+
+    def test_leave_without_from_date_returns_field_validation_rt03(self):
+        client = APIClient()
+        client.force_authenticate(self.employee.user)
+
+        response = client.post(
+            f"/api/v1/organizations/{self.organization.slug}/leaves/",
+            {"to_date": "2026-12-01", "leave_type": "casual", "reason": "UAT"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn("from_date", response.data)
+        self.assertNotEqual(response.data.get("detail"), "'from_date'")

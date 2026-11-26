@@ -3,6 +3,7 @@ from datetime import timedelta
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.shortcuts import get_object_or_404
+from django.http import Http404
 from django.db.models import Q
 from django.utils import timezone
 from rest_framework.decorators import api_view, permission_classes
@@ -10,6 +11,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import status
 
+from inventory.customer_services import create_customer, customer_queryset_for_access
 from leads.models import Lead
 from organizations.services import apply_data_scope, get_organization_access, get_project_context
 from .models import CustomerDocument, CustomerDocumentRequirement, DocumentCategory, EmployeeDocument, EmployeeDocumentCategory
@@ -35,15 +37,40 @@ def _docs(access, project):
         queryset,
         access,
         module="documents",
-        membership_lookups=("customer__assigned_membership",),
+        membership_lookups=("customer__lead__assigned_membership",),
         user_lookups=("uploaded_by",),
     )
 
 
 def _customer(access, customer_id, project):
-    queryset = Lead.objects.filter(organization=access.organization, project=project)
-    queryset = apply_data_scope(queryset, access, module="documents", membership_lookups=("assigned_membership",))
-    return get_object_or_404(queryset, pk=customer_id)
+    queryset = customer_queryset_for_access(access, project)
+    queryset = apply_data_scope(queryset, access, module="documents", membership_lookups=("lead__assigned_membership",))
+    customer = queryset.filter(pk=customer_id).first()
+    if customer is not None:
+        return customer
+    # Keep older clients working when they still submit the linked lead ID,
+    # while the actual customer ID remains the primary lookup.
+    customer = queryset.filter(lead_id=customer_id).first()
+    if customer is not None:
+        return customer
+    legacy_lead = Lead.objects.filter(
+        organization=access.organization,
+        project=project,
+        pk=customer_id,
+    ).first()
+    if legacy_lead is None:
+        raise Http404
+    # Older document clients could submit a lead ID before the Customer 360
+    # record existed. Preserve that upload flow by materializing the linked
+    # Customer once, then store the document against the Customer FK.
+    return create_customer(
+        organization=access.organization,
+        project=project,
+        lead=legacy_lead,
+        full_name=legacy_lead.full_name,
+        phone=legacy_lead.phone,
+        email=legacy_lead.email,
+    )
 
 
 def _doc(access, document_id, project): return get_object_or_404(_docs(access, project), pk=document_id)
@@ -61,7 +88,7 @@ def document_list(request, organization_slug):
         return Response(CustomerDocumentSerializer(_docs(access, project).get(pk=document.pk)).data, status=status.HTTP_201_CREATED)
     require_document_view(access)
     query = _docs(access, project)
-    if q := request.query_params.get("search"): query = query.filter(Q(document_name__icontains=q) | Q(file_name__icontains=q) | Q(customer__first_name__icontains=q) | Q(customer__last_name__icontains=q) | Q(document_category__name__icontains=q))
+    if q := request.query_params.get("search"): query = query.filter(Q(document_name__icontains=q) | Q(file_name__icontains=q) | Q(customer__full_name__icontains=q) | Q(customer__phone__icontains=q) | Q(customer__email__icontains=q) | Q(document_category__name__icontains=q))
     for key, field in (("customer", "customer_id"), ("category", "document_category_id"), ("status", "status")):
         if value := request.query_params.get(key): query = query.filter(**{field: value})
     if "active" in request.query_params: query = query.filter(is_active=request.query_params["active"].lower() == "true")

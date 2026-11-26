@@ -10,7 +10,7 @@ from organizations.models import Organization, OrganizationMembership
 from core.tests.samples import FORGED_EXE, FORGED_HTML, SAMPLE_JPEG, SAMPLE_PDF
 from documents.models import CustomerDocument, DocumentCategory
 
-from .models import Block, Plot, PlotBooking, Project, Registry
+from .models import Block, Customer, Plot, PlotBooking, Project, Registry
 
 
 class RegistryDocumentApiTests(TestCase):
@@ -43,6 +43,8 @@ class RegistryDocumentApiTests(TestCase):
         )
         booking = PlotBooking.objects.create(
             organization=self.organization,
+            project=self.project,
+            customer=Customer.objects.create(organization=self.organization, project=self.project, lead=lead, customer_code="REG-A-C-000001", full_name="Buyer A", phone="9000000011"),
             lead=lead,
             plot=plot,
             status=PlotBooking.Status.CONFIRMED,
@@ -107,7 +109,7 @@ class RegistryDocumentApiTests(TestCase):
 
     def test_a_file_sent_with_a_customer_document_is_still_checked_task_sec_001(self):
         category = DocumentCategory.objects.create(organization=self.organization, name="PAN", code="pan")
-        customer_document = CustomerDocument.objects.create(organization=self.organization, customer=self.registry.booking.lead, document_category=category, document_name="PAN", file=SimpleUploadedFile("pan.pdf", SAMPLE_PDF), file_name="pan.pdf", file_size=len(SAMPLE_PDF), content_type="application/pdf", version=1)
+        customer_document = CustomerDocument.objects.create(organization=self.organization, customer=self.registry.booking.customer, document_category=category, document_name="PAN", file=SimpleUploadedFile("pan.pdf", SAMPLE_PDF), file_name="pan.pdf", file_size=len(SAMPLE_PDF), content_type="application/pdf", version=1)
         response = self.post_file("deed.pdf", FORGED_HTML, customer_document_id=customer_document.id)
         self.assertEqual(response.status_code, 400)
         self.assertIn("file", response.data)

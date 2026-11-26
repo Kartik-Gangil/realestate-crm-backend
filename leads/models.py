@@ -283,7 +283,7 @@ class Sitevisit(models.Model):
         allowed = {
             self.Status.SCHEDULED: {self.Status.UPCOMING, self.Status.IN_PROGRESS, self.Status.CANCELLED, self.Status.NO_SHOW},
             self.Status.UPCOMING: {self.Status.IN_PROGRESS, self.Status.CANCELLED, self.Status.NO_SHOW, self.Status.RESCHEDULED},
-            self.Status.RESCHEDULED: {self.Status.UPCOMING, self.Status.IN_PROGRESS, self.Status.CANCELLED, self.Status.NO_SHOW},
+            self.Status.RESCHEDULED: {self.Status.UPCOMING, self.Status.IN_PROGRESS, self.Status.COMPLETED, self.Status.CANCELLED, self.Status.NO_SHOW},
             self.Status.IN_PROGRESS: {self.Status.COMPLETED, self.Status.CANCELLED},
             self.Status.COMPLETED: set(),
             self.Status.CANCELLED: set(),

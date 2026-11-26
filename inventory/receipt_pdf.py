@@ -41,7 +41,7 @@ def payment_receipt_pdf(payment, receipt):
         ).first()
         booking = allocation.booking if allocation else None
 
-    customer = booking.lead if booking else None
+    customer = booking.customer if booking else None
     plot = booking.plot if booking else None
 
     left = 22 * mm

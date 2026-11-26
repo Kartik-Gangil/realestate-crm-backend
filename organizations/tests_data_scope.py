@@ -3,7 +3,8 @@ from rest_framework.test import APIClient
 
 from documents.models import CustomerDocument, DocumentCategory
 from expenses.models import Expense, ExpenseCategory
-from inventory.models import Block, Plot
+from inventory.customer_services import create_customer
+from inventory.models import Block, Customer, Plot
 from leads.models import Lead
 from core.tests.factories import make_member, make_organization, make_project
 
@@ -65,6 +66,20 @@ class FullCrmDataScopeTests(TestCase):
             phone="9000000003",
             assigned_membership=self.other_department_membership,
         )
+        self.owner_customer = create_customer(
+            organization=self.organization,
+            project=self.project,
+            lead=self.owner_lead,
+            full_name="Owner Customer",
+            phone="9000000001",
+        )
+        self.other_customer = create_customer(
+            organization=self.organization,
+            project=self.project,
+            lead=self.other_department_lead,
+            full_name="Finance Customer",
+            phone="9000000003",
+        )
         self.category = ExpenseCategory.objects.create(
             organization=self.organization, project=self.project, name="Travel"
         )
@@ -113,7 +128,7 @@ class FullCrmDataScopeTests(TestCase):
         )
         self.owner_document = CustomerDocument.objects.create(
             organization=self.organization,
-            customer=self.owner_lead,
+            customer=self.owner_customer,
             document_category=self.category_documents,
             document_name="Owner identity",
             file="documents/owner.pdf",
@@ -125,7 +140,7 @@ class FullCrmDataScopeTests(TestCase):
         )
         self.other_document = CustomerDocument.objects.create(
             organization=self.organization,
-            customer=self.other_department_lead,
+            customer=self.other_customer,
             document_category=self.category_documents,
             document_name="Finance identity",
             file="documents/finance.pdf",

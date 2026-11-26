@@ -1,6 +1,7 @@
 from rest_framework.test import APITestCase
 
 from core.tests.factories import make_lead, make_member, make_organization, make_project
+from inventory.customer_services import create_customer
 from leads.models import Lead
 from organizations.models import Permission
 
@@ -21,7 +22,8 @@ class DocumentPermissionEnforcementTests(APITestCase):
             action="view",
             defaults={"name": "View documents"},
         )
-        self.customer = make_lead(self.organization, self.project, first_name="Customer")
+        lead = make_lead(self.organization, self.project, first_name="Customer")
+        self.customer = create_customer(organization=self.organization, project=self.project, lead=lead, full_name="Customer", phone="9000000121")
         self.category = DocumentCategory.objects.create(
             organization=self.organization,
             name="Identity",

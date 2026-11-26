@@ -345,7 +345,7 @@ def create_registry(*, booking, **data):
         if booking.plot.status != Plot.Status.BOOKED: raise ValidationError({"plot": "Registry requires a booked plot."})
         if not Agreement.objects.filter(booking=booking, status=Agreement.Status.SIGNED).exists(): raise ValidationError({"agreement": "A signed agreement is required."})
         from documents.services import validate_customer_documents_for_booking
-        validation = validate_customer_documents_for_booking(booking.lead)
+        validation = validate_customer_documents_for_booking(booking.customer)
         if not validation["allowed"]:
             raise ValidationError({"documents": validation})
         if Registry.objects.filter(booking=booking).exists(): raise ValidationError({"booking": "A registry already exists for this booking."})
@@ -362,7 +362,7 @@ def transition_registry(*, registry, status, user=None, remarks=""):
             if payment_totals(registry.booking)["outstanding_amount"] > Decimal("0.00"):
                 raise ValidationError({"payments": "All booking dues must be paid before registry completion."})
             from documents.services import validate_customer_documents_for_booking
-            validation = validate_customer_documents_for_booking(registry.booking.lead)
+            validation = validate_customer_documents_for_booking(registry.booking.customer)
             if not validation["allowed"]: raise ValidationError({"documents": validation})
         old = registry.status; result = _transition(registry, status, REGISTRY_TRANSITIONS, "registry")
         RegistryStatusHistory.objects.create(registry=result, old_status=old, new_status=status, remarks=remarks, changed_by=user)

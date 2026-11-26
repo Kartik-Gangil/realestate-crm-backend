@@ -79,6 +79,16 @@ class AgreementSignedCopyTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn('attachment;', response["Content-Disposition"])
 
+    def test_generate_pdf_route_preserves_existing_agreement_flow_lc09(self):
+        response = self.client.post(
+            reverse("inventory:agreement-generate-pdf", args=[self.organization.slug, self.agreement.id]),
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["id"], self.agreement.id)
+
     def test_forged_signed_copy_is_rejected_task_sec_001(self):
         for name, content in (("signed.pdf", FORGED_HTML), ("signed.png", FORGED_EXE)):
             response = self.client.post(self.upload_url(), {"file": self.signed_upload(name, content)}, format="multipart")

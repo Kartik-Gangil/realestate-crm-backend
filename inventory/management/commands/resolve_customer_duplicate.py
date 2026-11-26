@@ -46,7 +46,7 @@ class Command(BaseCommand):
             raise CommandError("Customers must be different records in the same project and organization.")
         bookings = kept.bookings.filter(pk__in=merged.bookings.values("pk")).count()
         notes = CustomerNote.objects.filter(customer=merged).count()
-        documents = CustomerDocument.objects.filter(customer_id=merged.lead_id).count() if merged.lead_id else 0
+        documents = CustomerDocument.objects.filter(customer_id=merged.pk).count()
         if options["dry_run"]:
             self.stdout.write(f"bookings_to_move={bookings}")
             self.stdout.write(f"notes_to_move={notes}")
@@ -61,8 +61,7 @@ class Command(BaseCommand):
                 booking.save(update_fields=["customer", "updated_at"])
             for note in CustomerNote.objects.select_for_update().filter(customer=merged).all():
                 models.QuerySet.update(CustomerNote.objects.filter(pk=note.pk), customer=kept)
-            if merged.lead_id and kept.lead_id:
-                CustomerDocument.objects.filter(customer_id=merged.lead_id).update(customer_id=kept.lead_id)
+            CustomerDocument.objects.filter(customer_id=merged.pk).update(customer_id=kept.pk)
             merged.status = Customer.Status.INACTIVE
             merged.lifecycle_reason = f"Merged into {kept.customer_code}"
             merged.phone = ""

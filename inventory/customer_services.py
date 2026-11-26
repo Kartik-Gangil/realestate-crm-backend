@@ -65,14 +65,24 @@ def decrypt_government_id(value):
 
 
 def _identity_query(project, *, phone="", email="", government_id_hash_value="", exclude_id=None):
-    query = Q()
+    identity_queries = []
     if phone:
-        query |= Q(phone=phone)
+        identity_queries.append(Q(phone=phone))
     if email:
-        query |= Q(email__iexact=email)
+        identity_queries.append(Q(email__iexact=email))
     if government_id_hash_value:
-        query |= Q(government_id_hash=government_id_hash_value)
-    queryset = Customer.objects.filter(project=project).filter(query)
+        identity_queries.append(Q(government_id_hash=government_id_hash_value))
+    # An empty create/update payload must go through model validation. An
+    # empty Q() matches every customer and incorrectly turns it into a
+    # duplicate response when the project already has any customer.
+    queryset = Customer.objects.filter(project=project)
+    if identity_queries:
+        query = identity_queries[0]
+        for identity_query in identity_queries[1:]:
+            query |= identity_query
+        queryset = queryset.filter(query)
+    else:
+        queryset = queryset.none()
     if exclude_id is not None:
         queryset = queryset.exclude(pk=exclude_id)
     return queryset.order_by("id")
@@ -284,7 +294,7 @@ def customer_360_data(customer):
         for visit in Sitevisit.objects.filter(lead=lead).all():
             timeline.append(_timeline_item("site_visit", visit.created_at, site_visit_id=visit.id, title="Site visit", status=visit.status))
         from documents.models import CustomerDocument
-        for document in CustomerDocument.objects.filter(customer=lead).all():
+        for document in CustomerDocument.objects.filter(customer=customer).all():
             timeline.append(_timeline_item("document", document.created_at, document_id=document.id, title=document.document_name, status=document.status))
     for booking in bookings:
         timeline.append(_timeline_item("booking", booking.created_at, booking_id=booking.id, title="Booking", status=booking.status))

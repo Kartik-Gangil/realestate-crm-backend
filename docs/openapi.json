@@ -336,7 +336,14 @@
             },
             "description": "Successful response"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-crm-scope": "user",
+        "x-permissions": {}
       }
     },
     "/api/v1/expenses/": {
@@ -2694,6 +2701,41 @@
     "/api/v1/organizations/{organization_slug}/inventory/agreements/{agreement_id}/download-signed/": {
       "get": {
         "operationId": "get_api_v1_organizations_organization_slug_inventory_agreements_agreement_id_download-signed",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "organization_slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "agreement_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/api/v1/organizations/{organization_slug}/inventory/agreements/{agreement_id}/generate-pdf/": {
+      "post": {
+        "operationId": "post_api_v1_organizations_organization_slug_inventory_agreements_agreement_id_generate-pdf",
         "parameters": [
           {
             "in": "path",

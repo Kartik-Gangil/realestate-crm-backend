@@ -102,6 +102,16 @@ class UatLcRbacTests(APITestCase):
         self.assertEqual(response.status_code, 403, response.data)
 
     def test_empty_customer_payload_returns_validation_not_duplicate_lc17(self):
+        from .customer_services import create_customer
+
+        create_customer(
+            organization=self.organization,
+            project=self.project,
+            full_name="Existing Customer",
+            phone="9000000999",
+            email="existing@example.com",
+            actor=self.admin,
+        )
         self.client.force_authenticate(self.admin)
         response = self.client.post(
             f"/api/organizations/{self.organization.slug}/customers/",

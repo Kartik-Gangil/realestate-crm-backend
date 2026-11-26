@@ -7,6 +7,7 @@ from django.test import TestCase
 from django.utils import timezone
 
 from leads.models import Lead
+from inventory.customer_services import create_customer
 from inventory.models import Project
 from core.tests.factories import make_lead
 from organizations.models import Organization, OrganizationMembership
@@ -21,7 +22,8 @@ class DocumentServiceTests(TestCase):
         self.user = get_user_model().objects.create_user(username="reviewer", email="reviewer@example.com", password="pw")
         self.org = Organization.objects.create(name="Org", slug="org")
         self.project = Project.objects.create(organization=self.org, name="Project", code="PROJECT")
-        self.customer = make_lead(self.org, self.project, first_name="Customer")
+        self.lead = make_lead(self.org, self.project, first_name="Customer")
+        self.customer = create_customer(organization=self.org, project=self.project, lead=self.lead, full_name="Customer", phone="9000000111")
         self.category = DocumentCategory.objects.create(organization=self.org, name="PAN", code="pan")
         CustomerDocumentRequirement.objects.create(organization=self.org, customer=self.customer, document_category=self.category)
 
@@ -49,7 +51,7 @@ class DocumentServiceTests(TestCase):
         from inventory.services import confirm_plot_booking, create_plot_booking
         block = Block.objects.create(organization=self.org, project=self.project, name="A", code="A")
         plot = Plot.objects.create(organization=self.org, project=self.project, block=block, plot_number="1", size=Decimal("100"))
-        booking = create_plot_booking(organization=self.org, lead=self.customer, plot=plot, site_visit=None, notes="", user=self.user)
+        booking = create_plot_booking(organization=self.org, lead=self.lead, plot=plot, site_visit=None, notes="", user=self.user)
         with self.assertRaises(ValidationError) as raised:
             confirm_plot_booking(booking=booking, user=self.user)
         self.assertTrue(hasattr(raised.exception, "document_validation"))

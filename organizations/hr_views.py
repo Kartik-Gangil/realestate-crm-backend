@@ -260,10 +260,16 @@ def leaves(request, organization_slug):
     employee = get_object_or_404(_employees_for_access(access), pk=request.data.get("employee", access.membership.id if access.membership else None))
     if not access.is_platform and employee != access.membership and not has_permission(request.user, access.organization, "leave.edit"): raise PermissionDenied("You can only apply for your own leave.")
     try:
-        from_date, to_date = parse_date(str(request.data["from_date"])), parse_date(str(request.data["to_date"]))
+        raw_from_date = request.data.get("from_date")
+        raw_to_date = request.data.get("to_date")
+        if not raw_from_date:
+            raise ValidationError({"from_date": "This field is required."})
+        if not raw_to_date:
+            raise ValidationError({"to_date": "This field is required."})
+        from_date, to_date = parse_date(str(raw_from_date)), parse_date(str(raw_to_date))
         if not from_date or not to_date: raise ValidationError({"from_date": "Use ISO dates (YYYY-MM-DD)."})
         validate_leave_date_range(from_date, to_date)
-        leave_type = str(request.data["leave_type"]).strip().lower()
+        leave_type = str(request.data.get("leave_type", "")).strip().lower()
         if leave_type == LeaveRequest.LeaveType.EARNED:
             leave_type = LeaveRequest.LeaveType.PAID
         if leave_type not in {LeaveRequest.LeaveType.CASUAL, LeaveRequest.LeaveType.SICK, LeaveRequest.LeaveType.PAID}:
@@ -288,7 +294,7 @@ def leaves(request, organization_slug):
         )
         if balance.remaining_days < days:
             raise ValidationError({"balance": "Insufficient leave balance."})
-        leave = LeaveRequest.objects.create(organization=access.organization, employee=employee, leave_type=leave_type, from_date=from_date, to_date=to_date, days=days, reason=request.data["reason"])
+        leave = LeaveRequest.objects.create(organization=access.organization, employee=employee, leave_type=leave_type, from_date=from_date, to_date=to_date, days=days, reason=str(request.data.get("reason", "")).strip())
         log_activity(organization=access.organization, employee=employee, action="leave_applied", actor=request.user, module="leave", details={"leave_id": leave.id, "days": days})
     except (KeyError, ValidationError) as error: return _validation_response(error)
     return Response(_leave(LeaveRequest.objects.select_related("employee__user").get(pk=leave.pk)), status=201)

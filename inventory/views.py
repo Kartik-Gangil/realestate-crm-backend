@@ -417,6 +417,7 @@ def _booking_payload(request, organization, access, *, project=None, plot_id=Non
     if protected:
         raise ValidationError({field: "This field cannot be supplied." for field in protected})
     lead_id = _parse_positive_id(request.data, "lead_id")
+    customer_id = _parse_positive_id(request.data, "customer_id")
     supplied_plot_id = _parse_positive_id(request.data, "plot_id")
     if plot_id is not None and supplied_plot_id is not None and supplied_plot_id != plot_id:
         raise ValidationError({"plot_id": "Must match the plot in the URL."})
@@ -427,11 +428,16 @@ def _booking_payload(request, organization, access, *, project=None, plot_id=Non
         raise ValidationError({"plot_id": "This field is required."})
     site_visit_id = _parse_positive_id(request.data, "site_visit_id")
     lead = get_object_or_404(_leads_for_access(access, project), pk=lead_id)
+    customer = None
+    if customer_id is not None:
+        customer = get_object_or_404(customer_queryset_for_access(access, project), pk=customer_id)
+        if customer.lead_id and customer.lead_id != lead.id:
+            raise ValidationError({"customer_id": "Customer must belong to the selected lead."})
     plot = get_object_or_404(_plots_for_access(access, project), pk=selected_plot_id)
     site_visit = get_object_or_404(
         _site_visits_for_access(access, _leads_for_access(access, project), project).filter(pk=site_visit_id),
     ) if site_visit_id else None
-    return lead, plot, site_visit, str(request.data.get("notes", "")).strip()
+    return lead, customer, plot, site_visit, str(request.data.get("notes", "")).strip()
 
 
 def _filter_bookings(queryset, params, organization):
@@ -729,12 +735,12 @@ def plot_select(request, organization_slug, plot_id):
     project = get_project_context(request, access)
     _require_booking_creation(access)
     try:
-        lead, plot, site_visit, notes = _booking_payload(request, access.organization, access, project=project, plot_id=plot_id)
+        lead, customer, plot, site_visit, notes = _booking_payload(request, access.organization, access, project=project, plot_id=plot_id)
         if plot.project_id != project.id:
             raise ValidationError({"plot_id": "Plot does not belong to the active project."})
         _require_booking_lead_scope(access, lead, site_visit)
         booking = create_idempotent_booking(
-            organization=access.organization, project=project, lead=lead, plot=plot, user=request.user,
+            organization=access.organization, project=project, lead=lead, customer=customer, plot=plot, user=request.user,
             idempotency_key=request.headers.get("X-Idempotency-Key"), body=dict(request.data),
             site_visit=site_visit, notes=notes, initial_payment=request.data.get("initial_payment", "0"),
             payment_mode=request.data.get("payment_mode"), transaction_reference=request.data.get("transaction_reference", ""),
@@ -752,12 +758,12 @@ def booking_list(request, organization_slug):
     if request.method == "POST":
         _require_booking_creation(access)
         try:
-            lead, plot, site_visit, notes = _booking_payload(request, access.organization, access, project=project)
+            lead, customer, plot, site_visit, notes = _booking_payload(request, access.organization, access, project=project)
             if plot.project_id != project.id:
                 raise ValidationError({"plot_id": "Plot does not belong to the active project."})
             _require_booking_lead_scope(access, lead, site_visit)
             booking = create_idempotent_booking(
-                organization=access.organization, project=project, lead=lead, plot=plot, user=request.user,
+                organization=access.organization, project=project, lead=lead, customer=customer, plot=plot, user=request.user,
                 idempotency_key=request.headers.get("X-Idempotency-Key"), body=dict(request.data),
                 site_visit=site_visit, notes=notes, initial_payment=request.data.get("initial_payment", "0"),
                 payment_mode=request.data.get("payment_mode"), transaction_reference=request.data.get("transaction_reference", ""),
@@ -1013,7 +1019,7 @@ def _sales_queryset(model, access, project=None):
         membership_lookups=("booking__lead__assigned_membership",),
         user_lookups=tuple(user_lookups),
     )
-    return queryset.select_related("organization", "booking", "booking__lead", "booking__plot", "booking__plot__block")
+    return queryset.select_related("organization", "booking", "booking__lead", "booking__customer", "booking__plot", "booking__plot__block")
 
 
 def _require_permission(access, code):
@@ -1035,7 +1041,7 @@ def _payment_queryset(access, project=None):
         membership_lookups=("booking__lead__assigned_membership",),
         user_lookups=("booking__created_by", "received_by"),
     )
-    return queryset.select_related("organization", "booking", "booking__lead", "booking__plot", "booking__plot__block", "received_by").prefetch_related("payment_allocations__booking__lead", "payment_allocations__booking__plot__block", "receipt", "refunds")
+    return queryset.select_related("organization", "booking", "booking__lead", "booking__customer", "booking__plot", "booking__plot__block", "received_by").prefetch_related("payment_allocations__booking__lead", "payment_allocations__booking__customer", "payment_allocations__booking__plot__block", "receipt", "refunds")
 
 
 def _simple_page(request, queryset, serializer):
@@ -1068,9 +1074,9 @@ def _booking_has_overdue_balance(booking):
 
 def payment_to_dict(payment, detailed=False):
     allocations = getattr(payment, "payment_allocations", None)
-    allocation_rows = list(allocations.all()) if allocations is not None else list(PaymentAllocation.objects.filter(payment=payment).select_related("booking__lead", "booking__plot", "installment", "registry_charge"))
+    allocation_rows = list(allocations.all()) if allocations is not None else list(PaymentAllocation.objects.filter(payment=payment).select_related("booking__lead", "booking__customer", "booking__plot", "installment", "registry_charge"))
     context_booking = allocation_rows[0].booking if allocation_rows else getattr(payment, "booking", None)
-    context_customer = context_booking.lead if context_booking else None
+    context_customer = context_booking.customer if context_booking else None
     context_plot = context_booking.plot if context_booking else None
     refund_rows = list(payment.refunds.all())
     account_status = payment.status
@@ -1091,7 +1097,7 @@ def payment_to_dict(payment, detailed=False):
             "refunds": [{"id": refund.id, "amount": str(refund.amount), "status": refund.status, "reason": refund.reason, "refund_date": refund.refund_date.isoformat()} for refund in refund_rows],
             "received_by": _actor_to_dict(payment.received_by), "created_at": payment.created_at.isoformat(), "updated_at": payment.updated_at.isoformat()}
     if detailed:
-        data.update({"allocations": [{"booking_id": a.booking_id, "amount": str(a.amount), "installment_id": a.installment_id, "registry_charge_id": a.registry_charge_id, "customer": {"id": a.booking.lead_id, "name": a.booking.lead.full_name}, "plot": {"id": a.booking.plot_id, "plot_number": a.booking.plot.plot_number}} for a in allocation_rows],
+        data.update({"allocations": [{"booking_id": a.booking_id, "amount": str(a.amount), "installment_id": a.installment_id, "registry_charge_id": a.registry_charge_id, "customer": {"id": a.booking.customer_id, "name": a.booking.customer.full_name}, "plot": {"id": a.booking.plot_id, "plot_number": a.booking.plot.plot_number}} for a in allocation_rows],
                      "advances": [{"booking_id": row.booking_id, "amount": str(row.amount)} for row in advance_rows],
                      "receipt": ({"receipt_number": payment.receipt.receipt_number, "generated_at": payment.receipt.generated_at.isoformat()} if hasattr(payment, "receipt") else None),
                      "refunds": [{"id": r.id, "amount": str(r.amount), "reason": r.reason, "status": r.status, "refund_date": r.refund_date.isoformat()} for r in refund_rows]})
@@ -1322,6 +1328,20 @@ def agreement_signed_copy(request, organization_slug, agreement_id):
                            changed_values={"superseded_at": "now"})
         AgreementSignedDocument.objects.create(agreement=agreement, file=uploaded_file, original_filename=uploaded_file.name, content_type=content_type, file_size_bytes=uploaded_file.size, uploaded_by=request.user)
     return Response(agreement_to_dict(_sales_queryset(Agreement, access, project).get(pk=agreement.pk)), status=status.HTTP_201_CREATED)
+
+
+@crm_endpoint(["POST"], scope="organization")
+def agreement_generate_pdf(request, organization_slug, agreement_id):
+    """Keep the legacy generate-PDF client action on the approved agreement flow.
+
+    The current SSOT defines signed-copy upload/download, not a second generated
+    document format. Returning the agreement metadata keeps the existing client
+    action from failing with 404 while leaving signed-copy storage authoritative.
+    """
+    access = get_organization_access(request.user, organization_slug)
+    project = get_project_context(request, access)
+    agreement = get_object_or_404(_sales_queryset(Agreement, access, project), pk=agreement_id)
+    return Response(agreement_to_dict(agreement))
 
 
 @api_view(["GET"])
@@ -1677,20 +1697,20 @@ def customer_notes(request, organization_slug, customer_id):
 
 def customer_payment_history(request, organization_slug, customer_id):
     access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_permission(access, "payments.view")
-    get_object_or_404(_leads_for_access(access, project), pk=customer_id)
-    return _simple_page(request, _payment_queryset(access, project).filter(payment_allocations__booking__lead_id=customer_id).distinct(), payment_to_dict)
+    customer = _customer_for_access(access, project, customer_id)
+    return _simple_page(request, _payment_queryset(access, project).filter(payment_allocations__booking__customer_id=customer.id).distinct(), payment_to_dict)
 
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def customer_payment_ledger(request, organization_slug, customer_id):
     access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_permission(access, "payments.view")
-    customer = get_object_or_404(_leads_for_access(access, project), pk=customer_id)
-    bookings = _bookings_for_access(access, project).filter(lead=customer, status=PlotBooking.Status.CONFIRMED)
+    customer = _customer_for_access(access, project, customer_id)
+    bookings = _bookings_for_access(access, project).filter(customer=customer, status=PlotBooking.Status.CONFIRMED)
     totals = [payment_totals(item) for item in bookings]
     due = sum((item["final_price"] or Decimal("0") for item in totals), Decimal("0")); paid = sum((item["net_paid"] for item in totals), Decimal("0"))
     payment_entries = _payment_queryset(access, project).filter(
-        payment_allocations__booking__lead=customer,
+        payment_allocations__booking__customer=customer,
         status__in=[Payment.Status.SUCCESS, Payment.Status.REFUNDED],
     ).distinct().order_by("payment_date", "id")
     running_paid = Decimal("0")
@@ -1713,8 +1733,8 @@ def customer_payment_ledger(request, organization_slug, customer_id):
 @permission_classes([IsAuthenticated])
 def customer_dues(request, organization_slug, customer_id):
     access = get_organization_access(request.user, organization_slug); project = get_project_context(request, access); _require_permission(access, "payments.view")
-    customer = get_object_or_404(_leads_for_access(access, project), pk=customer_id)
-    bookings = _bookings_for_access(access, project).filter(lead=customer, status=PlotBooking.Status.CONFIRMED).select_related("plot", "plot__block").prefetch_related("installments")
+    customer = _customer_for_access(access, project, customer_id)
+    bookings = _bookings_for_access(access, project).filter(customer=customer, status=PlotBooking.Status.CONFIRMED).select_related("plot", "plot__block").prefetch_related("installments")
     rows = []
     for booking in bookings:
         summary = payment_totals(booking)
@@ -1738,7 +1758,7 @@ def _registry_queryset(access, project=None):
         membership_lookups=("booking__lead__assigned_membership",),
         user_lookups=("booking__created_by", "created_by"),
     )
-    return queryset.select_related("booking__lead", "booking__plot__block", "created_by").prefetch_related("charges", "status_history__changed_by")
+    return queryset.select_related("booking__lead", "booking__customer", "booking__plot__block", "created_by").prefetch_related("charges", "status_history__changed_by")
 
 
 def managed_registry_to_dict(item, detailed=False):
@@ -1746,7 +1766,8 @@ def managed_registry_to_dict(item, detailed=False):
     total = sum((charge.amount for charge in charges), Decimal("0"))
     paid = PaymentAllocation.objects.filter(registry_charge__registry=item, payment__status__in=[Payment.Status.SUCCESS, Payment.Status.REFUNDED]).aggregate(total=Sum("amount"))["total"] or Decimal("0")
     charge_values = {charge.code: charge.amount for charge in charges}
-    data = {"id": item.id, "registry_id": item.registry_number or f"REG-{item.id}", "status": item.status, "registry_number": item.registry_number, "registry_date": item.registry_date.isoformat() if item.registry_date else None, "booking_id": item.booking_id, "customer_id": item.booking.lead_id, "buyer_name": item.booking.lead.full_name, "buyer_mobile": item.booking.lead.phone, "buyer_email": item.booking.lead.email, "plot_id": item.booking.plot_id, "plot_number": item.booking.plot.plot_number, "block_name": item.booking.plot.block.name, "consideration_amount": str(item.consideration_amount) if item.consideration_amount is not None else None, "booking": {"id": item.booking_id, "customer": {"id": item.booking.lead_id, "name": item.booking.lead.full_name}, "plot": {"id": item.booking.plot_id, "plot_number": item.booking.plot.plot_number, "block": item.booking.plot.block.name}}, "charges": {"stamp_duty": str(charge_values.get("stamp_duty", 0)), "registration_charges": str(charge_values.get("registration_charges", 0)), "legal_fees": str(charge_values.get("legal_fees", 0)), "miscellaneous": str(charge_values.get("miscellaneous", 0)), "tds": str(charge_values.get("tds", 0)), "total_charges": str(total), "paid_amount": str(paid), "pending_amount": str(max(total - paid, Decimal("0")))}, "total_charges": str(total), "paid_amount": str(paid), "pending_amount": str(max(total - paid, Decimal("0")))}
+    customer = item.booking.customer
+    data = {"id": item.id, "registry_id": f"REG-{item.id}", "status": item.status, "registry_number": item.registry_number, "registry_date": item.registry_date.isoformat() if item.registry_date else None, "booking_id": item.booking_id, "customer_id": customer.id if customer else None, "buyer_name": customer.full_name if customer else item.booking.lead.full_name, "buyer_mobile": customer.phone if customer else item.booking.lead.phone, "buyer_email": customer.email if customer else item.booking.lead.email, "plot_id": item.booking.plot_id, "plot_number": item.booking.plot.plot_number, "block_name": item.booking.plot.block.name, "consideration_amount": str(item.consideration_amount) if item.consideration_amount is not None else None, "booking": {"id": item.booking_id, "customer": {"id": customer.id if customer else None, "name": customer.full_name if customer else item.booking.lead.full_name}, "plot": {"id": item.booking.plot_id, "plot_number": item.booking.plot.plot_number, "block": item.booking.plot.block.name}}, "charges": {"stamp_duty": str(charge_values.get("stamp_duty", 0)), "registration_charges": str(charge_values.get("registration_charges", 0)), "legal_fees": str(charge_values.get("legal_fees", 0)), "miscellaneous": str(charge_values.get("miscellaneous", 0)), "tds": str(charge_values.get("tds", 0)), "total_charges": str(total), "paid_amount": str(paid), "pending_amount": str(max(total - paid, Decimal("0")))}, "total_charges": str(total), "paid_amount": str(paid), "pending_amount": str(max(total - paid, Decimal("0")))}
     if detailed: data.update({"registry_time": item.registry_time.isoformat() if item.registry_time else None, "sub_registrar_office": item.sub_registrar_office, "document_type": item.document_type, "consideration_amount": str(item.consideration_amount) if item.consideration_amount is not None else None, "agreement_number": item.agreement_number, "agreement_date": item.agreement_date.isoformat() if item.agreement_date else None, "notes": item.notes, "reminder_date": item.reminder_date.isoformat() if item.reminder_date else None, "reminder_enabled": item.reminder_enabled, "charges": [{"id": c.id, "code": c.code, "label": c.label, "calculation_type": c.calculation_type, "calculation_value": str(c.calculation_value), "amount": str(c.amount)} for c in charges], "history": [{"status": h.new_status, "old_status": h.old_status, "remarks": h.remarks, "changed_at": h.changed_at.isoformat(), "actor": _actor_to_dict(h.changed_by)} for h in item.status_history.all()]})
     return data
 
@@ -1780,7 +1801,7 @@ def managed_registry_documents(request, organization_slug, registry_id):
         customer_document = get_object_or_404(
             CustomerDocument.objects.filter(
                 organization=access.organization,
-                customer=registry.booking.lead,
+                customer=registry.booking.customer,
                 customer__project=project,
                 pk=customer_document_id,
             )

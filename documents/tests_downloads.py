@@ -6,7 +6,7 @@ from django.test import TestCase
 from rest_framework.test import APIClient
 
 from core.tests.samples import FORGED_HTML, SAMPLE_PDF
-from inventory.models import Project
+from inventory.models import Customer, Project
 from leads.models import Lead
 from organizations.models import Organization, OrganizationMembership
 from .models import CustomerDocument, DocumentCategory, EmployeeDocument, EmployeeDocumentCategory
@@ -18,7 +18,8 @@ class DocumentDownloadTests(TestCase):
         self.organization = Organization.objects.create(name="Downloads Org", slug="downloads-org")
         self.membership = OrganizationMembership.objects.create(organization=self.organization, user=user, role=OrganizationMembership.Role.ADMIN)
         project = Project.objects.create(organization=self.organization, name="Project A", code="DL-A")
-        self.customer = Lead.objects.create(organization=self.organization, project=project, first_name="Customer", phone="9000000021")
+        lead = Lead.objects.create(organization=self.organization, project=project, first_name="Customer", phone="9000000021")
+        self.customer = Customer.objects.create(organization=self.organization, project=project, lead=lead, customer_code="DL-A-C-000001", full_name="Customer", phone="9000000021")
         self.category = DocumentCategory.objects.create(organization=self.organization, name="PAN", code="pan")
         self.client = APIClient()
         self.client.force_authenticate(user)

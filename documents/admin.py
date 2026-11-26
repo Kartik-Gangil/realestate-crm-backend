@@ -19,7 +19,7 @@ class RequirementAdmin(admin.ModelAdmin):
 class CustomerDocumentAdmin(admin.ModelAdmin):
     list_display = ("customer", "document_category", "document_name", "version", "status", "uploaded_at", "expiry_date", "is_active", "uploaded_by", "verified_by")
     list_filter = ("organization", "document_category", "status", "is_active", "expiry_date")
-    search_fields = ("customer__first_name", "customer__last_name", "document_name", "file_name")
+    search_fields = ("customer__full_name", "customer__phone", "customer__email", "document_name", "file_name")
     list_select_related = ("customer", "document_category", "organization", "uploaded_by", "verified_by")
     readonly_fields = ("version", "file_name", "file_size", "content_type", "uploaded_at", "verified_at", "rejected_at", "archived_at", "created_at", "updated_at")
 
