@@ -353,7 +353,12 @@ def _sync_project_assignments(employee, projects, assigned_by, request=None):
 
 
 def _assert_role_change_allowed(access, role):
-    if access.is_platform or role is None or has_permission(access.membership.user, access.organization, "role.edit"):
+    if (
+        access.is_platform
+        or role is None
+        or has_permission(access.membership.user, access.organization, "role.edit")
+        or has_permission(access.membership.user, access.organization, "users.manage")
+    ):
         return
     raise PermissionDenied("Role assignment requires role.edit.")
 
@@ -393,7 +398,12 @@ def employee_list(request, organization_slug):
             return Response({"role_id": ["Use a role from this organization."]}, status=status.HTTP_400_BAD_REQUEST)
         data.pop("role_id")
     _assert_role_change_allowed(access, assigned_role)
-    if not access.is_platform and not has_permission(access.membership.user, access.organization, "settings.edit"):
+    can_manage_user_access = access.is_platform or has_permission(
+        access.membership.user,
+        access.organization,
+        "users.manage",
+    )
+    if not can_manage_user_access and not has_permission(access.membership.user, access.organization, "settings.edit"):
         if data["access_scope"] != OrganizationMembership.AccessScope.ALL or data.get("custom_scope_memberships") or data.get("custom_scope_departments") or data.get("project_ids") is not None:
             raise PermissionDenied("Only organization admins can assign employee access scopes.")
     try:

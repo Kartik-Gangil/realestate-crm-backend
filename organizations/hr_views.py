@@ -26,8 +26,9 @@ def _manage(access):
 
 
 def _dict_employee(employee):
+    full_name = " ".join(part for part in (employee.first_name, employee.last_name) if part).strip()
     return {"id": employee.id, "employee_id": employee.employee_id,
-            "name": employee.first_name or employee.user.get_full_name() or employee.user.email}
+            "name": full_name or employee.user.get_full_name() or employee.user.email}
 
 
 def _role(role):

@@ -39,6 +39,21 @@ def is_developer(user):
     return bool(user and user.is_authenticated and DeveloperAccount.objects.filter(user_id=user.pk).exists())
 
 
+def has_active_organization_access(user):
+    """Return whether a non-platform user still has an active CRM membership."""
+    if not user or not user.is_authenticated:
+        return False
+    if user.is_superuser or user.groups.filter(name="Platform Admin").exists() or is_developer(user):
+        return True
+    from organizations.models import OrganizationMembership
+
+    return OrganizationMembership.objects.filter(
+        user=user,
+        organization__is_active=True,
+        is_active=True,
+    ).exists()
+
+
 def normalize_phone(value):
     if not isinstance(value, str):
         return ""
@@ -73,7 +88,7 @@ def get_security_profile(user, *, lock=False):
 
 def authenticate_with_lockout(identifier, password):
     user = resolve_user(identifier)
-    if user is None or not user.is_active:
+    if user is None or not user.is_active or not has_active_organization_access(user):
         raise InvalidCredentials
     now = timezone.now()
     invalid_credentials = False

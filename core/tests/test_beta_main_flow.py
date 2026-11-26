@@ -48,12 +48,12 @@ class BetaMainFlowApiTests(TestCase):
         self.category = DocumentCategory.objects.create(
             organization=self.organization, name="Identity", code="identity"
         )
-        MasterData.objects.create(
+        MasterData.objects.get_or_create(
             organization=self.organization,
             project=self.project,
             category=MasterDataCategory.objects.get(code="payment_mode"),
             code="cash",
-            name="Cash",
+            defaults={"name": "Cash"},
         )
         self.client = APIClient()
 

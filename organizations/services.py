@@ -140,7 +140,10 @@ def ensure_default_roles(organization):
         manager_permissions.extend(
             Permission.objects.filter(
                 module="expenses",
-                action__in=["view", "view_team", "approve", "reject", "mark_paid", "process_payment"],
+                action__in=[
+                    "view", "view_own", "view_team", "edit_own", "submit",
+                    "approve", "reject", "mark_paid", "process_payment",
+                ],
             )
         )
         # Keep newly provisioned manager roles aligned with the payment and
@@ -173,6 +176,12 @@ def ensure_default_roles(organization):
         telecaller_permissions.extend(Permission.objects.filter(module="leads", action="add"))
         telecaller_permissions.extend(Permission.objects.filter(module="employees", action="view"))
         telecaller_permissions.extend(Permission.objects.filter(module="plots", action__in=["view", "view_team", "book"]))
+        telecaller_permissions.extend(
+            Permission.objects.filter(module="attendance", action__in=["view", "add", "edit"])
+        )
+        telecaller_permissions.extend(
+            Permission.objects.filter(module="leave", action__in=["view", "add", "edit"])
+        )
         roles["telecaller"].permissions.set(telecaller_permissions)
     if created["site-visit-executive"]:
         site_visit_executive_permissions = []
@@ -180,6 +189,8 @@ def ensure_default_roles(organization):
             ("site_visits", ("view", "add", "edit")),
             ("plots", ("view", "hold", "book")),
             ("leads", ("view",)),
+            ("attendance", ("view", "add", "edit")),
+            ("leave", ("view", "add", "edit")),
         ):
             site_visit_executive_permissions.extend(
                 Permission.objects.filter(module=module, action__in=actions)
@@ -197,6 +208,12 @@ def ensure_default_roles(organization):
     if created["accounts"]:
         accounts_permissions = list(
             Permission.objects.filter(module="expenses", action__in=["view", "view_team", "process_reimbursement", "reimburse"])
+        )
+        accounts_permissions.extend(
+            Permission.objects.filter(module="attendance", action__in=["view", "add", "edit"])
+        )
+        accounts_permissions.extend(
+            Permission.objects.filter(module="leave", action__in=["view", "add", "edit"])
         )
         roles["accounts"].permissions.set(accounts_permissions)
     return roles

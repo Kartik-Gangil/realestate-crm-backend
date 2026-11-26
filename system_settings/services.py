@@ -106,6 +106,7 @@ def get_system_parameter(organization, parameter_key, *, project=None):
 def clone_project_defaults(project, request=None):
     """Copy defaults without duplicating names and remap legacy expenses."""
     ensure_project_parameter_defaults(project)
+    ensure_payment_mode_defaults(project.organization)
     default_masters = MasterData.objects.filter(organization=project.organization, project__isnull=True)
     existing_masters = set(MasterData.objects.filter(project=project).values_list("category_id", "code"))
     new_masters = [
@@ -214,6 +215,31 @@ def ensure_organization_parameter_defaults(organization):
                 "data_type": definition.data_type,
                 "description": definition.description,
             },
+        )
+
+
+SUPPORTED_PAYMENT_MODES = (
+    ("upi", "UPI"),
+    ("card", "Card"),
+    ("net_banking", "Net Banking"),
+    ("cash", "Cash"),
+    ("cheque", "Cheque"),
+)
+
+
+def ensure_payment_mode_defaults(organization):
+    """Provision the SSOT payment modes used by the existing manual-payment flow."""
+    category, _ = MasterDataCategory.objects.get_or_create(
+        code="payment_mode",
+        defaults={"name": "Payment mode", "is_system": True},
+    )
+    for sort_order, (code, name) in enumerate(SUPPORTED_PAYMENT_MODES):
+        MasterData.objects.get_or_create(
+            organization=organization,
+            project=None,
+            category=category,
+            code=code,
+            defaults={"name": name, "is_system": True, "sort_order": sort_order},
         )
 
 

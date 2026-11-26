@@ -98,6 +98,18 @@ class SessionLifecycleTests(TestCase):
 
         self.assertEqual(self.me(token).status_code, 401)
 
+    def test_user_with_no_active_organization_membership_cannot_login_fr_p3_05(self):
+        self.user.organization_memberships.update(is_active=False)
+
+        response = APIClient().post(
+            "/api/auth/login/",
+            {"email": self.user.email, "password": self.PASSWORD},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 401, response.data)
+        self.assertNotIn("token", response.data)
+
     def test_change_password_deletes_token_and_revokes_sessions_fr_p1_06_dm_p1_02(self):
         token = self.login()
         client = APIClient()

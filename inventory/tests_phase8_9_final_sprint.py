@@ -180,13 +180,12 @@ class Phase9FinalSprintTests(TestCase):
             phone="9000000001",
             lifecycle_status="site_visit_completed",
         )
-        MasterData.objects.create(
+        MasterData.objects.get_or_create(
             organization=self.organization,
             project=self.project,
             category=MasterDataCategory.objects.get(code="payment_mode"),
             code="upi",
-            name="UPI",
-            is_active=True,
+            defaults={"name": "UPI", "is_active": True},
         )
 
     def test_fr_p9_03_creates_customer_books_plot_and_replays_idempotently(self):

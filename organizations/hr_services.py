@@ -167,8 +167,10 @@ def has_hr_admin_role(membership):
 @transaction.atomic
 def cancel_leave(*, leave, actor_membership, actor):
     leave = LeaveRequest.objects.select_for_update().select_related("employee").get(pk=leave.pk)
-    if leave.employee_id != getattr(actor_membership, "id", None):
-        raise PermissionDenied("Only the requesting employee can cancel this leave.")
+    is_requester = leave.employee_id == getattr(actor_membership, "id", None)
+    is_hr_or_admin = is_organization_admin(actor_membership) or has_hr_admin_role(actor_membership)
+    if not (is_requester or is_hr_or_admin):
+        raise PermissionDenied("Only the requesting employee, HR Admin, or organization admin can cancel this leave.")
     if leave.status not in {LeaveRequest.Status.PENDING, LeaveRequest.Status.APPROVED}:
         raise ValidationError({"status": "Only pending or approved leave can be cancelled."})
     if leave.status == LeaveRequest.Status.APPROVED:

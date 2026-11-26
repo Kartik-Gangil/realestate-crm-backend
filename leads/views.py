@@ -981,7 +981,7 @@ def lead_detail(request, organization_slug, lead_id):
         return Response(lead_to_dict(lead, include_follow_ups=True))
 
     if request.method == "DELETE":
-        _require_lead_management(access)
+        _require_lead_management(access, permission="leads.delete")
         try:
             delete_leads_with_history(
                 leads=[lead],

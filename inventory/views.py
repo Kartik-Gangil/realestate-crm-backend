@@ -345,6 +345,16 @@ def _require_inventory_view(access):
         raise PermissionDenied("This role does not have permission to view Plot Inventory.")
 
 
+def _require_inventory_create(access):
+    if not access.is_platform and not has_permission(
+        access.membership.user,
+        access.organization,
+        "plots.add",
+        project=getattr(access, "project", None),
+    ):
+        raise PermissionDenied("This role does not have permission to create plots.")
+
+
 def _bookings_for_access(access, project=None):
     queryset = PlotBooking.objects.filter(organization=access.organization)
     if project is not None:
@@ -537,6 +547,7 @@ def plot_list(request, organization_slug):
     if request.method == "GET":
         _require_inventory_view(access)
     if request.method == "POST":
+        _require_inventory_create(access)
         try:
             _reject_protected_payload_fields(request.data)
         except ValidationError as error:
@@ -1510,6 +1521,17 @@ def _require_customer_edit(access):
     raise PermissionDenied("Only Managers and Admins may edit customers.")
 
 
+def _require_customer_create(access, project):
+    if access.is_platform or has_permission(
+        access.membership.user,
+        access.organization,
+        "customers.add",
+        project=project,
+    ):
+        return
+    raise PermissionDenied("This role does not have permission to create customers.")
+
+
 def _customer_for_access(access, project, customer_id):
     _require_customer_view(access)
     queryset = customer_queryset_for_access(access, project)
@@ -1550,6 +1572,7 @@ def customer_list(request, organization_slug):
     project = get_project_context(request, access)
     _require_customer_view(access)
     if request.method == "POST":
+        _require_customer_create(access, project)
         try:
             customer = create_customer(**_customer_api_payload(request, access, project))
         except (ValidationError, ValueError, TypeError) as error:
