@@ -38,6 +38,36 @@ class DocumentServiceTests(TestCase):
 
         self.assertEqual(migration._lead_name(historical_lead), "Asha Sharma")
 
+    def test_customer_identity_migration_rewrites_colliding_document_versions_lc05_rt01(self):
+        migration = import_module("documents.migrations.0003_customer_identity")
+        rows = [
+            {"pk": 12, "customer_id": 7, "organization_id": 3, "document_category_id": 5,
+             "uploaded_at": "2026-01-01T10:00:00+00:00", "is_active": True},
+            {"pk": 13, "customer_id": 8, "organization_id": 3, "document_category_id": 5,
+             "uploaded_at": "2026-01-02T10:00:00+00:00", "is_active": True},
+        ]
+
+        plan = migration._document_rewrite_plan(
+            rows,
+            {(7, 3): 101, (8, 3): 101},
+        )
+
+        self.assertEqual(
+            plan,
+            [
+                (12, 101, 1, False),
+                (13, 101, 2, True),
+            ],
+        )
+
+    def test_customer_identity_migration_drops_old_fk_before_data_rewrite_lc05_rt01(self):
+        migration = import_module("documents.migrations.0003_customer_identity")
+
+        self.assertFalse(migration.Migration.operations[0].field.db_constraint)
+        self.assertFalse(migration.Migration.operations[1].field.db_constraint)
+        self.assertTrue(migration.Migration.operations[3].field.db_constraint)
+        self.assertTrue(migration.Migration.operations[4].field.db_constraint)
+
     def test_new_upload_archives_prior_version_and_latest_is_authoritative(self):
         first = self.upload(); first = put_document_under_verification(document=first, user=self.user); first = verify_customer_document(document=first, user=self.user)
         second = self.upload()
